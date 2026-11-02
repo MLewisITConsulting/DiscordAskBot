@@ -1,7 +1,9 @@
 import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadEnv } from "../shared/env";
+import { errorMessage, log } from "../shared/log";
 import type { WorkerPhase } from "../shared/wire";
 
 /**
@@ -39,6 +41,43 @@ export function workerRunBaseDir(runDir: string | undefined = loadEnv().workerRu
 /** This process's root under `base`. */
 export function workerRoot(base: string = workerBaseDir(), pid: number = process.pid): string {
 	return join(base, String(pid));
+}
+
+/**
+ * Removes the roots of worker processes that are gone (killed with SIGKILL, so their own cleanup never ran): every
+ * numeric `<pid>` directory under `bases` whose process does not exist. The run-local ones hold the run's auth store
+ * with live access tokens. Directories of live processes (EPERM: another user's) are left alone.
+ */
+export async function removeStaleWorkerDirs(bases: readonly string[], ownPid: number = process.pid): Promise<string[]> {
+	const removed: string[] = [];
+	for (const base of new Set(bases)) {
+		let names: string[];
+		try {
+			names = readdirSync(base);
+		} catch {
+			continue;
+		}
+		for (const name of names) {
+			if (!/^[1-9][0-9]*$/.test(name)) continue;
+			const pid = Number(name);
+			if (pid === ownPid) continue;
+			try {
+				process.kill(pid, 0);
+				continue;
+			} catch (err) {
+				if ((err as NodeJS.ErrnoException).code !== "ESRCH") continue;
+			}
+			const dir = join(base, name);
+			try {
+				await rm(dir, { recursive: true, force: true });
+				removed.push(dir);
+				log("info", "stale worker directory removed", { dir, pid });
+			} catch (err) {
+				log("warn", "stale worker directory cleanup failed", { dir, pid, error: errorMessage(err) });
+			}
+		}
+	}
+	return removed;
 }
 
 /** Writes the status file atomically on every change. Sync on purpose: a tiny file, written from event handlers. */

@@ -6,9 +6,6 @@ metadata:
     {{- include "askbot.labels" (dict "root" . "component" "web") | nindent 4 }}
 spec:
   replicas: 1
-  # The web home is a ReadWriteOnce volume: a rolling update could not attach it to a second pod on another node.
-  strategy:
-    type: Recreate
   selector:
     matchLabels:
       {{- include "askbot.selectorLabels" (dict "root" . "component" "web") | nindent 6 }}
@@ -29,8 +26,6 @@ spec:
               value: /run/secrets/askbot_web_api_token
             - name: ASKBOT_ORCHESTRATOR_URL
               value: {{ include "askbot.orchestratorUrl" . }}
-            - name: ASKBOT_WEB_VSCODE
-              value: {{ ternary "on" "off" .Values.web.vscode | quote }}
             {{- with .Values.web.trustedProxies }}
             - name: ASKBOT_WEB_TRUSTED_PROXIES
               value: {{ join "," . | quote }}
@@ -57,15 +52,10 @@ spec:
           resources:
             {{- toYaml .Values.web.resources | nindent 12 }}
           volumeMounts:
-            - name: home
-              mountPath: /home/askbot
             - name: secrets
               mountPath: /run/secrets
               readOnly: true
       volumes:
-        - name: home
-          persistentVolumeClaim:
-            claimName: {{ default (printf "%s-web-home" (include "askbot.fullname" .)) .Values.web.persistence.existingClaim }}
         {{- include "askbot.secretVolume" (dict "root" . "keys" (list "web-api-token")) | nindent 8 }}
 ---
 apiVersion: v1

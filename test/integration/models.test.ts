@@ -112,7 +112,7 @@ async function startLogin(stack: PageStack, provider: string): Promise<string> {
 }
 
 describe("/admin/models", () => {
-	test("featured providers first, the rest by name, and the SEC-13 notice", async () => {
+	test("featured providers first, the rest by name", async () => {
 		const { stack } = await start();
 		const res = await stack.get("/admin/models");
 		expect(res.status).toBe(200);
@@ -121,7 +121,6 @@ describe("/admin/models", () => {
 		expect(featuredButtons).toEqual([...FEATURED_PROVIDERS]);
 		const others = [...page.matchAll(/<option value="([^"]+)">/g)].map(m => m[1]).filter(id => PROVIDERS.some(p => p.id === id));
 		expect(others).toEqual(["aa-other", "zz-other"]);
-		expect(page).toContain("Unlike stored API keys, a run's copy of these tokens is readable by that run's agent shell");
 		expect(page).toContain("No accounts signed in yet.");
 		expect(page).toContain("No models available");
 

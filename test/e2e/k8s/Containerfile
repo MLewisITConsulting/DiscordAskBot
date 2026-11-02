@@ -1,10 +1,13 @@
-# Kubernetes scenario image (test/e2e/k8s/scenarios.sh), built from the repository root on top of the release image:
-#   podman build -f test/e2e/k8s/Containerfile -t localhost/askbot-k8s-e2e:dev .
-# Adds the test fakes and fixtures and an entry point that runs the scenario orchestrator for `orchestrator` and a worker
-# with the fixture agent host for `worker` (test/e2e/k8s/entrypoint.sh), so the chart runs it with only
-# image.repository/tag changed. Every other role, and `askbot health`, is the release image's.
+# e2e scenario image, built from the repository root on top of the release image:
+#   podman build -f test/e2e/k8s/Containerfile --ignorefile test/e2e/k8s/Containerfile.containerignore -t localhost/askbot-e2e:dev .
+# Adds the test fakes and fixtures and replaces `askbot` with test/e2e/k8s/askbot.sh, which runs the scenario
+# orchestrator for `orchestrator` and a worker with the fixture agent host for `worker`, and the real CLI for anything
+# else. So the chart (test/e2e/k8s/install-smoke.sh) and compose.yaml with the launcher (test/e2e/compose/smoke.sh,
+# test/e2e/chaos/run.ts) run it with only the image changed: web, the launcher, the probes and `askbot health` are the
+# release image's.
 ARG BASE_IMAGE=localhost/askbot:dev
 FROM ${BASE_IMAGE}
+USER 0:0
 COPY test/ /app/test/
-COPY --chmod=0755 test/e2e/k8s/entrypoint.sh /usr/local/bin/askbot-k8s-e2e
-ENTRYPOINT ["askbot-k8s-e2e"]
+COPY --chmod=0755 test/e2e/k8s/askbot.sh /usr/local/bin/askbot
+USER 10001:10001

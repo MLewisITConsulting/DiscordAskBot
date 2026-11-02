@@ -6,7 +6,7 @@ metadata:
   labels:
     {{- include "askbot.labels" (dict "root" . "component" "orchestrator") | nindent 4 }}
   annotations:
-    # The database, mirrors and sessions outlive `helm uninstall`; a reinstall with the same release name adopts them.
+    # The database, vault, sessions and sign-ins outlive `helm uninstall`; a reinstall with the same release name adopts them.
     helm.sh/resource-policy: keep
 spec:
   accessModes: ["ReadWriteOnce"]
@@ -16,21 +16,4 @@ spec:
   resources:
     requests:
       storage: {{ .Values.orchestrator.persistence.size }}
-{{- end }}
-{{- if not .Values.web.persistence.existingClaim }}
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: {{ include "askbot.fullname" . }}-web-home
-  labels:
-    {{- include "askbot.labels" (dict "root" . "component" "web") | nindent 4 }}
-spec:
-  accessModes: ["ReadWriteOnce"]
-  {{- with .Values.web.persistence.storageClass }}
-  storageClassName: {{ . | quote }}
-  {{- end }}
-  resources:
-    requests:
-      storage: {{ .Values.web.persistence.size }}
 {{- end }}

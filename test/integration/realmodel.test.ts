@@ -62,17 +62,11 @@ async function host(o: HostRunOptions) {
 const transcriptOf = (messages: ChildMessage[]): TranscriptEvent[] => messages.flatMap(m => (m.t === "transcript" ? [m.event] : []));
 
 describe.skipIf(!flag)(`real model ${MODEL} (spikes A1, A2)`, () => {
-	test("the agent finds and reads the skill, and delegates only to the admin's valid agent", async () => {
+	test("the skill is listed and the agent reads it through skill:// (spike A1)", async () => {
 		const dirs = await setup();
 		const { run, end } = await host({
 			dirs,
-			opts: {
-				modelPattern: MODEL,
-				outputSchema: ANSWER_SCHEMA,
-				wantLoadout: true,
-				prompt:
-					"What does the team term \"flarn\" mean and what is its code word? Then use the task tool three times: first with agent `scout`, then with agent `shell`, then with agent `researcher`, each with the task \"Say hello.\". Report each outcome in one sentence.",
-			},
+			opts: { modelPattern: MODEL, outputSchema: ANSWER_SCHEMA, wantLoadout: true, prompt: 'What does the team term "flarn" mean, and what is its code word? Answer in one sentence.' },
 		});
 		expect(end).toMatchObject({ t: "done" });
 		const loadout = run.messages.find(m => m.t === "loadout");
@@ -83,12 +77,32 @@ describe.skipIf(!flag)(`real model ${MODEL} (spikes A1, A2)`, () => {
 		});
 		const events = transcriptOf(run.messages);
 		expect(events.some(e => e.type === "tool_start" && e.tool === "read_file" && e.args.includes("skill://glossary"))).toBe(true);
-		const tasks = events.filter(e => e.type === "tool_end" && e.tool === "task");
-		const texts = tasks.map(e => (e.type === "tool_end" ? e.text : "")).join("\n");
-		expect(texts).toContain("Cannot spawn 'scout'. Allowed: researcher");
-		expect(texts).toContain("Cannot spawn 'shell'. Allowed: researcher");
-		expect(tasks.some(e => e.type === "tool_end" && !e.isError)).toBe(true);
 		expect(JSON.stringify(end?.t === "done" && end.result.output)).toContain("ZEBRA-42");
+	}, 240_000);
+
+	test("only the admin's valid agent can be spawned (spike A2)", async () => {
+		const dirs = await setup();
+		const { run, end } = await host({
+			dirs,
+			opts: {
+				modelPattern: MODEL,
+				outputSchema: ANSWER_SCHEMA,
+				// One task per call: a batch with a refused agent fails as a whole.
+				prompt:
+					'Make exactly three separate `task` tool calls, one after another, each with a single entry in `tasks` and the task "Say hello.": the first with agent `scout`, the second with agent `shell`, the third with agent `researcher`. Then report each outcome in one sentence.',
+			},
+		});
+		expect(end).toMatchObject({ t: "done" });
+		// The model may skip a call after a refusal; every call it made to a non-admin agent must have been refused, and
+		// the researcher must have run. (Preflight itself is covered deterministically in agents.test.ts.)
+		const events = transcriptOf(run.messages);
+		// Every agent named in a task call, whether the model used the batch (`tasks[]`) or the single-task shape.
+		const attempted = events.flatMap(e => (e.type === "tool_start" && e.tool === "task" ? [...e.args.matchAll(/"agent":"([^"]*)"/g)].map(m => m[1]!) : []));
+		const tasks = events.flatMap(e => (e.type === "tool_end" && e.tool === "task" ? [e] : []));
+		const texts = tasks.map(e => e.text).join("\n");
+		expect(attempted).toContain("researcher");
+		for (const agent of attempted.filter(a => a !== "researcher")) expect(texts).toContain(`Cannot spawn '${agent}'. Allowed: researcher`);
+		expect(tasks.some(e => !e.isError)).toBe(true);
 	}, 240_000);
 
 	test("aborting the turn stops a running subagent", async () => {

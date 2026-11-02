@@ -10,7 +10,7 @@ import { APP_ROOT, type AppIdentity, appIdentity } from "../shared/version";
 import type { OrchestratorControl, WorkerPhase } from "../shared/wire";
 import { WorkerConnection } from "./connection";
 import { type ActiveRun, type RunTiming, RunSupervisor } from "./runner";
-import { StatusFile, workerRoot, workerRunBaseDir } from "./status";
+import { removeStaleWorkerDirs, StatusFile, workerBaseDir, workerRoot, workerRunBaseDir } from "./status";
 
 /**
  * The worker role (architecture §2.3): connect, claim one run, serve it, clean up, exit 0. Nothing to claim within
@@ -135,8 +135,11 @@ export async function runWorkerOnce(opts: WorkerOptions): Promise<WorkerOutcome>
  * registers with it: the SIGTERM session upload and the cleanup finish before the process exits (within postmortem's 10 s).
  */
 export async function runWorkerProcess(opts: Omit<WorkerOptions, "root" | "runLocal" | "signal">): Promise<WorkerOutcome> {
+	const runBase = workerRunBaseDir();
+	// Roots left by SIGKILLed workers on this host, including run-local auth stores with live tokens.
+	await removeStaleWorkerDirs([workerBaseDir(), runBase]);
 	const root = workerRoot();
-	const runLocal = workerRoot(workerRunBaseDir());
+	const runLocal = workerRoot(runBase);
 	await mkdir(join(runLocal, "home"), { recursive: true, mode: 0o700 });
 	await mkdir(join(runLocal, "auth"), { recursive: true, mode: 0o700 });
 	process.env.HOME = join(runLocal, "home");

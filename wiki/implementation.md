@@ -249,3 +249,22 @@ AgentBot's tests are copied with their modules. Tests that pinned AgentBot-only 
 | Spike A1 or A2 fails | Skills or task agents can't use omp's own mechanism in a restricted session | The fallbacks in §3: the host-built skill catalog, and the `run_agent` custom tool. |
 | Prompt injection by public users through skills or agents | A public user steers the agent or a subagent toward the worker token or other files | The confined tools (AGT-09, AGT-28, AGT-30) and the `web_search`-only subagent allowlist (AGT-25, AGT-31); the phase 9 security review. |
 | Cost abuse by public users | Model spend grows without an admin noticing | `limits.maxCostUsdPerTurn` per turn, one live run per public user (DSC-06), `limits.maxChatSessions`, and usage by user on the status page (OBS-06). |
+
+## 7. Status (2026-11-02)
+
+Every phase's work is done. Without a Discord test guild, the exits that need Discord ran against the fake Discord surface (`test/fakes/discord.ts`) in front of the real orchestrator; everything else is real.
+
+| Phase | Exit as run | Evidence |
+|---|---|---|
+| 0 | Both spikes pass; no fallback | [spikes/A1.md](spikes/A1.md), [spikes/A2.md](spikes/A2.md); their conditions are in AGT-20, AGT-24, AGT-25, AGT-31, AGT-32 |
+| 1 | `bun run typecheck`, `bun test`; `askbot orchestrator` opens the database and serves `/livez` | full suite (530 tests); local orchestrator run |
+| 2 | `/ask hello` posts the canned `answer.md`; `/stop` replies "Nothing is running." | `test/integration/phase2.test.ts` (fake Discord) |
+| 3 | `/ask` with a PDF on a worker started by hand and a real model: `answer.md` and `outputs/notes.md` attached, loadout exactly `list_files`, `read_file`, `web_search`, `write_file`, `yield`; orchestrator killed mid-run re-attaches and keeps editing the same status message; a killed worker fails the turn as lost and the next message resumes; nothing left on the worker host | a throwaway real-model run (fake Discord); `test/integration/phase3.test.ts` (fixture host). Found and fixed: elapsed time after a restart, a duplicate status edit, a lost first turn not resuming, and run directories left by a SIGKILLed worker |
+| 4 | Skill `glossary` and agent `researcher` used in one `/ask` (loadout and transcript); `tools: bash` refused on upload | the same real-model run; `bun run dry-run --omp-dir`; `test/integration/agents.test.ts`; `ASKBOT_REAL_MODEL=1 bun test test/integration/realmodel.test.ts` |
+| 5 | Fresh install in a browser: setup token, admin, Discord settings with validation errors, ask channel from the dropdown (hidden channel disabled, missing permission named), model sign-in, checklist complete | headless Chromium against the real web and admin API with a fake Discord REST API and sign-in; `test/integration/phase5.test.ts` |
+| 6 | `podman compose up -d`: three healthy services; an `/ask` on a launcher-started worker container, removed afterwards; rootful socket refused | `test/e2e/compose/smoke.sh` (scenario orchestrator image with the fake Discord, fixture host) |
+| 7 | Chart on kind with KEDA: an `/ask` on a KEDA worker Job pod, removed after the TTL; NetworkPolicies; upgrade keeps the secrets | `test/e2e/k8s/install-smoke.sh` |
+| 8 | omp 18.15.0 installed into a runtime copy, packed, unpacked, and the agent host from the copy registered (canary); approval and auto-update logic; `bun run dry-run --prompt "2+2?"` prints the answer JSON | `test/e2e/omp-update/real-install.ts`; `test/integration/ompUpdate.test.ts`, `omp.test.ts`; dry-run |
+| 9 | Chaos (one seed: 7 crashes across all services, every thread one answer, no duplicates, nothing left) and the limits round; security review with fixes; NFR-01 measured; README | `test/e2e/chaos/run.ts`; [security-review.md](security-review.md); NFR-01; `README.md` |
+
+Not run: a real Discord guild (every Discord behaviour rests on the fakes) and the first image publish, which happens when CI runs on `main`.

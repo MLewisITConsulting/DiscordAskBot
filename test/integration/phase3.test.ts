@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Subprocess } from "bun";
 import { type InternalApi, SCALE_PATH, startInternalApi } from "../../src/orchestrator/api/server";
-import type { MsgRef } from "../../src/orchestrator/discord/surface";
 import { createWorkerDispatcher, dispatchLimits, type WorkerDispatcher } from "../../src/orchestrator/dispatch/workers";
 import { type Controller, createController } from "../../src/orchestrator/engine/controller";
 import { shutdownOrchestrator } from "../../src/orchestrator/main";
@@ -78,8 +77,6 @@ interface Harness {
 	orch: Orchestrator;
 	/** Every orchestrator log line of this test (the in-process components). */
 	logs: string[];
-	/** Each edit of a bot message as applied: message id → contents after each edit. */
-	edits: Map<string, string[]>;
 	/** Serves `files` as Discord attachment URLs. */
 	attachmentUrl(name: string): string;
 	files: Map<string, string>;
@@ -100,15 +97,6 @@ async function boot(): Promise<Harness> {
 	await ensureOmpAssetsDir(ompDir);
 
 	const discord = createFakeDiscord({ guildId: "g1", channels: [{ id: ASK, name: "ask" }] });
-	// Observation only: what each message said after each edit.
-	const edits = new Map<string, string[]>();
-	const edit = discord.edit.bind(discord);
-	discord.edit = async (ref: MsgRef, msg, priority) => {
-		await edit(ref, msg, priority);
-		const content = discord.message(ref.messageId)?.content;
-		if (content !== undefined) edits.set(ref.messageId, [...(edits.get(ref.messageId) ?? []), content]);
-	};
-
 	const files = new Map<string, string>();
 	const attachments = Bun.serve({
 		hostname: "127.0.0.1",
@@ -221,7 +209,6 @@ async function boot(): Promise<Harness> {
 		discord,
 		orch: await start(true),
 		logs,
-		edits,
 		files,
 		attachmentUrl: name => `${attachments.url}${name}`,
 		async restart() {
@@ -299,9 +286,11 @@ describe("phase 3 exit", () => {
 
 		const [status] = statusMessages(h, threadId);
 		expect(statusMessages(h, threadId)).toHaveLength(1);
-		const history = h.edits.get(status!.id) ?? [];
-		expect(history.some(c => c.includes("Starting the agent…") || c.includes("Waiting for a worker…"))).toBe(true);
-		expect(history.some(c => c.includes("Posting the answer…"))).toBe(true);
+		// Posted as "Waiting for a worker…" (RUN-03); the dispatcher saying so again costs no write, and no write repeats (DSC-32).
+		expect(status!.history[0]).toContain("↳ Waiting for a worker…");
+		expect(status!.history.filter(c => c.includes("Waiting for a worker…"))).toHaveLength(1);
+		expect(status!.history.every((c, i) => c !== status!.history[i - 1])).toBe(true);
+		expect(status!.history.some(c => c.includes("Posting the answer…"))).toBe(true);
 		expect(status!.content).toContain("$0.50");
 		expect(status!.content).not.toContain("↳");
 

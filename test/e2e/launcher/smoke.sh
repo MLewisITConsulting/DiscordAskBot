@@ -2,7 +2,7 @@
 # Launcher smoke test on real Podman (architecture LCH-01 to LCH-04, spike S6). Run from anywhere:
 #   test/e2e/launcher/smoke.sh
 # 1. Rootless engine: runs `askbot launcher` in a container with the rootless socket mounted (keep-id + label=disable,
-#    as compose does), against a stub orchestrator reporting STUB_PENDING runs and a stub worker image. Checks that
+#    as compose does), against a stub orchestrator reporting STUB_PENDING runs, with a stub worker image as ASKBOT_IMAGE. Checks that
 #    worker containers appear (never more than the capacity), get the S6 create spec, and are gone once the runs end;
 #    that each worker runs with the F7 hardening (no_new_privileges, no capabilities, pids limit, the
 #    ASKBOT_WORKER_CPUS quota) and the OBS-01 health check;
@@ -73,7 +73,7 @@ $P run -d --name "$prefix" --network "$net" \
 	--secret "${prefix}_scale_token,target=scale_token,uid=10001" \
 	-e ASKBOT_SCALE_TOKEN_FILE=/run/secrets/scale_token \
 	-e ASKBOT_ORCHESTRATOR_URL=http://orchestrator:8081 \
-	-e ASKBOT_IMAGE="$launcher_image" -e ASKBOT_WORKER_IMAGE="$worker_image" \
+	-e ASKBOT_IMAGE="$worker_image" \
 	-e ASKBOT_WORKER_NETWORK="$net" -e ASKBOT_WORKER_SECRET="${prefix}_worker_token" \
 	-e ASKBOT_WORKER_CAPACITY="$capacity" -e ASKBOT_WORKER_MEMORY=256m -e ASKBOT_WORKER_DISK=1g -e ASKBOT_WORKER_CPUS=0.5 \
 	"$launcher_image" launcher >/dev/null

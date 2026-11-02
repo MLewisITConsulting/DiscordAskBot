@@ -10,11 +10,11 @@ AskBot {{ .Chart.AppVersion }} is installed in namespace {{ .Release.Namespace }
 
 2. On first start the web UI asks for the setup token, which the orchestrator prints once:
    kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "askbot.orchestratorService" . }} | grep setupToken
-   Create the admin account, then fill in Settings (Discord, GitHub App, models).
+   Create the admin account, then fill in Settings (Discord, ask-only channels) and sign in to a model.
 
 3. Workers: KEDA starts one Job pod per pending run, up to worker.maxReplicas = {{ .Values.worker.maxReplicas }}, and none while idle:
    kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=worker
-   At most maxConcurrentJobs + maxChatSessions workers are used (default 2 + 2); raise them in Settings to use all
+   At most maxChatSessions workers are used (default 2); raise it in Settings to use all
    {{ .Values.worker.maxReplicas }}. The orchestrator's health warns while they are lower:
    kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "askbot.orchestratorService" . }} -- bun -e 'console.log(await (await fetch("http://127.0.0.1:8081/readyz")).text())'
 

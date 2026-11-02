@@ -65,7 +65,7 @@ try {
 	summary.resolvedFromCopy = realpathSync(resolved).startsWith(realpathSync(copyDir));
 
 	// The agent host from the copy, as the worker spawns it, run until it registers (the canary), then aborted.
-	const dirs = { home: join(root, "home"), auth: join(root, "auth"), tmp: join(root, "tmp"), sessions: join(root, "sessions"), omp: join(root, "omp"), cwd: join(root, "work") };
+	const dirs = { home: join(root, "home"), auth: join(root, "auth"), tmp: join(root, "tmp"), sessions: join(root, "sessions"), omp: join(root, "omp"), cwd: join(root, "work"), scratch: join(root, "scratch") };
 	for (const dir of Object.values(dirs)) await mkdir(dir, { recursive: true, mode: 0o700 });
 	const events: string[] = [];
 	const ended = Promise.withResolvers<ChildMessage | undefined>();
@@ -98,9 +98,11 @@ try {
 		runtime: { agentDir: dirs.auth, ompDir: dirs.omp, providerKeys: { anthropic: "sk-ant-invalid-real-install" } },
 		opts: {
 			runId: "real-install",
+			// The session works in a run directory outside the scratch copy its file tools are confined to (AGT-24, AGT-28).
 			cwd: dirs.cwd,
+			scratchRoot: dirs.scratch,
 			sessionDir: dirs.sessions,
-			profile: "plan",
+			profile: "ask",
 			modelPattern: "anthropic/claude-sonnet-4-5",
 			thinking: "off",
 			prompt: "Say hello.",

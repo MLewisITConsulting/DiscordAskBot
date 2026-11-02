@@ -140,7 +140,7 @@ jobs:
         run: |
           helm install askbot deploy/helm/askbot -n askbot --create-namespace --wait --timeout 5m \
             --set image.repository="${IMAGE%:*}" --set image.tag="${IMAGE##*:}" --set image.pullPolicy=Never \
-            --set worker.diskLimit=1Gi --set orchestrator.persistence.size=1Gi --set web.persistence.size=1Gi \
+            --set worker.diskLimit=1Gi --set orchestrator.persistence.size=1Gi \
             --set-json 'worker.resources={"requests":{"cpu":"100m","memory":"256Mi","ephemeral-storage":"100Mi"},"limits":{"memory":"1Gi"}}'
       - name: Orchestrator and web Ready, ScaledJob Ready
         run: |

@@ -47,8 +47,8 @@ async function existing(surface: DiscordSurface, ref: MsgRef | undefined): Promi
 
 export async function startProgress(surface: DiscordSurface, channelId: string, title: string, activity: string, opts: ProgressOptions = {}): Promise<Progress> {
 	const snapshot = opts.restore?.progress;
-	// A restored run keeps its elapsed time.
-	const startedAt = Date.now() - (snapshot?.elapsedMs ?? 0);
+	// A restored run keeps counting from when its status message started, across the downtime (RUN-14).
+	const startedAt = snapshot?.startedAtMs ?? Date.now() - (snapshot?.elapsedMs ?? 0);
 	const state = {
 		status: "running" as ProgressState,
 		activity: snapshot?.activity ?? activity,
@@ -57,12 +57,17 @@ export async function startProgress(surface: DiscordSurface, channelId: string, 
 	};
 	const elapsed = () => Date.now() - startedAt;
 	const render = () => progressLine({ title, state: state.status, elapsedMs: elapsed(), cost: state.cost, activity: state.activity });
+	/** What the message shows now, apart from the elapsed time. */
+	const shown = { activity: state.activity, cost: state.cost };
 
 	const kept = await existing(surface, opts.restore?.statusMessage);
 	const ref = kept ?? (await surface.send(channelId, { content: render() }, "high"));
 	const persist = () => {
 		try {
-			opts.persist?.({ statusMessage: ref, progress: { state: state.status, activity: state.activity, elapsedMs: elapsed(), costUsd: state.cost } });
+			opts.persist?.({
+				statusMessage: ref,
+				progress: { state: state.status, activity: state.activity, elapsedMs: elapsed(), costUsd: state.cost, startedAtMs: startedAt },
+			});
 		} catch (err) {
 			log("warn", "progress state not stored", { error: errorMessage(err) });
 		}
@@ -72,6 +77,8 @@ export async function startProgress(surface: DiscordSurface, channelId: string, 
 	let last: Promise<void> = Promise.resolve();
 	const edit = (priority: Priority) => {
 		state.lastEdit = Date.now();
+		shown.activity = state.activity;
+		shown.cost = state.cost;
 		persist();
 		last = surface.edit(ref, { content: render() }, priority).catch(err => {
 			log("debug", "progress edit failed", { channel: ref.channelId, message: ref.messageId, error: errorMessage(err) });
@@ -95,7 +102,8 @@ export async function startProgress(surface: DiscordSurface, channelId: string, 
 			if (finished) return;
 			state.activity = text;
 			if (cost !== undefined) state.cost = cost;
-			void edit("state");
+			// A step that changes nothing visible is not worth a Discord write (DSC-32); the heartbeat refreshes the time.
+			if (state.activity !== shown.activity || state.cost !== shown.cost) void edit("state");
 		},
 		async finish(final) {
 			if (finished) return;

@@ -1,39 +1,51 @@
 #!/usr/bin/env bash
-# Helm chart install smoke test on kind with KEDA and the real image (architecture §7.3, requirements OPS-07, OPS-08).
+# Helm chart install smoke test on kind with KEDA (architecture §7.3, requirements OPS-07, OPS-08, SEC-15/16).
 #   test/e2e/k8s/install-smoke.sh
-# 1. Builds localhost/askbot:dev on the rootful Podman engine (BUILD=0 reuses it), brings up the shared kind cluster
-#    with test/e2e/k8s/kind.sh and loads the image.
+# 1. Builds localhost/askbot:dev and the e2e scenario image localhost/askbot-e2e:dev (test/e2e/k8s/Containerfile) on the
+#    rootful Podman engine (BUILD=0 reuses them), brings up the shared kind cluster with test/e2e/k8s/kind.sh and loads
+#    the e2e image.
 # 2. Shows the chart's KEDA check: `helm template` without the ScaledJob API fails with the OPS-08 message, and renders
 #    against the cluster's own API list (`--validate`), which has it.
-# 3. `helm install --wait` with small resources (worker.maxReplicas 2) into its own namespace; prints the objects, the
-#    orchestrator's /readyz body (limits, capacity) and NOTES.
-# 4. Through a port-forward to the web Service: /setup with the setup token from `kubectl logs deploy/<orchestrator>`,
-#    saves an MCP server and clicks "Test connection". The test runs on a real worker Job pod: exactly one must appear,
-#    become Ready (claimed), connect and list the tool, and no worker pod may remain (Job TTL 60 s).
-# 5. NetworkPolicies (SEC-15, F5): a pod labelled as a worker reaches orchestrator:8081 and the public npm registry but
+# 3. `helm install --wait` of the real chart with small resources (worker.maxReplicas 2) into its own namespace, with
+#    only the image swapped for the e2e one (image.repository/tag): its `orchestrator` is the scenario orchestrator
+#    (real internals, fake Discord), its `worker` a real worker with the fixture agent host; web, the probes and
+#    `askbot health` are the release image's. Prints the objects, the orchestrator's /readyz body and NOTES.
+# 4. Through a port-forward to the web Service: /setup with the setup token from `kubectl logs deploy/<orchestrator>`;
+#    the scenario orchestrator then seeds its settings (one ask channel, one allowed user) and the engine starts.
+# 5. `/ask` in the fake ask channel (the e2e control API through a port-forward to the orchestrator). The run goes to a
+#    real KEDA worker Job pod of the chart's ScaledJob: exactly one must appear and become Ready (claimed), the answer
+#    (`answer.md`) and "Done" must reach the thread, and no worker pod may remain (Job TTL 60 s).
+# 6. NetworkPolicies (SEC-15, F5): a pod labelled as a worker reaches orchestrator:8081 and the public npm registry but
 #    neither web:8080 nor another pod's address (CoreDNS's readiness port); an unlabelled pod reaches neither AskBot
 #    service.
-# 6. `helm upgrade` (a changed value) keeps the generated Secret's values.
-# 7. Uninstalls and deletes the namespace (KEEP=1 leaves it; the cluster always stays: kind.sh down removes it).
-# Env: IMAGE (default localhost/askbot:dev), BUILD (default 1), ROOTFUL_PODMAN (default
-# `podman --connection podman-machine-default-root`), HELM (default .tools/helm), NAMESPACE (default askbot-smoke),
-# RELEASE (default askbot), WEB_PORT (default 18090), MCP_DELAY_MS (default 4000), KEEP.
+# 7. `helm upgrade` (worker.maxReplicas 3) keeps the generated Secret's values: the restarted orchestrator opens the
+#    vault with the same master key and its engine runs again (SEC-16).
+# 8. Uninstalls and deletes the namespace (KEEP=1 leaves it; the cluster always stays: kind.sh down removes it).
+# Env: IMAGE (default localhost/askbot:dev), E2E_IMAGE (default localhost/askbot-e2e:dev), BUILD (default 1),
+# ROOTFUL_PODMAN (default `podman --connection podman-machine-default-root`), HELM (default .tools/helm, else helm on
+# PATH), NAMESPACE (default askbot-smoke), RELEASE (default askbot), WEB_PORT (default 18090), ORCH_PORT (default
+# 18091), HOLD_SECONDS (default 8: how long the fixture holds the run, so the pod's Ready shows), KEEP.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 image="${IMAGE:-localhost/askbot:dev}"
+e2e_image="${E2E_IMAGE:-localhost/askbot-e2e:dev}"
 R="${ROOTFUL_PODMAN:-podman --connection podman-machine-default-root}"
 helm="${HELM:-$root/.tools/helm}"
+[ -x "$helm" ] || helm="$(command -v helm)" || { echo "FAIL: no helm at $helm or on PATH" >&2; exit 1; }
 ns="${NAMESPACE:-askbot-smoke}"
 release="${RELEASE:-askbot}"
 port="${WEB_PORT:-18090}"
-delay="${MCP_DELAY_MS:-4000}"
+orch_port="${ORCH_PORT:-18091}"
+hold="${HOLD_SECONDS:-8}"
 chart="$root/deploy/helm/askbot"
 ctx=kind-askbot-e2e
 k="kubectl --context $ctx -n $ns"
 base="http://127.0.0.1:$port"
+ctl_base="http://127.0.0.1:$orch_port/internal/admin/e2e"
 work="$(mktemp -d)"
 forward_pid=""
+orch_forward_pid=""
 # The chart's object names for release "askbot" (fullname = the release name when it contains the chart name).
 case "$release" in *askbot*) full="$release" ;; *) full="$release-askbot" ;; esac
 orch="$full-orchestrator"
@@ -42,6 +54,10 @@ worker_sel="app.kubernetes.io/instance=$release,app.kubernetes.io/component=work
 
 now_ms() { bun -e 'process.stdout.write(String(Date.now()))'; }
 secs() { awk -v ms="$1" 'BEGIN { printf "%.1f s", ms / 1000 }'; }
+# The scenario orchestrator's control API (test/e2e/k8s/orchestrator.ts), with the web token.
+ctl() { curl -s --max-time 10 -H "authorization: Bearer $web_token" -H 'content-type: application/json' "$@"; }
+# `$1` of a JSON document on stdin (a JS expression over `d`).
+json() { bun -e "const d = await Bun.stdin.json(); const v = $1; process.stdout.write(typeof v === 'string' ? v : JSON.stringify(v))"; }
 
 teardown() {
 	"$helm" --kube-context "$ctx" -n "$ns" uninstall "$release" --wait >/dev/null 2>&1 || true
@@ -50,7 +66,7 @@ teardown() {
 
 cleanup() {
 	code=$?
-	[ -z "$forward_pid" ] || kill "$forward_pid" 2>/dev/null || true
+	for pid in $forward_pid $orch_forward_pid; do kill "$pid" 2>/dev/null || true; done
 	if [ "${KEEP:-0}" = 1 ]; then
 		echo "KEEP=1: release $release left in namespace $ns; remove with: $helm --kube-context $ctx -n $ns uninstall $release && kubectl --context $ctx delete namespace $ns"
 	else
@@ -75,13 +91,26 @@ fail() {
 # GET http://127.0.0.1:<port><path> from inside a Deployment's container (the image has no curl).
 in_pod() { $k exec "deploy/$1" -- bun -e "const r = await fetch('http://127.0.0.1:$2$3'); console.log(r.status, await r.text())"; }
 
+# kubectl port-forward <target> <local>:<remote> in the background until <url> answers; its pid in $forwarded.
+port_forward() {
+	$k port-forward "$1" "$2" >>"$work/forward.log" 2>&1 &
+	forwarded=$!
+	for _ in $(seq 1 50); do
+		[ "$(curl -s -o /dev/null -w '%{http_code}' "$3" || true)" = 200 ] && return
+		sleep 0.2
+	done
+	fail "port-forward $1 $2: $3 does not answer"
+}
+
 if [ "${BUILD:-1}" = 1 ]; then
-	echo "== build $image (rootful engine)"
+	echo "== build $image and $e2e_image (rootful engine)"
 	$R build -q -t "$image" "$root" | sed 's/^/  /'
+	$R build -q -f "$root/test/e2e/k8s/Containerfile" --ignorefile "$root/test/e2e/k8s/Containerfile.containerignore" \
+		--build-arg "BASE_IMAGE=$image" -t "$e2e_image" "$root" | sed 's/^/  /'
 fi
 
-echo "== kind cluster (test/e2e/k8s/kind.sh up $image)"
-"$root/test/e2e/k8s/kind.sh" up "$image" 2>&1 | grep -E '^kind.sh:|successfully rolled out' | sed 's/^/  /'
+echo "== kind cluster (test/e2e/k8s/kind.sh up $e2e_image)"
+"$root/test/e2e/k8s/kind.sh" up "$e2e_image" 2>&1 | grep -E '^kind.sh:|successfully rolled out' | sed 's/^/  /'
 kubectl --context "$ctx" version 2>/dev/null | sed 's/^/  /'
 echo "  KEDA $(kubectl --context "$ctx" -n keda get deploy keda-operator -o jsonpath='{.metadata.labels.app\.kubernetes\.io/version}')"
 
@@ -105,15 +134,14 @@ teardown
 
 cat >"$work/values.yaml" <<EOF
 image:
-  repository: ${image%:*}
-  tag: ${image##*:}
+  repository: ${e2e_image%:*}
+  tag: ${e2e_image##*:}
   pullPolicy: Never
 orchestrator:
   resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { memory: 1Gi } }
   persistence: { size: 1Gi }
 web:
-  resources: { requests: { cpu: 50m, memory: 128Mi }, limits: { memory: 1Gi } }
-  persistence: { size: 1Gi }
+  resources: { requests: { cpu: 50m, memory: 128Mi }, limits: { memory: 512Mi } }
 worker:
   maxReplicas: 2
   diskLimit: 1Gi
@@ -144,13 +172,10 @@ echo "== orchestrator /readyz (before setup: limits null)"
 in_pod "$orch" 8081 /readyz | sed 's/^/  /'
 
 echo "== port-forward svc/$web $port:8080"
-$k port-forward "svc/$web" "$port:8080" >"$work/forward.log" 2>&1 &
-forward_pid=$!
-for _ in $(seq 1 50); do
-	[ "$(curl -s -o /dev/null -w '%{http_code}' "$base/healthz" || true)" = 200 ] && break
-	sleep 0.2
-done
+port_forward "svc/$web" "$port:8080" "$base/healthz"
+forward_pid=$forwarded
 echo "  web /healthz: $(curl -s "$base/healthz")"
+
 
 echo "== /setup with the setup token from kubectl logs deploy/$orch"
 token=$($k logs "deploy/$orch" | grep -o '"setupToken":"[^"]*"' | tail -1 | cut -d'"' -f4)
@@ -162,27 +187,30 @@ out=$(post --data-urlencode "token=$token" --data-urlencode username=admin --dat
 [ "$out" = "303 $base/" ] || fail "setup answered $out"
 echo "admin created"
 
-echo "== save MCP server e2e (stdio: bun -e <inline MCP server, initialize answered after ${delay} ms>)"
-mcp_script=$(cat <<'EOF'
-let b="";const send=(m,r)=>process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:r})+"\n");process.stdin.on("data",d=>{b+=d;let i;while((i=b.indexOf("\n"))>=0){const l=b.slice(0,i);b=b.slice(i+1);if(!l.trim())continue;const m=JSON.parse(l);if(m.id===undefined)continue;if(m.method==="initialize")setTimeout(()=>send(m,{protocolVersion:m.params.protocolVersion,capabilities:{tools:{}},serverInfo:{name:"e2e",version:"1"}}),DELAY);else send(m,m.method==="tools/list"?{tools:[{name:"echo",description:"Echoes its input",inputSchema:{type:"object",properties:{}}}]}:{})}})
-EOF
-)
-out=$(post --data-urlencode mcp.0.name=e2e --data-urlencode mcp.0.type=stdio --data-urlencode mcp.0.enabled=on \
-	--data-urlencode mcp.0.command=bun --data-urlencode "mcp.0.args=-e
-${mcp_script//DELAY/$delay}" "$base/admin/omp")
-[ "$out" = "303 $base/admin/omp" ] || fail "saving the omp configuration answered $out"
-echo "saved"
+echo "== port-forward svc/$orch $orch_port:8081 (the e2e control API)"
+web_token=$($k get secret "$full" -o jsonpath='{.data.web-api-token}' | base64 -d)
+port_forward "svc/$orch" "$orch_port:8081" "http://127.0.0.1:$orch_port/livez"
+orch_forward_pid=$forwarded
+phase=""
+for _ in $(seq 1 60); do
+	phase=$(ctl "$ctl_base/state" | json d.phase 2>/dev/null || true)
+	[ "$phase" = running ] && break
+	sleep 0.5
+done
+[ "$phase" = running ] || fail "the engine is not running after setup (phase ${phase:-unknown})"
+echo "engine running with the seeded e2e settings"
 
-echo "== Test connection (a worker Job pod runs it)"
-[ -z "$($k get pods -l "$worker_sel" -o name)" ] || fail "worker pods exist before the test"
+echo "== /ask in the fake ask channel (fixture:slow, held $hold s): a KEDA worker Job pod runs it"
+[ -z "$($k get pods -l "$worker_sel" -o name)" ] || fail "worker pods exist before the ask"
 start=$(now_ms)
-out=$(post --data-urlencode server=e2e "$base/admin/omp/mcp/test")
-case "$out" in "303 $base/admin/omp/mcp/test/"*) ;; *) fail "Test connection answered $out" ;; esac
-page="${out#303 }"
-echo "test page ${page#$base}"
+out=$(ctl -X POST -d "{\"prompt\":\"What does AskBot do? fixture:slow fixture-hold-seconds:$hold\"}" "$ctl_base/ask")
+thread=$(echo "$out" | json 'd.thread ?? ""')
+[ -n "$thread" ] || fail "/ask was refused: $out"
+echo "thread $thread: $(echo "$out" | json d.reply)"
+thread_js="(d.find(t => t.id === '$thread')?.messages.filter(m => m.bot) ?? [])"
 seen=""
 ready=""
-status=""
+answered=""
 last=""
 for _ in $(seq 1 300); do
 	listed=$($k get pods -l "$worker_sel" --no-headers -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,READY:.status.conditions[?(@.type=="Ready")].status' 2>/dev/null || true)
@@ -194,19 +222,20 @@ for _ in $(seq 1 300); do
 		case " $seen " in *" $name "*) ;; *) seen="$seen $name" ;; esac
 	done
 	echo "$listed" | awk '$3 == "True"' | grep -q . && ready=1
-	status=$(curl -s -b "$jar" "$page.json" | bun -e 'process.stdout.write((await Bun.stdin.json()).status ?? "")' 2>/dev/null || true)
-	if [ "$status" = done ] && [ -n "$seen" ]; then break; fi
+	answered=$(ctl "$ctl_base/threads" | json "$thread_js.some(m => m.content.startsWith('✅ **Done.**')) ? 'yes' : ''" 2>/dev/null || true)
+	if [ -n "$answered" ] && [ -n "$seen" ]; then break; fi
 	sleep 0.5
 done
 done_ms=$(($(now_ms) - start))
 [ -n "$seen" ] || fail "no worker pod appeared"
-[ "$status" = done ] || fail "the MCP test did not finish (status $status)"
+[ -n "$answered" ] || fail "the answer did not reach thread $thread"
 [ -n "$ready" ] || fail "the worker pod never became Ready (health --claimed)"
-echo "test done $(secs $done_ms) after the click"
-curl -s -b "$jar" "$page" >"$work/result.html"
-sed -n '/<h1>Test MCP server/,/Back to omp configuration/p' "$work/result.html" | sed 's/<[^>]*>/ /g; s/  */ /g; s/^ //; /^$/d' | sed 's/^/  /'
-grep -q 'Connected to e2e: 1 tool' "$work/result.html" || fail "the MCP test did not connect"
-grep -q 'mcp__e2e_echo' "$work/result.html" || fail "the MCP test did not list mcp__e2e_echo"
+echo "answered $(secs $done_ms) after /ask; the worker pod was Ready (claimed) while it ran"
+echo "== thread $thread (bot messages)"
+ctl "$ctl_base/threads" | json "$thread_js.map(m => [m.content.split('\n')[0], ...m.files.map(f => '  [file] ' + f), ...(m.answer ? ['  answer.md: ' + m.answer.trim()] : [])].join('\n')).join('\n')" | sed 's/^/  /'
+echo
+answers=$(ctl "$ctl_base/threads" | json "$thread_js.filter(m => m.files.includes('answer.md')).map(m => m.answer)")
+[ "$answers" = '["Fixture slow answer."]' ] || fail "expected exactly one answer.md with the fixture's answer, got $answers"
 
 echo "== worker pods until none remain (Job ttlSecondsAfterFinished 60)"
 for _ in $(seq 1 240); do
@@ -225,9 +254,12 @@ done
 [ -z "$listed" ] || fail "worker pods remain: $listed"
 gone_ms=$(($(now_ms) - start))
 set -- $seen
-[ $# = 1 ] || fail "$# worker pods appeared for one test:$seen"
-echo "exactly one worker pod ($1); none left $(secs $gone_ms) after the click"
-$k logs "deploy/$orch" | grep -E 'MCP connection test|worker (connected|disconnected)|run claimed' | tail -6 | cut -c1-220 | sed 's/^/  /'
+[ $# = 1 ] || fail "$# worker pods appeared for one run:$seen"
+run=$(ctl "$ctl_base/state" | json "d.runs.filter(r => r.thread === '$thread').map(r => r.state + '/' + r.outcome + ' on ' + r.worker)")
+echo "  runs: $run"
+[ "$run" = "[\"finished/succeeded on $1\"]" ] || fail "expected one succeeded run on $1, got $run"
+echo "exactly one worker pod ($1); none left $(secs $gone_ms) after /ask"
+$k logs "deploy/$orch" | grep -E '"(ask chat started|run pending|run claimed|run finished|worker connected|worker disconnected)"' | tail -8 | cut -c1-220 | sed 's/^/  /'
 
 echo "== orchestrator /readyz (after setup: limits and warnings)"
 in_pod "$orch" 8081 /readyz | sed 's/^/  /'
@@ -240,7 +272,7 @@ dns_ip=$(kubectl --context "$ctx" -n kube-system get pod -l k8s-app=kube-dns -o 
 probe() {
 	# $1 pod name, $2 extra labels; prints "<target> <status|blocked>" for orchestrator:8081, web:8080, CoreDNS:8181 and
 	# the npm registry.
-	$k run "$1" --image "$image" --image-pull-policy Never --restart Never --labels "$2" \
+	$k run "$1" --image "$e2e_image" --image-pull-policy Never --restart Never --labels "$2" \
 		--overrides '{"spec":{"automountServiceAccountToken":false,"enableServiceLinks":false,"securityContext":{"runAsUser":10001,"runAsNonRoot":true}}}' \
 		--command -- bun -e "for (const u of ['http://$orch:8081/livez', 'http://$web:8080/healthz', 'http://$dns_ip:8181/ready', 'https://registry.npmjs.org/-/ping']) { try { const r = await fetch(u, { signal: AbortSignal.timeout(5000) }); console.log(u, r.status) } catch { console.log(u, 'blocked') } }" >/dev/null
 	$k wait --for jsonpath='{.status.phase}'=Succeeded "pod/$1" --timeout 90s >/dev/null || fail "probe pod $1 did not finish"
@@ -257,22 +289,34 @@ grep -qE "$dns_ip:8181/ready [0-9]+" "$work/np-other" || fail "the cluster-addre
 grep -q "$orch:8081/livez blocked" "$work/np-other" || fail "an unlabelled pod can reach the orchestrator"
 grep -q "$web:8080/healthz blocked" "$work/np-other" || fail "an unlabelled pod can reach web"
 
-echo "== helm upgrade (web.vscode=false) keeps the generated secrets"
-# The web pod is replaced by the upgrade, which ends the port-forward anyway.
-kill "$forward_pid" 2>/dev/null || true
-wait "$forward_pid" 2>/dev/null || true
+echo "== helm upgrade (worker.maxReplicas=3) keeps the generated secrets"
+# The upgrade replaces the orchestrator pod, which ends the port-forwards anyway.
+for pid in $forward_pid $orch_forward_pid; do
+	kill "$pid" 2>/dev/null || true
+	wait "$pid" 2>/dev/null || true
+done
 forward_pid=""
-"$helm" --kube-context "$ctx" upgrade "$release" "$chart" -n "$ns" -f "$work/values.yaml" --set web.vscode=false --wait --timeout 5m >/dev/null || fail "helm upgrade failed"
-$k get deploy "$web" -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="ASKBOT_WEB_VSCODE")].value}' | grep -qx off || fail "the upgrade did not apply web.vscode=false"
+orch_forward_pid=""
+"$helm" --kube-context "$ctx" upgrade "$release" "$chart" -n "$ns" -f "$work/values.yaml" --set worker.maxReplicas=3 --wait --timeout 5m >/dev/null || fail "helm upgrade failed"
+$k rollout status "deploy/$orch" --timeout 120s >/dev/null || fail "the upgraded orchestrator is not ready"
+$k get deploy "$orch" -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="ASKBOT_WORKER_CAPACITY")].value}' | grep -qx 3 || fail "the upgrade did not apply worker.maxReplicas=3"
 secret_after=$($k get secret "$full" -o jsonpath='{.data}' | shasum -a 256 | cut -c1-16)
 scale_after=$($k get secret "$full" -o jsonpath='{.data.scale-token}')
 echo "  revision $("$helm" --kube-context "$ctx" -n "$ns" status "$release" -o json | bun -e 'process.stdout.write(String((await Bun.stdin.json()).version))')"
 echo "  secret data sha256 before $secret_before, after $secret_after"
 echo "  scale-token before ${scale_before:0:12}..., after ${scale_after:0:12}..."
 [ "$secret_before" = "$secret_after" ] || fail "helm upgrade changed the generated secrets"
+# The new orchestrator opened the vault with the kept master key: its engine runs without a login (SEC-16).
+phase=""
+for _ in $(seq 1 60); do
+	phase=$(in_pod "$orch" 8081 /readyz 2>/dev/null | sed 's/^[0-9]* //' | json 'd.phase' 2>/dev/null || true)
+	[ "$phase" = running ] && break
+	sleep 1
+done
 in_pod "$orch" 8081 /readyz | sed 's/^/  /'
+[ "$phase" = running ] || fail "the upgraded orchestrator's engine is not running (phase ${phase:-unknown}): the vault did not open"
 
 echo "== timings"
 echo "  helm install to orchestrator + web Ready: $(secs $install_ms)"
-echo "  Test connection to result: $(secs $done_ms); to no worker pod left: $(secs $gone_ms)"
+echo "  /ask to answer: $(secs $done_ms); to no worker pod left: $(secs $gone_ms)"
 echo "PASS"

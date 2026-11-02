@@ -1,0 +1,25 @@
+# e2e override of compose.yaml (test/e2e/compose/smoke.sh, test/e2e/chaos/run.ts): the e2e scenario image
+# (test/e2e/k8s/Containerfile) as the orchestrator and, through the launcher's ASKBOT_IMAGE, the workers (real internals
+# with the fake Discord and the fixture agent host); the real web and launcher from the release image.
+#   podman compose -f compose.yaml -f test/e2e/compose/compose.e2e.yaml -p <project> up -d
+# Set ASKBOT_IMAGE to the e2e image and ASKBOT_BASE_IMAGE to the release image; the drivers set everything.
+#   E2E_ORCH_PORT       host port of the orchestrator's internal API (the driver's e2e control API), default 18181
+#   E2E_ADMIN_PASSWORD, E2E_MAX_CHAT_SESSIONS, E2E_LEASE_MS, E2E_REATTACH_GRACE_MS  passed to the scenario orchestrator
+#                       (test/e2e/k8s/orchestrator.ts); unset = the setup-token flow and the product's defaults
+
+services:
+  orchestrator:
+    environment:
+      E2E_DISCORD_STATE: /state/e2e-discord.json
+      E2E_ADMIN_PASSWORD: ${E2E_ADMIN_PASSWORD:-}
+      E2E_MAX_CHAT_SESSIONS: ${E2E_MAX_CHAT_SESSIONS:-}
+      E2E_LEASE_MS: ${E2E_LEASE_MS:-}
+      E2E_REATTACH_GRACE_MS: ${E2E_REATTACH_GRACE_MS:-}
+    ports:
+      - "127.0.0.1:${E2E_ORCH_PORT:-18181}:8081"
+
+  web:
+    image: ${ASKBOT_BASE_IMAGE:-localhost/askbot:dev}
+
+  launcher:
+    image: ${ASKBOT_BASE_IMAGE:-localhost/askbot:dev}

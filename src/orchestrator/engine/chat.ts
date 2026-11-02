@@ -288,14 +288,15 @@ export function createAskChat(deps: EngineDeps, opts: AskChatOptions): AskChat {
 			}
 		};
 		try {
-			progress = await startProgress(discord, threadId, "Answering", "Preparing the workspace…", {
+			// A new turn's run is pending until a worker starts it (RUN-03), so the message opens with what the dispatcher
+			// reports then; its `onWaitingForWorker` changes nothing visible and costs no edit.
+			progress = await startProgress(discord, threadId, "Answering", turn ? "Waiting for a worker…" : "Thinking…", {
 				restore,
 				persist: state => runUi.set(threadId, state),
 			});
 			await setTopIcon(discord, threadId, CHAT_ICONS.working);
 			paths = await ensureScratch(threadId);
 			before = await snapshotFiles(paths.outputs);
-			if (!restore) progress.phase("Starting the agent…");
 			const current = progress;
 			result = await dispatcher.runAgent(
 				{

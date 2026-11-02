@@ -454,10 +454,11 @@ The settings are validated as a whole on save. Errors read `Invalid config: <pat
 
 ## 13. Resource requirements
 
-- **NFR-01** The documented memory budget is (all estimates, to be measured):
-  - orchestrator: about 450 MB;
-  - web: about 100 MB;
-  - per concurrent agent run: about 250 MB.
+- **NFR-01** The documented memory budget is (measured in phase 9, implementation.md §4):
+  - orchestrator: about 270 MB (`podman stats`, idle and during a run);
+  - web: about 35 MB;
+  - launcher: about 20 MB;
+  - per concurrent agent run: about 600 MB: the worker supervisor about 190 MB (`podman stats`) plus the agent host about 420 MB (peak RSS with a real model and `web_search`, measured on macOS arm64; Linux is usually lower). Task subagents run inside the agent host.
 
   For Podman hosts, 4 GiB is the minimum and 8 GiB is recommended. Concurrency MUST be tunable down for small hosts (`maxChatSessions`, `ASKBOT_WORKER_CAPACITY`).
 - **NFR-02** Each worker MUST have its own memory limit (default 4 GiB, no swap) and scratch space limit (default 2 GiB, architecture STO-06), in both runtimes, so that an out-of-memory kill or a full disk affects only that run and is reported for that run only (AGT-19, STO-06). The worker enforces the scratch limit by measuring its scratch copy periodically; under Podman this is a soft limit and the host disk is the hard ceiling, because rootless Podman cannot enforce a per-container disk limit (AgentBot spike S6, `../AgentBot/wiki/spikes/S6.md`). Under Kubernetes, `emptyDir.sizeLimit` also enforces it. Detection of OOM kills relies on cgroup v2.

@@ -40,9 +40,10 @@ orchestrator:
       memory: 512Mi
     limits:
       memory: 1Gi
-  # The state volume (RWO): database, mirrors, sessions, logs, omp sign-ins (architecture §5).
+  # The state volume (RWO): database, omp sign-ins, sessions, scratch files, skills and agents, omp runtime copies, logs
+  # (architecture §5).
   persistence:
-    size: 20Gi
+    size: 10Gi
     storageClass: ""
     # An existing PVC to use instead of creating one.
     existingClaim: ""
@@ -51,22 +52,16 @@ orchestrator:
   affinity: {}
 
 web:
-  # ASKBOT_WEB_VSCODE: the in-browser VS Code editor for the config workspace (requirements WEB-28).
-  vscode: true
   # ASKBOT_WEB_TRUSTED_PROXIES: addresses/CIDRs of the ingress controller pods (e.g. the pod network). Login attempts
   # are then counted per right-most untrusted X-Forwarded-For entry instead of per controller pod (WEB-03).
   trustedProxies: []
+  # Web keeps nothing: no volume (requirements DB-03).
   resources:
     requests:
       cpu: 100m
-      memory: 768Mi
+      memory: 128Mi
     limits:
-      memory: 2Gi
-  # The web home volume (RWO): config workspace copy, queued saves, code-server user data.
-  persistence:
-    size: 5Gi
-    storageClass: ""
-    existingClaim: ""
+      memory: 512Mi
   # The Ingress terminates TLS so that the session cookie is Secure (WEB-05). An empty tls.secretName uses the
   # ingress controller's default certificate.
   ingress:
@@ -82,18 +77,13 @@ web:
 
 worker:
   # Most worker pods at once (the ScaledJob's maxReplicaCount), also the orchestrator's ASKBOT_WORKER_CAPACITY. To use
-  # them all, raise maxConcurrentJobs + maxChatSessions in Settings (RUN-11); the health warning says so until then.
+  # them all, raise maxChatSessions in Settings (RUN-11); the health warning says so until then.
   maxReplicas: 10
   # ASKBOT_WORKER_ADDRESS_BINDING: one claim per worker pod address, worker ids bound to their first address
   # (architecture §6). Set false only under a service mesh that rewrites workers' source addresses.
   addressBinding: true
-  # A derived worker image with target-repo toolchains, built FROM the same AskBot version (architecture §7.1).
-  # Empty repository = the AskBot image above; empty tag = image.tag.
-  image:
-    repository: ""
-    tag: ""
-  # Checkout space per worker (STO-06): the checkout emptyDir's sizeLimit and ASKBOT_WORKER_DISK. Ki, Mi, Gi or Ti.
-  diskLimit: 20Gi
+  # Scratch space per worker (STO-06): the scratch emptyDir's sizeLimit and ASKBOT_WORKER_DISK. Ki, Mi, Gi or Ti.
+  diskLimit: 2Gi
   # Memory-backed run-local emptyDir (status file, run-private auth store, omp's home); counts against the memory limit.
   runDirLimit: 256Mi
   # KEDA polling interval in seconds (architecture §4.4).
@@ -101,9 +91,9 @@ worker:
   failedJobsHistoryLimit: 5
   resources:
     requests:
-      cpu: 500m
-      memory: 1536Mi
-      ephemeral-storage: 20Gi
+      cpu: 250m
+      memory: 512Mi
+      ephemeral-storage: 2Gi
     limits:
       memory: 4Gi
   nodeSelector: {}
@@ -115,7 +105,7 @@ keda:
   # chart without a cluster, e.g. `helm template` in CI (or pass --api-versions keda.sh/v1alpha1/ScaledJob).
   skipCrdCheck: false
 
-# NetworkPolicies (SEC-15, security review F5). Ingress: orchestrator:8081 only from web, workers and KEDA; web:8080 only
+# NetworkPolicies (SEC-15). Ingress: orchestrator:8081 only from web, workers and KEDA; web:8080 only
 # from the ingress controller; nothing to workers. Egress: web reaches only DNS and the orchestrator; workers reach DNS,
 # the orchestrator and the internet except link-local addresses (cloud metadata: 169.254.169.254, fd00:ec2::254) and
 # worker.clusterCIDRs; the orchestrator's egress stays open. Helm merges selector maps with these defaults: to replace

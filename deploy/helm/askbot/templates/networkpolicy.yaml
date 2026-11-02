@@ -1,7 +1,7 @@
 {{- if .Values.networkPolicy.enabled }}
-{{- /* SEC-15: ingress for every pod. Egress (security review F5): web reaches DNS and the orchestrator only; workers
+{{- /* SEC-15: ingress for every pod. Egress: web reaches DNS and the orchestrator only; workers
   reach DNS, the orchestrator and the internet, but not link-local (cloud metadata) or the cluster's own ranges. The
-  orchestrator's egress stays open (Discord, GitHub, npm, sign-in endpoints). */}}
+  orchestrator's egress stays open (Discord, npm, sign-in endpoints). */}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

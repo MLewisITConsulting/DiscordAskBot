@@ -81,6 +81,8 @@ export interface FakeMessage {
 	attachments: InAttachment[];
 	/** Number of applied edits. */
 	edits: number;
+	/** The content as posted, then after each applied edit: what Discord was actually sent. */
+	history: string[];
 }
 
 export type FakeResponseType = "reply" | "defer" | "editReply" | "followUp";
@@ -254,6 +256,7 @@ export function createFakeDiscord(opts: FakeDiscordOptions = {}): FakeDiscord {
 			authorId,
 			attachments: [],
 			edits: 0,
+			history: [msg.content],
 			...(replyTo ? { replyTo } : {}),
 		};
 		messageStore.set(message.id, message);
@@ -264,6 +267,7 @@ export function createFakeDiscord(opts: FakeDiscordOptions = {}): FakeDiscord {
 		message.content = msg.content;
 		if (msg.files) message.files = msg.files;
 		message.edits++;
+		message.history.push(msg.content);
 	}
 
 	/** One simulated REST call on `bucket` (`simulate`): its latency, then the bucket's window. */

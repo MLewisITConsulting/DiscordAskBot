@@ -66,7 +66,7 @@ ${
 
 /** SEC-13: where sign-ins live and who can read a run's copy. */
 const STORAGE_NOTICE = `<p class="warning">Sign-ins are stored and refreshed only by the orchestrator; a new sign-in is used by the next run without a restart.
-Unlike stored API keys, a run's copy of these tokens is readable by that run's agent shell (its refresh token stays with the orchestrator, and signing out refuses that run's later refresh requests).</p>`;
+Each run gets a copy of the access tokens, like the provider API keys; the refresh token stays with the orchestrator, and signing out refuses that run's later refresh requests (CRED-02, CRED-05).</p>`;
 
 export function modelsPage(view: ModelsView, now: number, flash?: Flash): string {
 	const models = view.models.map(model => `<tr><td><code>${esc(model.id)}</code></td><td>${esc(model.name)}</td></tr>`);

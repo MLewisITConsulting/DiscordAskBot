@@ -68,6 +68,9 @@ export function defaultAgentDir(): string {
 	return process.env.PI_CODING_AGENT_DIR || join(homedir(), ".omp", "agent");
 }
 
+/** Provider credentials omp reads from the environment; the host's environment is otherwise an allowlist (F2). */
+const PROVIDER_ENV = /(_API_KEY|_OAUTH_TOKEN|_API_BASE|_BASE_URL)$|^(AWS|AZURE|GOOGLE|GCP|GCLOUD|VERTEX)_/;
+
 /** Opens the developer's sign-in store and checks that some model can be used with it or with the environment's keys. */
 async function openCredentials(agentDir: string, model: string | undefined): Promise<Signins> {
 	const signins = await openSigninStore(agentDir);
@@ -257,7 +260,7 @@ export async function dryRun(opts: DryRunOptions): Promise<HostResult> {
 		proc = Bun.spawn({
 			cmd: [process.execPath, opts.hostEntry ?? HOST_ENTRY],
 			cwd: dirs.root,
-			env: hostEnv(dirs, marker),
+			env: hostEnv(dirs, marker, Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => PROVIDER_ENV.test(e[0]) && e[1] !== undefined))),
 			stdin: "ignore",
 			// Its log lines arrive as `log` messages too; stdout stays the answer's.
 			stdout: "ignore",

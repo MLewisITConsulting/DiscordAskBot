@@ -396,7 +396,7 @@ The orchestrator's health body reports its limits:
 
   The address rule stops a second claim from the same pod or container. It does not stop code that reaches the orchestrator from another address. Running the agent host as a different user from the worker supervisor, in a second container without the worker token, closes this gap (§11 item 2).
 
-**Public users and the agent's tools.** Public users steer the agent. The `ask` profile's confined tools (AGT-09, AGT-28, AGT-30) and the subagent allowlist (AGT-31) are what keep them away from the worker token on disk and in `/proc`. Because there is no shell, a public user can't run code in the worker except through bugs in the confined tools; a security review of those tools is part of the release (implementation.md, phase 9).
+**Public users and the agent's tools.** Public users steer the agent. The `ask` profile's confined tools (AGT-09, AGT-28, AGT-30) and the subagent allowlist (AGT-31) are what keep them away from the worker token on disk and in `/proc`. Because there is no shell, a public user can't run code in the worker except through bugs in the confined tools. omp itself reads every `@<path>` in a prompt into the model's context, from anywhere on the filesystem; the agent host therefore neutralises `@` in every prompt and steer it sends, and in every `task` assignment before a subagent starts, and turns off prompt templates and slash commands. The host also gets an environment built from an allowlist, without the supervisor's `ASKBOT_*` variables, and fails the run if the session's tools differ from the profile. The phase 9 security review ([security-review.md](security-review.md)) records these findings and their tests.
 
 ### 6.1 Model sign-ins
 

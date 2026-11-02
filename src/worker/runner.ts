@@ -102,10 +102,43 @@ export async function makeRunDirs(root: string, runLocal: string): Promise<RunDi
 	return dirs;
 }
 
-/** The agent host's environment: omp's `HOME`, agent dir and `TMPDIR` run-local (spike S2) and the run marker (AGT-06). */
-export function hostEnv(dirs: RunDirs, marker: string): Record<string, string | undefined> {
+/**
+ * Variables the agent host inherits from the supervisor (security review F2): locale, time zone, proxies and CA
+ * bundles. Nothing else: no `ASKBOT_*` (the worker token file, the orchestrator URL) and no `PI_*`/`OMP_*` overrides.
+ */
+const HOST_ENV_NAMES: readonly string[] = [
+	"PATH",
+	"LANG",
+	"LANGUAGE",
+	"TZ",
+	"HTTP_PROXY",
+	"HTTPS_PROXY",
+	"NO_PROXY",
+	"ALL_PROXY",
+	"http_proxy",
+	"https_proxy",
+	"no_proxy",
+	"all_proxy",
+	"SSL_CERT_FILE",
+	"SSL_CERT_DIR",
+	"NODE_EXTRA_CA_CERTS",
+	"BUN_RUNTIME_TRANSPILER_CACHE_PATH",
+];
+/** `LC_*` locale variables, and the test suite's hooks into the fixture host (`TEST_*`). */
+const HOST_ENV_PREFIXES: readonly string[] = ["LC_", "TEST_"];
+
+/**
+ * The agent host's environment (F2: an allowlist, never the supervisor's whole environment): omp's `HOME`, agent dir
+ * and `TMPDIR` run-local (spike S2), the run marker (AGT-06), and `extra` (dry-run's provider keys).
+ */
+export function hostEnv(dirs: RunDirs, marker: string, extra: Record<string, string> = {}): Record<string, string | undefined> {
+	const env: Record<string, string | undefined> = {};
+	for (const [name, value] of Object.entries(process.env)) {
+		if (HOST_ENV_NAMES.includes(name) || HOST_ENV_PREFIXES.some(prefix => name.startsWith(prefix))) env[name] = value;
+	}
 	return {
-		...process.env,
+		...env,
+		...extra,
 		HOME: dirs.home,
 		PI_CODING_AGENT_DIR: dirs.auth,
 		TMPDIR: dirs.tmp,

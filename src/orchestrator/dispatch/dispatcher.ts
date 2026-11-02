@@ -134,6 +134,10 @@ export interface Dispatcher {
 /** RUN-14: the Discord state of a run's live messages, kept per ask thread so a restarted orchestrator edits the same messages. */
 export interface RunUiState {
 	statusMessage?: { channelId: string; messageId: string };
-	/** Latest progress snapshot (state, activity, elapsed, cost). */
-	progress?: { state: string; activity: string; elapsedMs: number; costUsd: number };
+	/**
+	 * Latest progress snapshot (state, activity, elapsed, cost). `startedAtMs` (epoch ms) is when the status message's
+	 * clock started; a restarted orchestrator counts elapsed time from it, so the gap since the last edit and the downtime
+	 * are not lost. `elapsedMs` is the elapsed time at the last edit.
+	 */
+	progress?: { state: string; activity: string; elapsedMs: number; costUsd: number; startedAtMs?: number };
 }

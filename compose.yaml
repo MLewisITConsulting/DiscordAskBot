@@ -6,9 +6,8 @@
 #
 # Variables (shell environment or a `.env` file next to this file):
 #   ASKBOT_IMAGE                 image of all three services and of the workers (default ghcr.io/factotuminok/askbot:latest)
-#   ASKBOT_WORKER_IMAGE          derived worker image with target-repo toolchains, built FROM the same version (optional)
 #   ASKBOT_WORKER_CAPACITY       most worker containers at once, also the orchestrator's run cap (default 4)
-#   ASKBOT_WORKER_MEMORY         memory limit per worker, no swap (default 4g); ASKBOT_WORKER_DISK checkout limit (default 20g)
+#   ASKBOT_WORKER_MEMORY         memory limit per worker, no swap (default 4g); ASKBOT_WORKER_DISK scratch limit (default 2g)
 #   ASKBOT_WORKER_CPUS           CPU quota per worker, in CPUs like `podman run --cpus` (default 2)
 #   ASKBOT_SECRETS_DIR           directory written by scripts/init-secrets.sh (default ./secrets, next to this file)
 #   ASKBOT_WORKER_SECRET         Podman secret holding the worker token (default askbot_worker_token)
@@ -57,8 +56,6 @@ services:
       ASKBOT_WORKER_TOKEN_FILE: /run/secrets/askbot_worker_token
       ASKBOT_SCALE_TOKEN_FILE: /run/secrets/askbot_scale_token
       ASKBOT_WORKER_CAPACITY: ${ASKBOT_WORKER_CAPACITY:-4}
-      # Checkpoint and result bundles larger than a worker's checkout limit are refused (STO-06).
-      ASKBOT_WORKER_DISK: ${ASKBOT_WORKER_DISK:-20g}
       ASKBOT_WORKER_ADDRESS_BINDING: ${ASKBOT_WORKER_ADDRESS_BINDING:-on}
     secrets: [askbot_master_key, askbot_web_api_token, askbot_worker_token, askbot_scale_token]
     volumes:
@@ -75,8 +72,7 @@ services:
       ASKBOT_ORCHESTRATOR_URL: http://orchestrator:8081
       ASKBOT_WEB_TRUSTED_PROXIES: ${ASKBOT_WEB_TRUSTED_PROXIES:-}
     secrets: [askbot_web_api_token]
-    volumes:
-      - askbot-web:/home/askbot
+    # No volume: web keeps nothing (requirements DB-03).
     ports:
       - "127.0.0.1:${ASKBOT_WEB_HOST_PORT:-8080}:8080"
     depends_on:
@@ -94,13 +90,12 @@ services:
     environment:
       ASKBOT_ROLE: launcher
       ASKBOT_IMAGE: ${ASKBOT_IMAGE:-ghcr.io/factotuminok/askbot:latest}
-      ASKBOT_WORKER_IMAGE: ${ASKBOT_WORKER_IMAGE:-}
       ASKBOT_WORKER_NETWORK: ${ASKBOT_NETWORK:-askbot}-workers
       ASKBOT_WORKER_SECRET: ${ASKBOT_WORKER_SECRET:-askbot_worker_token}
       ASKBOT_WORKER_CAPACITY: ${ASKBOT_WORKER_CAPACITY:-4}
       ASKBOT_WORKER_MEMORY: ${ASKBOT_WORKER_MEMORY:-4g}
       ASKBOT_WORKER_CPUS: ${ASKBOT_WORKER_CPUS:-2}
-      ASKBOT_WORKER_DISK: ${ASKBOT_WORKER_DISK:-20g}
+      ASKBOT_WORKER_DISK: ${ASKBOT_WORKER_DISK:-2g}
       ASKBOT_ORCHESTRATOR_URL: http://orchestrator:8081
       ASKBOT_PODMAN_SOCKET: /run/podman/podman.sock
       ASKBOT_SCALE_TOKEN_FILE: /run/secrets/askbot_scale_token
@@ -128,7 +123,6 @@ networks:
 
 volumes:
   askbot-state: {}
-  askbot-web: {}
 
 secrets:
   askbot_master_key:

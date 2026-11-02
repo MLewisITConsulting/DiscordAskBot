@@ -38,10 +38,6 @@ app.kubernetes.io/component: {{ . }}
 {{- printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag) }}
 {{- end }}
 
-{{- define "askbot.workerImage" -}}
-{{- printf "%s:%s" (default .Values.image.repository .Values.worker.image.repository) (default (default .Chart.AppVersion .Values.image.tag) .Values.worker.image.tag) }}
-{{- end }}
-
 {{- define "askbot.secretName" -}}
 {{- default (include "askbot.fullname" .) .Values.secrets.existingSecret }}
 {{- end }}
@@ -132,11 +128,11 @@ affinity:
 {{- end }}
 {{- end }}
 
-{{/* ASKBOT_WORKER_DISK from worker.diskLimit: the same binary size in Podman notation (20Gi -> 20g). */}}
+{{/* ASKBOT_WORKER_DISK from worker.diskLimit: the same binary size in Podman notation (2Gi -> 2g). */}}
 {{- define "askbot.workerDisk" -}}
 {{- $limit := toString .Values.worker.diskLimit }}
 {{- if not (regexMatch "^[0-9]+(Ki|Mi|Gi|Ti)$" $limit) }}
-{{- fail (printf "worker.diskLimit must be a whole number of Ki, Mi, Gi or Ti (e.g. 20Gi), got %q" $limit) }}
+{{- fail (printf "worker.diskLimit must be a whole number of Ki, Mi, Gi or Ti (e.g. 2Gi), got %q" $limit) }}
 {{- end }}
 {{- $limit | lower | trimSuffix "i" }}
 {{- end }}

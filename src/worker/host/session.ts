@@ -11,6 +11,7 @@ import {
 	SessionManager,
 	type YieldDetails,
 } from "@oh-my-pi/pi-coding-agent";
+import type { PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { loadSkillsFromDir } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { type SubagentEventPayload, TASK_SUBAGENT_EVENT_CHANNEL } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
@@ -117,6 +118,48 @@ export function checkSessionCwd(cwd: string, scratchRoot: string): void {
 	}
 }
 
+/** AGT-09 (security review F3): throws unless `active` is exactly `expected`, so an omp change that adds a tool fails. */
+export function checkProfileTools(profile: AgentProfile, expected: readonly string[], active: readonly string[]): void {
+	const missing = expected.filter(name => !active.includes(name));
+	const extra = active.filter(name => !expected.includes(name));
+	if (missing.length > 0 || extra.length > 0) {
+		throw new Error(`The session's tools differ from the ${profile} profile (missing: ${missing.join(", ") || "none"}; extra: ${extra.join(", ") || "none"})`);
+	}
+}
+
+/**
+ * Security review F1: omp reads every `@<path>` in a prompt into the context, from anywhere on the filesystem
+ * (`#promptWithMessage`, utils/file-mentions.ts), bypassing the confined tools. A word joiner before every `@` fails
+ * omp's mention-boundary check and leaves the text readable. Applied to every text the host hands to omp as a user
+ * message, and to the model-written `task` assignment, which becomes the child's prompt.
+ */
+export function neutraliseMentions(text: string): string {
+	return text.replaceAll("@", "\u2060@");
+}
+
+/** `neutraliseMentions` on every string inside a JSON-like value. */
+function neutraliseStrings(value: unknown): unknown {
+	if (typeof value === "string") return neutraliseMentions(value);
+	if (Array.isArray(value)) return value.map(neutraliseStrings);
+	if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, v]) => [key, neutraliseStrings(v)]));
+	return value;
+}
+
+/**
+ * Extension that rewrites the `task` tool's arguments before it runs, so no assignment a (possibly steered) model
+ * writes can make a subagent's prompt read a file (F1 route b); omp executes, and records, the revised input. A
+ * restricted session ignores `extensions` and binds only prepared ones (sdk.ts "Restricted children retain parent
+ * hooks"), which its children rebind too.
+ */
+const NEUTRALISE_TASK_MENTIONS: PreparedExtension = {
+	path: "<askbot-task-mentions>",
+	resolvedPath: "<askbot-task-mentions>",
+	error: null,
+	factory: pi => {
+		pi.on("tool_call", event => (event.toolName === "task" ? { input: neutraliseStrings(event.input) as Record<string, unknown> } : undefined));
+	},
+};
+
 /** AGT-14. */
 const WALL_CLOCK_CHECK_MS = 15_000;
 const YIELD_NUDGE = "You have not called yield. Call yield now with data matching the required schema.";
@@ -152,10 +195,13 @@ export async function runSession(runtime: SessionRuntime, opts: SessionOptions):
 		agentRegistry: new AgentRegistry(),
 		hasUI: false,
 		interactivePrompts: false,
-		enableMCP: false,
 		disableExtensionDiscovery: true,
 		// The only extension root: the downloaded skills and agents (AGT-24).
 		additionalExtensionPaths: [runtime.ompDir],
+		preloadedPreparedExtensions: [NEUTRALISE_TASK_MENTIONS],
+		// F4: no slash commands or prompt templates are expanded in user text.
+		slashCommands: [],
+		promptTemplates: [],
 		skills,
 		// AGT-31: the only spawnable agents (task description and preflight); "" disables spawning (spike A2).
 		spawns: agents.map(agent => agent.name).join(","),
@@ -276,9 +322,8 @@ export async function runSession(runtime: SessionRuntime, opts: SessionOptions):
 	try {
 		const sessionFile = session.sessionFile;
 		if (!sessionFile) throw new Error("Agent session has no session file");
-		const active = session.getActiveToolNames();
-		const missing = toolNames.filter(name => !active.includes(name));
-		if (missing.length > 0) log("warn", "profile tools unavailable", { run, profile: opts.profile, missing });
+		// AGT-09 (security review F3): exactly the profile's tools, or the run fails before any prompt.
+		checkProfileTools(opts.profile, toolNames, session.getActiveToolNames());
 		await opts.onSessionFile(sessionFile);
 		if (opts.onLoadout) {
 			const disabledAgents = omp.settings["task.disabledAgents"];
@@ -293,7 +338,8 @@ export async function runSession(runtime: SessionRuntime, opts: SessionOptions):
 		opts.register({
 			steer: async text => {
 				transcript({ type: "steer", text });
-				await session.steer(text);
+				// omp does not read mentions in steers today; neutralised anyway, as every user text is (F1).
+				await session.steer(neutraliseMentions(text));
 			},
 			abort: async reason => {
 				abortWith(reason);
@@ -304,7 +350,7 @@ export async function runSession(runtime: SessionRuntime, opts: SessionOptions):
 		const prompt = async (text: string) => {
 			transcript({ type: "prompt", text });
 			try {
-				await session.prompt(text);
+				await session.prompt(neutraliseMentions(text), { expandPromptTemplates: false });
 				await session.waitForIdle();
 			} catch (err) {
 				// An abort (ours or the post-yield contingency) can surface as a rejected prompt.

@@ -41,8 +41,8 @@ spec:
   jobTargetRef:
     # The orchestrator owns retries (RUN-04); a pod with nothing to claim exits 0.
     backoffLimit: 0
-    # The pod and its emptyDir volumes are deleted a minute after the run (RUN-20). No activeDeadlineSeconds: a run
-    # may wait up to askTimeoutHours for an answer.
+    # The pod and its emptyDir volumes are deleted a minute after the run (RUN-20). No activeDeadlineSeconds: runs are
+    # bounded by the 20-minute turn limit (AGT-14) and the worker's own exit.
     ttlSecondsAfterFinished: 60
     template:
       metadata:
@@ -50,13 +50,13 @@ spec:
           {{- include "askbot.labels" (dict "root" . "component" "worker") | nindent 10 }}
       spec:
         restartPolicy: Never
-        # Time for the final checkpoint on eviction (RUN-18).
+        # Time for a final session upload on eviction (RUN-18).
         terminationGracePeriodSeconds: 60
         {{- include "askbot.podSpec" . | nindent 8 }}
         {{- with include "askbot.scheduling" .Values.worker | trim }}{{ . | nindent 8 }}{{ end }}
         containers:
           - name: worker
-            image: {{ include "askbot.workerImage" . }}
+            image: {{ include "askbot.image" . }}
             imagePullPolicy: {{ .Values.image.pullPolicy }}
             args: ["worker"]
             env:
@@ -85,8 +85,8 @@ spec:
             resources:
               {{- toYaml .Values.worker.resources | nindent 14 }}
             volumeMounts:
-              # The checkout root is $TMPDIR/askbot-worker (architecture §5).
-              - name: checkout
+              # The worker root is $TMPDIR/askbot-worker (architecture §5).
+              - name: scratch
                 mountPath: /tmp
               - name: run-local
                 mountPath: /run/askbot
@@ -94,8 +94,8 @@ spec:
                 mountPath: /run/secrets
                 readOnly: true
         volumes:
-          # Backstop for the worker's own checkout-size limit (STO-06), enforced by the kubelet.
-          - name: checkout
+          # Backstop for the worker's own scratch-size limit (STO-06), enforced by the kubelet.
+          - name: scratch
             emptyDir:
               sizeLimit: {{ .Values.worker.diskLimit }}
           - name: run-local

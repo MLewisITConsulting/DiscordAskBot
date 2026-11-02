@@ -50,6 +50,19 @@ test("progress edits of one message coalesce in the queue: only the latest state
 	await progress.finish("done");
 });
 
+test("a phase that changes nothing visible makes no edit; a changed cost does (DSC-32)", async () => {
+	const { fake, messages } = setup();
+	const progress = await startProgress(fake, "thread-1", "Answering", "Waiting for a worker…");
+	progress.phase("Waiting for a worker…");
+	progress.phase("Waiting for a worker…", 0);
+	await fake.settled();
+	expect(messages()[0]!.edits).toBe(0);
+	progress.phase("Waiting for a worker…", 0.1);
+	await fake.settled();
+	expect(messages()[0]!.history).toEqual([expect.stringContaining("$0.00"), expect.stringContaining("$0.10\n↳ Waiting for a worker…")]);
+	await progress.finish("done");
+});
+
 test("stop ends updates without writing a final state (engine detach)", async () => {
 	const { fake, messages } = setup();
 	const progress = await startProgress(fake, "thread-1", "Answering", "Thinking…");
@@ -114,6 +127,25 @@ describe("restore after a restart (RUN-14)", () => {
 		await fake.settled();
 		expect(messages()).toHaveLength(1);
 		expect(messages()[0]!.content).toStartWith("✅ **Answering**");
+	});
+
+	test("a restored progress counts from when the turn started, including the time since the last edit and the downtime", async () => {
+		const { fake, messages } = setup();
+		const before = Date.now();
+		let stored: RunUiState | undefined;
+		const first = await startProgress(fake, "thread-1", "Answering", "Starting…", { persist: s => (stored = s) });
+		first.stop();
+		expect(stored?.progress?.startedAtMs).toBeGreaterThanOrEqual(before);
+		expect(stored?.progress?.startedAtMs).toBeLessThanOrEqual(Date.now());
+
+		// The last edit stored 10 s, but the turn started a minute ago: the gap and the downtime still count.
+		const restore: RunUiState = { ...stored, progress: { ...stored!.progress!, elapsedMs: 10_000, startedAtMs: Date.now() - 60_000 } };
+		const second = await startProgress(fake, "thread-1", "Answering", "Starting…", { restore, persist: s => (stored = s) });
+		await fake.settled();
+		expect(messages()).toHaveLength(1);
+		expect(messages()[0]!.content).toContain("· 1m 0s ·");
+		expect(stored?.progress?.startedAtMs).toBe(restore.progress!.startedAtMs);
+		second.stop();
 	});
 
 	test("a deleted message is posted anew and its new id stored", async () => {

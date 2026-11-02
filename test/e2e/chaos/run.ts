@@ -1,24 +1,25 @@
 #!/usr/bin/env bun
-// Chaos tests on the rootless compose stack (implementation.md §4 Phase 11; wiki/verification.md NFR-02/03/04). The stack is
-// compose.yaml plus compose.chaos.yaml: the chaos image (test/e2e/chaos/Containerfile) as orchestrator and workers (the
-// real internals with fake Discord and the fixture agent host), the real web and launcher, and the fake GitHub as its
-// own service, so both fakes outlive orchestrator restarts. No Discord, GitHub or model credentials are needed.
-//   chaos   per seed: ISSUES issues through the phase 5 flow (label → plan → approve → implement → push CI green →
-//           PR → review comment → revise → merge → done, thread archived) while a seeded RNG crashes the orchestrator,
-//           web, launcher or a worker at random points (a crash is SIGKILL to every process but the container's init,
-//           so the restart policy brings the service back; the orchestrator at most once per re-attach grace). The
-//           seed fixes the crash times and targets; which run a worker crash hits depends on timing. A job failed by
-//           its second lost worker (RUN-04) gets the user's Retry click. Asserts every issue done, no duplicated PRs,
-//           comments, Discord messages or pushes, no run left unfinished, no worker container left.
-//   limits  one issue fills its checkout past ASKBOT_WORKER_DISK, one OOM-kills its agent host, one OOM-kills a tool
-//           process and finishes, one is ordinary: each failure is reported for its run only, the others finish.
+// Chaos tests on the rootless compose stack (implementation.md phase 9; requirements NFR-03 to NFR-05). The stack is
+// compose.yaml plus test/e2e/compose/compose.e2e.yaml: the e2e scenario image (test/e2e/k8s/Containerfile) as the
+// orchestrator and the workers (the real internals with the fake Discord, kept in a file on the state volume so it
+// outlives orchestrator restarts, and the fixture agent host), the real web and launcher. No Discord or model
+// credentials are needed.
+//   chaos   per seed: ASKS `/ask` threads (fixture runs held 15-60 s) while a seeded RNG crashes the orchestrator, web,
+//           the launcher or a worker at random points (a crash is SIGKILL to every process but the container's init, so
+//           the restart policy brings the service back; the orchestrator at most once per re-attach grace). The seed
+//           fixes the crash times and targets; which run a worker crash hits depends on timing. A turn failed by a lost
+//           worker (RUN-04) gets the user's follow-up ("try again"). Asserts every thread ends with exactly one answer,
+//           each failure is a lost worker followed by a successful retry, no duplicated Discord message, no run left
+//           unfinished, no worker container left.
+//   limits  one run fills its scratch past ASKBOT_WORKER_DISK, one OOM-kills its agent host, one OOM-kills a tool
+//           process and still answers, one is ordinary: each failure is reported in its own thread only.
 //
 // Usage: bun test/e2e/chaos/run.ts [chaos] [limits]       (default both, chaos first)
 // Env:
 //   SEEDS          comma-separated seeds of the chaos rounds (default one random seed; printed)
-//   ISSUES         issues per chaos round (default 4)
+//   ASKS           `/ask` threads per chaos round (default 4)
 //   KILL_MIN_S, KILL_MAX_S  seconds between crashes (default 5, 20)
-//   SKIP_BUILD=1   use localhost/askbot:dev and localhost/askbot-chaos:dev as they are on the rootless engine
+//   SKIP_BUILD=1   use localhost/askbot:dev and localhost/askbot-e2e:dev as they are on the rootless engine
 //   KEEP=1         leave the stack running afterwards
 //   ROOTLESS_CONNECTION  Podman connection of the rootless engine (default podman-machine-default; empty = local podman)
 import { cp, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
@@ -29,19 +30,18 @@ import { $, type Subprocess } from "bun";
 const root = join(import.meta.dir, "..", "..", "..");
 const conn = process.env.ROOTLESS_CONNECTION ?? "podman-machine-default";
 const baseImage = "localhost/askbot:dev";
-const chaosImage = "localhost/askbot-chaos:dev";
+const e2eImage = "localhost/askbot-e2e:dev";
 const project = "askbot-chaos";
 const network = "askbot-chaos";
 const workerSecret = "askbot_chaos_worker_token";
 const ORCH_PORT = 18181;
-const GITHUB_PORT = 18191;
 const WEB_PORT = 18180;
 const LEASE_MS = 10_000;
 // Rootless Podman gives a restarted orchestrator a new address: workers notice their dead connection by the
 // keepalive (up to 30 s), then may need another 30 s for Bun's DNS cache to let go of the old address. The product
 // default re-attach grace, 90 s, covers both.
 const REATTACH_GRACE_MS = 90_000;
-const ISSUES = Number(process.env.ISSUES || 4);
+const ASKS = Number(process.env.ASKS || 4);
 const KILL_MIN_S = Number(process.env.KILL_MIN_S || 5);
 const KILL_MAX_S = Number(process.env.KILL_MAX_S || 20);
 const ROUND_TIMEOUT_MS = 20 * 60_000;
@@ -118,7 +118,7 @@ const stackEnv: Record<string, string> = {
 	...(conn ? { CONTAINER_CONNECTION: conn } : {}),
 	DOCKER_HOST: forwardVars.docker_host!,
 	PODMAN_COMPOSE_WARNING_LOGS: "false",
-	ASKBOT_IMAGE: chaosImage,
+	ASKBOT_IMAGE: e2eImage,
 	ASKBOT_BASE_IMAGE: baseImage,
 	ASKBOT_NETWORK: network,
 	ASKBOT_WORKER_SECRET: workerSecret,
@@ -129,13 +129,13 @@ const stackEnv: Record<string, string> = {
 	// Small enough for the limits scenario, roomy for the fixture's runs: a worker and its agent host use ~150 MB.
 	ASKBOT_WORKER_MEMORY: "512m",
 	ASKBOT_WORKER_DISK: "2m",
-	CHAOS_ORCH_PORT: String(ORCH_PORT),
-	CHAOS_GITHUB_PORT: String(GITHUB_PORT),
+	E2E_ORCH_PORT: String(ORCH_PORT),
+	E2E_ADMIN_PASSWORD: "chaos-admin-password",
+	E2E_MAX_CHAT_SESSIONS: "4",
 	E2E_LEASE_MS: String(LEASE_MS),
 	E2E_REATTACH_GRACE_MS: String(REATTACH_GRACE_MS),
-	E2E_MAX_CONCURRENT_JOBS: "4",
 };
-const composeArgs = ["compose", "-f", join(root, "compose.yaml"), "-f", join(import.meta.dir, "compose.chaos.yaml"), "-p", project];
+const composeArgs = ["compose", "-f", join(root, "compose.yaml"), "-f", join(root, "test", "e2e", "compose", "compose.e2e.yaml"), "-p", project];
 const compose = (...args: string[]) => $`${podman} ${composeArgs} ${args}`.env(stackEnv).quiet();
 const pm = (...args: string[]) => $`${podman} ${args}`.env(stackEnv).quiet().nothrow();
 
@@ -186,9 +186,9 @@ async function cleanup(): Promise<void> {
 say(`clean state (project ${project}, network ${network})`);
 await teardown();
 if (!process.env.SKIP_BUILD) {
-	say(`build ${baseImage} and ${chaosImage} (rootless)`);
+	say(`build ${baseImage} and ${e2eImage} (rootless)`);
 	await $`${podman} build -q -t ${baseImage} ${root}`.quiet();
-	await $`${podman} build -q -f ${join(import.meta.dir, "Containerfile")} --ignorefile ${join(import.meta.dir, "Containerfile.containerignore")} --build-arg BASE_IMAGE=${baseImage} -t ${chaosImage} ${root}`.quiet();
+	await $`${podman} build -q -f ${join(root, "test", "e2e", "k8s", "Containerfile")} --ignorefile ${join(root, "test", "e2e", "k8s", "Containerfile.containerignore")} --build-arg BASE_IMAGE=${baseImage} -t ${e2eImage} ${root}`.quiet();
 }
 await $`${join(root, "scripts", "init-secrets.sh")}`.env(stackEnv).quiet();
 const webToken = (await readFile(join(work, "secrets", "askbot_web_api_token"), "utf8")).trim();
@@ -207,61 +207,52 @@ async function control<T>(path: string, body?: object): Promise<T> {
 	if (!res.ok) throw new Error(`${path}: ${res.status} ${await res.text()}`);
 	return (await res.json()) as T;
 }
-async function github<T>(path: string, body?: object): Promise<T> {
-	const res = await fetch(`http://127.0.0.1:${GITHUB_PORT}${path}`, {
-		method: body ? "POST" : "GET",
-		headers: { "content-type": "application/json" },
-		body: body ? JSON.stringify(body) : undefined,
-		signal: AbortSignal.timeout(10_000),
-	});
-	if (!res.ok) throw new Error(`github ${path}: ${res.status} ${await res.text()}`);
-	return (await res.json()) as T;
-}
 
 interface Message {
 	id: string;
 	bot: boolean;
 	content: string;
-	buttons: string[];
+	files: string[];
 }
-interface IssueView {
-	number: number;
-	state: string | null;
-	branch: string | null;
-	pr: number | null;
-	job: { kind: string; status: string; result: string | null; error: string | null } | null;
-	thread: { id: string; archived: boolean; messages: Message[] } | null;
+interface Thread {
+	id: string;
+	messages: Message[];
 }
 interface Run {
 	id: string;
-	kind: string;
-	issue: number | null;
+	thread: string;
 	state: string;
 	outcome: string | null;
+	error: string | null;
 	worker: string | null;
+	createdAt: string;
 }
 interface State {
 	phase: string;
 	runs: Run[];
 }
-interface GhIssue {
-	number: number;
-	title: string;
-	body: string;
-	state: string;
-	labels: string[];
-	pull: { head: string; merged: boolean } | null;
-	comments: { id: number; login: string; body: string }[];
-}
-interface GhState {
-	issues: GhIssue[];
-	pushes: { at: number; old: string; sha: string; ref: string; forced: boolean }[];
-	branches: Record<string, { sha: string; log: string[] }>;
-	mutating: Record<string, number>;
+
+const ANSWER = "📄 **Answer attached:**";
+const DONE = "✅ **Done.**";
+const FAILED = "❌ **Failed:**";
+const LOST = "the worker running this was lost";
+const RETRY = "Please try again. fixture:auto";
+const botMessages = (t: Thread | undefined) => (t?.messages ?? []).filter(m => m.bot);
+
+async function threads(ids: string[]): Promise<Thread[]> {
+	const all = await control<Thread[]>("threads");
+	return ids.map(id => all.find(t => t.id === id) ?? { id, messages: [] });
 }
 
-const issuesView = (numbers: number[]) => control<IssueView[]>(`issues?numbers=${numbers.join(",")}`);
-const said = (v: IssueView, text: string) => v.thread?.messages.some(m => m.bot && m.content.includes(text)) ?? false;
+async function ask(prompts: string[]): Promise<string[]> {
+	const ids: string[] = [];
+	for (const prompt of prompts) {
+		const { thread, reply } = await control<{ thread: string | null; reply: string | null }>("ask", { prompt });
+		if (!thread) throw new Error(`/ask refused: ${reply}`);
+		ids.push(thread);
+	}
+	return ids;
+}
 
 await until(async () => (await control<State>("state")).phase === "running", "the engine to run", 180_000);
 await until(async () => (await fetch(`http://127.0.0.1:${WEB_PORT}/healthz`)).ok, "web /healthz", 120_000);
@@ -355,107 +346,80 @@ async function chaosMonkey(random: () => number, done: () => boolean, kills: Kil
 	}
 }
 
-// ---- the phase 5 flow per issue ---------------------------------------------------------------------------------------
+// ---- one thread's flow ------------------------------------------------------------------------------------------------
 
 interface Flow {
-	number: number;
-	approvedAt?: number;
-	commentedAt?: number;
-	mergedAt?: number;
-	doneAt?: number;
+	thread: string;
 	startedAt: number;
-	/** Retry clicks after a job failed on its second lost worker (RUN-04). */
+	doneAt?: number;
+	/** Follow-ups sent after a turn failed on a lost worker (RUN-04). */
 	retries: number;
 	retriedAt?: number;
 }
 
-const REVIEW = "/askbot please tidy this up fixture:auto";
-
-/** One step of an issue's flow; true when it is done and archived. */
-async function step(f: Flow, v: IssueView): Promise<boolean> {
-	if (v.state === "done" && v.thread?.archived) {
+/** One step of a thread's flow; true once it is answered and its run finished. */
+async function step(f: Flow, t: Thread, runs: Run[]): Promise<boolean> {
+	const messages = t.messages;
+	const lastStatus = messages.findLastIndex(m => m.bot && (m.content.startsWith(DONE) || m.content.startsWith(FAILED)));
+	const status = messages[lastStatus];
+	const open = runs.some(r => r.thread === f.thread && !["finished", "lost"].includes(r.state));
+	if (status?.content.startsWith(DONE) && !open) {
 		f.doneAt ??= Date.now();
 		return true;
 	}
-	// RUN-04: a job whose worker is lost twice fails with a Retry button; the user's way on is to click it.
-	if (v.state === "failed" && /worker running this was lost/.test(v.job?.error ?? "")) {
-		if (!f.retriedAt || Date.now() - f.retriedAt > 15_000) {
-			say(`   #${f.number}: ${v.job?.kind} job failed on its second lost worker (RUN-04); clicking Retry`);
-			await control("click", { issue: f.number, label: "Retry" }).catch(err => say(`   #${f.number}: Retry: ${err}`));
-			f.retries++;
-			f.retriedAt = Date.now();
-		}
-		return false;
-	}
-	if (v.state === "failed" || v.state === "cancelled") throw new Fatal(`issue #${f.number} ended ${v.state}: ${v.job?.kind} job ${v.job?.status}: ${v.job?.error ?? ""}`);
-	const planMsg = v.thread?.messages.findLast(m => m.bot && m.content.includes("Plan ready for your approval") && m.buttons.includes("Approve"));
-	// Approve; again after a while if the click was lost in a crash.
-	if (v.state === "awaiting_approval" && planMsg && (!f.approvedAt || Date.now() - f.approvedAt > 15_000)) {
-		await control("approve", { issue: f.number }).catch(() => undefined);
-		f.approvedAt = Date.now();
-	}
-	if (v.state === "in_review" && v.pr && !f.commentedAt && said(v, "Implementation complete")) {
-		await github("/comment", { number: v.pr, body: REVIEW });
-		f.commentedAt = Date.now();
-	}
-	if (v.state === "in_review" && v.pr && f.commentedAt && !f.mergedAt && said(v, "Review feedback addressed")) {
-		await github("/merge", { number: v.pr });
-		f.mergedAt = Date.now();
-	}
+	if (!status?.content.startsWith(FAILED)) return false;
+	if (!status.content.includes(LOST)) throw new Fatal(`thread ${f.thread} failed: ${status.content}`);
+	// RUN-04: the user's way on is to ask again in the thread. Again after a while if the message was lost in a crash.
+	const followed = messages.slice(lastStatus + 1).some(m => !m.bot);
+	if (open || (followed && f.retriedAt && Date.now() - f.retriedAt < 30_000)) return false;
+	say(`   ${f.thread}: turn failed on a lost worker (RUN-04); asking again`);
+	await control("message", { thread: f.thread, content: RETRY }).catch(err => say(`   ${f.thread}: follow-up: ${err}`));
+	f.retries++;
+	f.retriedAt = Date.now();
 	return false;
 }
 
-async function fileIssues(bodies: string[]): Promise<number[]> {
-	const numbers: number[] = [];
-	for (const body of bodies) numbers.push(...(await github<{ numbers: number[] }>("/issues", { body })).numbers);
-	return numbers;
-}
-
 /** Fingerprint of a bot message for duplicate detection: its text without the volatile parts. */
-const fingerprint = (content: string) => content.replace(/\b[0-9a-f]{7,40}\b/g, "<sha>").replace(/\d+(\.\d+)?\s?(s|ms|min)\b/g, "<t>");
+const fingerprint = (content: string) => content.replace(/\b[0-9a-f]{7,40}\b/g, "<id>").replace(/\d+(\.\d+)?\s?(s|ms|min|m)\b/g, "<t>").replace(/\$\d+(\.\d+)?/g, "<$>");
 
 interface Check {
 	ok: boolean;
 	line: string;
 }
 
-/** `retried`: issues whose job the driver re-ran with Retry, which repeats its Discord messages legitimately. */
-async function verify(numbers: number[], expectRevise: boolean, retried: ReadonlySet<number> = new Set()): Promise<Check[]> {
+/**
+ * Every thread answered once (one `answer.md`, the last status "Done"), every failure a lost worker, no bot message
+ * repeated more often than the thread had turns (`retries` + 1; a turn posts its own status message), then no run
+ * unfinished and no worker container left.
+ */
+async function verify(flows: Flow[]): Promise<Check[]> {
 	const checks: Check[] = [];
 	const check = (ok: boolean, line: string) => checks.push({ ok, line: `${ok ? "ok  " : "FAIL"} ${line}` });
-	const views = await issuesView(numbers);
-	const gh = await github<GhState>("/state");
-	for (const v of views) {
-		const tag = `#${v.number}`;
-		check(v.state === "done", `${tag} done (state ${v.state})`);
-		check(v.thread?.archived === true, `${tag} thread archived`);
-		const pulls = gh.issues.filter(i => i.pull && i.pull.head === v.branch);
-		check(pulls.length === 1, `${tag} exactly one PR for ${v.branch} (${pulls.map(p => `#${p.number}`).join(", ")})`);
-		const issue = gh.issues.find(i => i.number === v.number)!;
-		const planComments = issue.comments.filter(c => c.body.startsWith("<!-- askbot:plan -->"));
-		check(planComments.length === 1, `${tag} one plan comment on the issue (${planComments.length})`);
-		for (const target of [issue, ...pulls]) {
-			const bodies = target.comments.filter(c => c.login.endsWith("[bot]")).map(c => c.body);
-			const dupes = bodies.filter((b, i) => bodies.indexOf(b) !== i);
-			check(dupes.length === 0, `${tag} no duplicated bot comment on #${target.number} (${bodies.length} bot comments${dupes.length ? `; duplicated: ${dupes.map(d => JSON.stringify(d.slice(0, 80))).join(", ")}` : ""})`);
-		}
-		const botMessages = (v.thread?.messages ?? []).filter(m => m.bot);
-		const prints = botMessages.map(m => fingerprint(m.content));
-		const dupes = prints.filter((p, i) => prints.indexOf(p) !== i);
-		const repeats = `${botMessages.length} bot messages${dupes.length ? `; repeated: ${dupes.map(d => JSON.stringify(d.slice(0, 80))).join(", ")}` : ""}`;
-		if (retried.has(v.number)) check(true, `${tag} Discord messages repeated only by the Retry click (${repeats})`);
-		else check(dupes.length === 0, `${tag} no duplicated Discord message (${repeats})`);
-		const branch = v.branch ? gh.branches[v.branch] : undefined;
-		const log = branch?.log ?? [];
-		const revisions = log.filter(s => s === "Address the follow-up").length;
-		check(revisions === (expectRevise ? 1 : 0), `${tag} branch log has ${revisions} revise commit(s): ${log.join(" ← ")}`);
-		const pushes = gh.pushes.filter(p => p.ref === `refs/heads/${v.branch}`);
-		const forced = pushes.filter(p => p.forced);
-		check(forced.length === 0, `${tag} ${pushes.length} push(es) to ${v.branch}, ${forced.length} forced`);
+	const views = await threads(flows.map(f => f.thread));
+	for (const [i, t] of views.entries()) {
+		const f = flows[i]!;
+		const bot = botMessages(t);
+		const answers = bot.filter(m => m.content.startsWith(ANSWER) && m.files.includes("answer.md"));
+		check(answers.length === 1, `${t.id}: exactly one answer.md (${answers.length})`);
+		const statuses = bot.filter(m => m.content.startsWith(DONE) || m.content.startsWith(FAILED));
+		check(statuses.at(-1)?.content.startsWith(DONE) === true, `${t.id}: ends with "Done" (${statuses.map(m => m.content.split("\n")[0]!.slice(0, 40)).join(" → ")})`);
+		const failures = statuses.filter(m => m.content.startsWith(FAILED));
+		check(
+			failures.every(m => m.content.includes(LOST)) && failures.length <= f.retries,
+			`${t.id}: ${failures.length} failure(s), all lost workers, each followed by a retry (${f.retries} follow-up(s))`,
+		);
+		const turns = f.retries + 1;
+		const counts = new Map<string, number>();
+		for (const m of bot) counts.set(fingerprint(m.content), (counts.get(fingerprint(m.content)) ?? 0) + 1);
+		const repeated = [...counts].filter(([print, n]) => n > (print.startsWith(ANSWER) || print.startsWith(DONE) ? 1 : turns));
+		check(
+			repeated.length === 0,
+			`${t.id}: no duplicated Discord message (${bot.length} bot messages, ${turns} turn(s)${repeated.length ? `; repeated: ${repeated.map(([p, n]) => `${n}× ${JSON.stringify(p.slice(0, 80))}`).join(", ")}` : ""})`,
+		);
 	}
 	const state = await control<State>("state");
 	const open = state.runs.filter(r => !["finished", "lost"].includes(r.state));
-	check(open.length === 0, `no run left unfinished (${open.map(r => `${r.kind}/${r.state}`).join(", ") || "none"})`);
+	check(open.length === 0, `no run left unfinished (${open.map(r => `${r.thread}/${r.state}`).join(", ") || "none"})`);
 	const left = await until(async () => (await workerContainers(true)).length === 0 && "none", "worker containers to go", 120_000).catch(async () => (await workerContainers(true)).join(", "));
 	check(left === "none", `no worker container left (${left})`);
 	return checks;
@@ -466,16 +430,12 @@ let failed = false;
 
 async function chaosRound(seed: number): Promise<void> {
 	const random = rng(seed);
-	say(`== chaos round, seed ${seed}: ${ISSUES} issues, a crash every ${KILL_MIN_S}-${KILL_MAX_S} s`);
-	const bodies = Array.from({ length: ISSUES }, () => {
-		const plan = 10 + Math.floor(random() * 30);
-		const implement = 15 + Math.floor(random() * 45);
-		return `Please make a change. fixture:slow fixture-plan-seconds:${plan} fixture-implement-seconds:${implement}`;
-	});
+	say(`== chaos round, seed ${seed}: ${ASKS} /ask threads, a crash every ${KILL_MIN_S}-${KILL_MAX_S} s`);
+	const holds = Array.from({ length: ASKS }, () => 15 + Math.floor(random() * 45));
 	const started = Date.now();
-	const numbers = await fileIssues(bodies);
-	say(`filed ${numbers.map(n => `#${n}`).join(" ")}: ${bodies.map(b => b.replace(/.*fixture:slow /, "")).join(" | ")}`);
-	const flows: Flow[] = numbers.map(number => ({ number, startedAt: started, retries: 0 }));
+	const ids = await ask(holds.map((hold, i) => `Chaos question ${i + 1}. fixture:slow fixture-hold-seconds:${hold}`));
+	say(`asked ${ids.map((id, i) => `${id} (holds ${holds[i]} s)`).join(", ")}`);
+	const flows: Flow[] = ids.map(thread => ({ thread, startedAt: started, retries: 0 }));
 	const kills: Kill[] = [];
 	let finished = false;
 	const monkey = chaosMonkey(random, () => finished, kills);
@@ -483,16 +443,22 @@ async function chaosRound(seed: number): Promise<void> {
 	try {
 		await until(
 			async () => {
-				const views = await issuesView(numbers).catch(() => undefined);
-				if (!views) return false;
-				const line = views.map(v => `#${v.number}:${v.state}${v.thread?.archived ? "(archived)" : ""}`).join(" ");
+				const views = await threads(ids).catch(() => undefined);
+				const state = await control<State>("state").catch(() => undefined);
+				if (!views || !state) return false;
+				const line = views
+					.map(t => {
+						const run = state.runs.filter(r => r.thread === t.id).at(-1);
+						return `${t.id}:${run ? `${run.state}${run.outcome ? `/${run.outcome}` : ""}` : "-"}`;
+					})
+					.join(" ");
 				if (line !== lastLine) say(`   ${line}`);
 				lastLine = line;
 				let all = true;
-				for (const [i, v] of views.entries()) all = (await step(flows[i]!, v)) && all;
+				for (const [i, t] of views.entries()) all = (await step(flows[i]!, t, state.runs)) && all;
 				return all;
 			},
-			"every issue to be done",
+			"every thread to be answered",
 			ROUND_TIMEOUT_MS,
 		);
 	} finally {
@@ -501,11 +467,11 @@ async function chaosRound(seed: number): Promise<void> {
 	}
 	const totalS = ((Date.now() - started) / 1000).toFixed(0);
 	const killList = kills.map(k => `${k.target}@+${((Date.parse(k.at) - started) / 1000).toFixed(0)}s${k.downMs ? `(back in ${(k.downMs / 1000).toFixed(1)}s)` : ""}`).join(", ");
-	say(`all done in ${totalS} s; ${kills.length} crashes: ${killList || "none"}`);
-	for (const f of flows) say(`   #${f.number}: done after ${(((f.doneAt ?? Date.now()) - f.startedAt) / 1000).toFixed(0)} s${f.retries ? `, ${f.retries} Retry click(s) (RUN-04)` : ""}`);
-	// The issues just finished; give the last Discord writes and worker removals a moment.
+	say(`all answered in ${totalS} s; ${kills.length} crashes: ${killList || "none"}`);
+	for (const f of flows) say(`   ${f.thread}: answered after ${(((f.doneAt ?? Date.now()) - f.startedAt) / 1000).toFixed(0)} s${f.retries ? `, ${f.retries} follow-up(s) after a lost worker (RUN-04)` : ""}`);
+	// The threads just finished; give the last Discord writes and worker removals a moment.
 	await Bun.sleep(5_000);
-	const checks = await verify(numbers, true, new Set(flows.filter(f => f.retries > 0).map(f => f.number)));
+	const checks = await verify(flows);
 	for (const c of checks) say(`   ${c.line}`);
 	const bad = checks.filter(c => !c.ok).length;
 	if (bad) {
@@ -513,57 +479,54 @@ async function chaosRound(seed: number): Promise<void> {
 		await saveLogs();
 	}
 	const retries = flows.reduce((n, f) => n + f.retries, 0);
-	results.push(`chaos seed ${seed}: ${bad ? `FAIL (${bad} checks)` : "PASS"}, ${ISSUES} issues in ${totalS} s, ${retries} Retry click(s), ${kills.length} crashes: ${killList}`);
+	results.push(`chaos seed ${seed}: ${bad ? `FAIL (${bad} checks)` : "PASS"}, ${ASKS} threads in ${totalS} s, ${retries} follow-up(s) after lost workers, ${kills.length} crashes: ${killList}`);
 }
 
 async function limitsRound(): Promise<void> {
-	say("== limits round: a full disk, an OOM-killed agent host, an OOM-killed tool process, an ordinary issue");
+	say("== limits round: a full scratch disk, an OOM-killed agent host, an OOM-killed tool process, an ordinary question");
 	const started = Date.now();
-	const [disk, oomHost, oomChild, plain] = await fileIssues([
+	const [disk, oomHost, oomChild, plain] = await ask([
 		"Please fill the disk. fixture:fillDisk",
 		"Please use too much memory. fixture:oomHost",
 		"Please run a memory hog. fixture:oomChild",
-		"Please make a change. fixture:auto",
+		"Please answer. fixture:auto",
 	]);
-	say(`filed disk #${disk}, oomHost #${oomHost}, oomChild #${oomChild}, plain #${plain}`);
-	const flows = new Map<number, Flow>([oomChild!, plain!].map(number => [number, { number, startedAt: started, retries: 0 }]));
-	const numbers = [disk!, oomHost!, oomChild!, plain!];
+	say(`asked disk ${disk}, oomHost ${oomHost}, oomChild ${oomChild}, plain ${plain}`);
+	const ids = [disk!, oomHost!, oomChild!, plain!];
+	const statusOf = (t: Thread) => botMessages(t).findLast(m => m.content.startsWith(DONE) || m.content.startsWith(FAILED))?.content.split("\n")[0] ?? "-";
 	let lastLine = "";
 	await until(
 		async () => {
-			const views = await issuesView(numbers);
-			const line = views.map(v => `#${v.number}:${v.state}`).join(" ");
+			const views = await threads(ids);
+			const line = views.map(t => `${t.id}:${statusOf(t).slice(0, 30)}`).join(" ");
 			if (line !== lastLine) say(`   ${line}`);
 			lastLine = line;
-			let all = views.slice(0, 2).every(v => v.state === "failed");
-			for (const v of views.slice(2)) all = (await step(flows.get(v.number)!, v)) && all;
-			return all;
+			const state = await control<State>("state");
+			return views.every(t => statusOf(t) !== "-") && state.runs.every(r => ["finished", "lost"].includes(r.state));
 		},
 		"the limits round",
 		10 * 60_000,
 	);
 	const totalS = ((Date.now() - started) / 1000).toFixed(0);
-	const views = await issuesView(numbers);
-	const gh = await github<GhState>("/state");
+	const views = await threads(ids);
 	const checks: Check[] = [];
 	const check = (ok: boolean, line: string) => checks.push({ ok, line: `${ok ? "ok  " : "FAIL"} ${line}` });
-	const byNumber = (n: number) => views.find(v => v.number === n)!;
-	const threadText = (n: number) => (byNumber(n).thread?.messages ?? []).filter(m => m.bot).map(m => m.content).join("\n");
-	const diskView = byNumber(disk!);
-	check(/ran out of disk space/.test(diskView.job?.error ?? ""), `disk #${disk}: job ${diskView.job?.kind}/${diskView.job?.status}: ${diskView.job?.error}`);
-	check(/ran out of disk space/.test(threadText(disk!)), `disk #${disk}: the thread reports the full disk`);
-	const hostView = byNumber(oomHost!);
-	check(/most likely ran out of memory/.test(hostView.job?.error ?? ""), `oomHost #${oomHost}: job ${hostView.job?.kind}/${hostView.job?.status}: ${hostView.job?.error}`);
-	check(/ran out of memory/.test(threadText(oomHost!)), `oomHost #${oomHost}: the thread reports the OOM kill`);
-	const childView = byNumber(oomChild!);
-	const childPr = gh.issues.find(i => i.number === childView.pr);
-	check(childView.state === "done", `oomChild #${oomChild}: done (state ${childView.state})`);
-	check(!!childPr?.body.includes("Local verification incomplete"), `oomChild #${oomChild}: PR #${childView.pr} body carries the OOM warning (AGT-19)`);
-	check(threadText(oomChild!).includes("Local verification incomplete"), `oomChild #${oomChild}: the Discord message carries the OOM warning`);
-	const plainView = byNumber(plain!);
-	check(plainView.state === "done", `plain #${plain}: done (state ${plainView.state})`);
-	check(!threadText(plain!).includes("Local verification incomplete") && !/out of (disk|memory)/.test(threadText(plain!)), `plain #${plain}: no OOM or disk report`);
-	for (const c of await verify([oomChild!, plain!], true)) checks.push(c);
+	const text = (id: string) =>
+		botMessages(views.find(t => t.id === id))
+			.map(m => m.content)
+			.join("\n");
+	const answered = (id: string) => botMessages(views.find(t => t.id === id)).filter(m => m.files.includes("answer.md")).length;
+	const oomWarning = "ran out of memory during this turn";
+	const failure = (id: string) => text(id).split("\n").find(l => l.startsWith(FAILED)) ?? "(no failure)";
+	check(/ran out of disk space/.test(failure(disk!)) && answered(disk!) === 0, `disk ${disk}: ${failure(disk!)}`);
+	check(/most likely ran out of memory/.test(failure(oomHost!)) && answered(oomHost!) === 0, `oomHost ${oomHost}: ${failure(oomHost!)}`);
+	check(answered(oomChild!) === 1 && text(oomChild!).includes(oomWarning) && !text(oomChild!).includes(FAILED), `oomChild ${oomChild}: answered with the OOM warning (AGT-19)`);
+	check(answered(plain!) === 1 && !text(plain!).includes(oomWarning) && !text(plain!).includes(FAILED) && !/out of (disk|memory)/.test(text(plain!)), `plain ${plain}: answered, no OOM or disk report`);
+	for (const [name, id] of [["disk", disk], ["oomHost", oomHost]] as const) {
+		check(!text(id!).includes(oomWarning) && (name === "disk" ? !/memory/.test(failure(id!)) : !/disk/.test(failure(id!))), `${name} ${id}: only its own failure reported`);
+	}
+	const left = await until(async () => (await workerContainers(true)).length === 0 && "none", "worker containers to go", 120_000).catch(async () => (await workerContainers(true)).join(", "));
+	check(left === "none", `no worker container left (${left})`);
 	for (const c of checks) say(`   ${c.line}`);
 	const bad = checks.filter(c => !c.ok).length;
 	if (bad) {
@@ -576,10 +539,11 @@ async function limitsRound(): Promise<void> {
 /** Every service's whole log and the orchestrator's run history, kept after the stack is gone. */
 async function saveLogs(): Promise<void> {
 	const logs = await mkdtemp(join(tmpdir(), "askbot-chaos-logs-"));
-	for (const s of ["orchestrator", "web", "launcher", "github"]) {
+	for (const s of ["orchestrator", "web", "launcher"]) {
 		await Bun.write(join(logs, `${s}.log`), (await compose("logs", "--no-color", "--timestamps", s).nothrow()).stdout);
 	}
 	await Bun.write(join(logs, "state.json"), JSON.stringify(await control<State>("state").catch(e => ({ error: String(e) })), null, 1));
+	await Bun.write(join(logs, "threads.json"), JSON.stringify(await control<Thread[]>("threads").catch(e => ({ error: String(e) })), null, 1));
 	await cp(workerLogs, join(logs, "workers"), { recursive: true });
 	say(`logs in ${logs}`);
 }

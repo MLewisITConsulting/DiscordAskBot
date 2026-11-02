@@ -3,7 +3,10 @@ import { join } from "node:path";
 
 /** `compose.yaml` as the compose providers read it (YAML merge keys resolved; `${…}` left as written). */
 interface Service {
+	image?: string;
+	command?: string[];
 	networks?: string[];
+	volumes?: string[];
 	environment?: Record<string, string>;
 	healthcheck?: { test: string[]; interval: string; timeout: string; start_period: string; retries: number };
 }
@@ -34,5 +37,18 @@ describe("compose.yaml", () => {
 		expect(compose.services.launcher?.networks).toEqual(["askbot"]);
 		// The launcher attaches workers to the workers network, by its fixed name.
 		expect(compose.services.launcher?.environment?.ASKBOT_WORKER_NETWORK).toBe(compose.networks.workers?.name);
+	});
+
+	test("one image for every service and the workers; web keeps nothing; workers get 2g of scratch by default", () => {
+		const image = "${ASKBOT_IMAGE:-ghcr.io/factotuminok/askbot:latest}";
+		for (const [name, service] of Object.entries(compose.services)) {
+			expect(service.image).toBe(image);
+			expect(service.command).toEqual([name]);
+		}
+		expect(compose.services.launcher?.environment?.ASKBOT_IMAGE).toBe(image);
+		// DB-03: no volume for web; only the orchestrator has state.
+		expect(compose.services.web?.volumes).toBeUndefined();
+		expect(compose.services.orchestrator?.volumes).toEqual(["askbot-state:/state"]);
+		expect(compose.services.launcher?.environment?.ASKBOT_WORKER_DISK).toBe("${ASKBOT_WORKER_DISK:-2g}");
 	});
 });

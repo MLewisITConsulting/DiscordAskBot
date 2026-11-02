@@ -35,9 +35,6 @@ spec:
               value: /run/secrets/askbot_scale_token
             - name: ASKBOT_WORKER_CAPACITY
               value: {{ .Values.worker.maxReplicas | quote }}
-            # Checkpoint and result bundles larger than a worker's checkout limit are refused (STO-06).
-            - name: ASKBOT_WORKER_DISK
-              value: {{ include "askbot.workerDisk" . | quote }}
             {{- if not .Values.worker.addressBinding }}
             - name: ASKBOT_WORKER_ADDRESS_BINDING
               value: "off"

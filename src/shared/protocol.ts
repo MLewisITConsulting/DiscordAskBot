@@ -21,7 +21,7 @@ export interface HostRuntime {
 
 export interface StartOptions {
 	runId: string;
-	/** Working directory: the run's scratch copy (CHAT-07). */
+	/** Working directory: a run directory outside the scratch copy, with no `.omp` in or above it (AGT-24). */
 	cwd: string;
 	/** Directory the session file is written in. */
 	sessionDir: string;

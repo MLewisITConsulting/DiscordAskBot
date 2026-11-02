@@ -43,6 +43,8 @@ async function packageVersion(dir: string): Promise<string> {
 function sourceCommit(): string {
 	const fromBuild = process.env.ASKBOT_COMMIT;
 	if (fromBuild && fromBuild !== "unknown") return fromBuild;
+	// The image has no git (architecture §7.1): spawning it would throw.
+	if (!Bun.which("git")) return "unknown";
 	const git = Bun.spawnSync(["git", "rev-parse", "--short=12", "HEAD"], { cwd: APP_ROOT, stdout: "pipe", stderr: "ignore" });
 	return git.exitCode === 0 ? git.stdout.toString().trim() : "unknown";
 }
