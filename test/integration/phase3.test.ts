@@ -340,6 +340,22 @@ describe("phase 3 exit", () => {
 		expect(h.orch.db.getRun(runId)?.state).toBe("finished");
 	}, 25_000);
 
+	test("a file attached to a message that steers the live run reaches the worker before the steer (CHAT-08)", async () => {
+		const h = await boot();
+		const threadId = await ask(h, "fixture:chatHeld hold until told", [{ name: "first.txt", content: "first\n" }]);
+		h.spawnWorker();
+		await until(() => running(h, threadId), "the held run");
+		h.files.set("late.txt", "late\n");
+		await h.discord.emitMessage({
+			channelId: threadId,
+			content: "please finish now",
+			attachments: [{ name: "late.txt", url: h.attachmentUrl("late.txt"), size: 5 }],
+			actor: h.discord.actor(ALICE, { username: "alice" }),
+		});
+		await until(() => said(h, threadId, "✅ **Done.**").length === 1, "the chat to finish");
+		expect(fileText(withFile(h, threadId, "answer.md")[0]!, "answer.md")).toBe("Held run finished. Inputs: first.txt, late.txt.");
+	}, 25_000);
+
 	test("a turn still waiting for a worker at a restart is re-issued with its prompt and answered (NFR-03)", async () => {
 		const h = await boot();
 		const threadId = await ask(h, "fixture:chatHeld hold until told");

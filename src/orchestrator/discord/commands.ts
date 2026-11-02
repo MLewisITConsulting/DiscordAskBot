@@ -22,7 +22,7 @@ export function commandDefinitions(agentName: string): RESTPostAPIChatInputAppli
 		description: `Ask ${agentName} a question in a new thread`.slice(0, 100),
 		options: [
 			{ type: ApplicationCommandOptionType.String, name: "prompt", description: "Question or request", required: true },
-			file("file", "A file for the agent to use"),
+			file("file", "A file for the agent. Pick it here: files added with the + button are not sent"),
 			file("file2", "Another file"),
 			file("file3", "Another file"),
 		],

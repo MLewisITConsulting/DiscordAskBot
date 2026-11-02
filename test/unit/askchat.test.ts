@@ -292,7 +292,7 @@ describe("follow-ups (CHAT-03, DSC-06)", () => {
 		const steer = await a.h.discord.emitMessage({ channelId: id, content: "also this", actor: a.allowed, attachments: [{ name: "notes.txt", url: "n1", size: 5 }] });
 		await until(() => a.h.discord.message(steer.ref!.messageId)?.reactions.includes("👀") === true, "👀");
 		expect(run.steers).toHaveLength(1);
-		expect(run.steers[0]).toMatchObject({ from: "alice", scratchInputs: ["inputs/notes.txt"] });
+		expect(run.steers[0]).toMatchObject({ from: "alice", scratchInputs: ["notes.txt"] });
 		expect(run.steers[0]!.text).toContain("also this\n\n## Attached files\n- inputs/notes.txt");
 
 		const ignored = await a.h.discord.emitMessage({ channelId: id, content: "let me in", actor: a.stranger });

@@ -146,6 +146,8 @@ Everything an admin enters lives in the orchestrator's encrypted settings vault 
 
 Allowed members (`allowedUserIds`, `allowedRoleIds`) may follow up, steer and `/stop` in every ask thread and are exempt from the one-live-run limit; everyone else can do so only in the threads they started.
 
+Files go in through the `file`, `file2` and `file3` options of `/ask`, or as attachments to a reply in the thread. A file added with the message box's + button while `/ask` is in it is dropped by Discord and never reaches the bot.
+
 ## Security notes
 
 Read [architecture §6](wiki/architecture.md) and the [security review](wiki/security-review.md) before opening an ask channel to the public. In short:

@@ -191,7 +191,10 @@ const scripts: Record<string, (opts: SessionOptions, runtime: FixtureRuntime) =>
 		opts.onUsage(usage(0.5));
 		return result(opts, { output: { answer: `Summarised \`${input}\` into \`outputs/summary.txt\`.` } });
 	},
-	/** An `/ask` turn that holds until it is steered with a message containing `finish`; then writes `outputs/held.txt` and answers. */
+	/**
+	 * An `/ask` turn that holds until it is steered with a message containing `finish`; then writes `outputs/held.txt`
+	 * and answers, naming the files in `inputs/` (those a steer attached included).
+	 */
 	async chatHeld(opts) {
 		await opts.onSessionFile(sessionFile(opts));
 		const { promise, resolve } = Promise.withResolvers<HostResult["aborted"] | "finish">();
@@ -207,7 +210,8 @@ const scripts: Record<string, (opts: SessionOptions, runtime: FixtureRuntime) =>
 		mkdirSync(join(opts.scratchRoot, "outputs"), { recursive: true });
 		writeFileSync(join(opts.scratchRoot, "outputs", "held.txt"), "held\n");
 		opts.onUsage(usage(0.5));
-		return result(opts, { output: { answer: "Held run finished." } });
+		const inputs = readdirSync(join(opts.scratchRoot, "inputs")).sort();
+		return result(opts, { output: { answer: `Held run finished. Inputs: ${inputs.join(", ") || "none"}.` } });
 	},
 	/** Fills the scratch copy past a small disk limit, then waits to be stopped (STO-06). */
 	async fillDisk(opts) {

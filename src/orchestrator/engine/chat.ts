@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { basename } from "node:path";
 import { errorMessage, log } from "../../shared/log";
 import type { RunUsage } from "../../shared/transcript";
 import { askThreadAllowed, memberAllowed } from "../discord/access";
@@ -386,8 +387,9 @@ export function createAskChat(deps: EngineDeps, opts: AskChatOptions): AskChat {
 		if (!text) return;
 		const handle = handles.get(threadId);
 		if (handle) {
-			// Delivery can wait for the worker (RUN-15); the message handler does not.
-			void acknowledgeSteer(discord, e.ref, onQueued => handle.steer(askFollowUp(text, saved), e.actor.username, { onQueued, scratchInputs: saved })).catch(
+			// Delivery can wait for the worker (RUN-15); the message handler does not. `scratch-input` takes names in `inputs/`.
+			const scratchInputs = saved.map(path => basename(path));
+			void acknowledgeSteer(discord, e.ref, onQueued => handle.steer(askFollowUp(text, saved), e.actor.username, { onQueued, scratchInputs })).catch(
 				err => log("warn", "ask steer failed", { thread: threadId, error: errorMessage(err) }),
 			);
 			return;
@@ -434,8 +436,13 @@ export function createAskChat(deps: EngineDeps, opts: AskChatOptions): AskChat {
 			const top = await discord.send(e.where.channelId, { content: `💬 **${e.actor.username}** asked:\n${prompt}`.slice(0, MAX_MESSAGE) }, "high");
 			const threadId = await discord.startThread(top, { name: prompt.slice(0, 100) || "Question", autoArchiveMinutes: 1440 });
 			const chat = db.insertAskChat(threadId, e.where.channelId, e.actor.userId);
-			log("info", "ask chat started", { thread: threadId, channel: e.where.channelId, user: e.actor.userId });
-			await e.editReply({ content: `Started <#${threadId}>. Progress and the answer will appear there; reply in the thread to follow up.` });
+			log("info", "ask chat started", { thread: threadId, channel: e.where.channelId, user: e.actor.userId, files: e.attachments.length });
+			// Discord drops a file added with the message box's + button while /ask is in it; the command never carries it.
+			const fileHint =
+				e.attachments.length === 0
+					? "\nTo give the agent a file, reply in the thread with it, or use the `file` option of `/ask`: files added with the + button are not sent with a command."
+					: "";
+			await e.editReply({ content: `Started <#${threadId}>. Progress and the answer will appear there; reply in the thread to follow up.${fileHint}` });
 			let saved: string[];
 			try {
 				saved = await saveInputs(threadId, e.attachments, MAX_COMMAND_FILES);

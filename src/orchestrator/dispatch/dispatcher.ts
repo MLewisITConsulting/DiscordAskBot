@@ -50,7 +50,7 @@ export type AbortReason = "user" | "time" | "cost";
 export interface SteerOptions {
 	/** Called once if the text can't be delivered right now (worker disconnected, host not `registered`): react ⏳ (RUN-15). */
 	onQueued?(): void;
-	/** New ask attachments saved to `inputs/` that the worker must download before this steer (`scratch-input`, CHAT-08). */
+	/** Names (not paths) of new ask attachments saved to `inputs/` that the worker must download before this steer (`scratch-input`, CHAT-08). */
 	scratchInputs?: string[];
 }
 
