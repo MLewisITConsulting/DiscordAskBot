@@ -5,7 +5,7 @@
 # the Podman socket) and podman-compose. Docker Engine is not supported: the launcher refuses a rootful socket (LCH-01).
 #
 # Variables (shell environment or a `.env` file next to this file):
-#   ASKBOT_IMAGE                 image of all three services and of the workers (default ghcr.io/factotuminok/askbot:latest)
+#   ASKBOT_IMAGE                 image of all three services and of the workers (default ghcr.io/mlewisitconsulting/askbot:latest)
 #   ASKBOT_WORKER_CAPACITY       most worker containers at once, also the orchestrator's run cap (default 4)
 #   ASKBOT_WORKER_MEMORY         memory limit per worker, no swap (default 4g); ASKBOT_WORKER_DISK scratch limit (default 2g)
 #   ASKBOT_WORKER_CPUS           CPU quota per worker, in CPUs like `podman run --cpus` (default 2)
@@ -30,7 +30,7 @@
 name: askbot
 
 x-askbot: &askbot
-  image: ${ASKBOT_IMAGE:-ghcr.io/factotuminok/askbot:latest}
+  image: ${ASKBOT_IMAGE:-ghcr.io/mlewisitconsulting/askbot:latest}
   user: "10001:10001"
   userns_mode: "keep-id:uid=10001,gid=10001"
   init: true
@@ -89,7 +89,7 @@ services:
     security_opt: ["label=disable"]
     environment:
       ASKBOT_ROLE: launcher
-      ASKBOT_IMAGE: ${ASKBOT_IMAGE:-ghcr.io/factotuminok/askbot:latest}
+      ASKBOT_IMAGE: ${ASKBOT_IMAGE:-ghcr.io/mlewisitconsulting/askbot:latest}
       ASKBOT_WORKER_NETWORK: ${ASKBOT_NETWORK:-askbot}-workers
       ASKBOT_WORKER_SECRET: ${ASKBOT_WORKER_SECRET:-askbot_worker_token}
       ASKBOT_WORKER_CAPACITY: ${ASKBOT_WORKER_CAPACITY:-4}

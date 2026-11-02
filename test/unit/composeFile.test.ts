@@ -40,7 +40,7 @@ describe("compose.yaml", () => {
 	});
 
 	test("one image for every service and the workers; web keeps nothing; workers get 2g of scratch by default", () => {
-		const image = "${ASKBOT_IMAGE:-ghcr.io/factotuminok/askbot:latest}";
+		const image = "${ASKBOT_IMAGE:-ghcr.io/mlewisitconsulting/askbot:latest}";
 		for (const [name, service] of Object.entries(compose.services)) {
 			expect(service.image).toBe(image);
 			expect(service.command).toEqual([name]);

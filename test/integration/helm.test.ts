@@ -279,7 +279,7 @@ describe.skipIf(!HELM)("helm chart", () => {
 		expectHardened(spec);
 		const [c] = spec.containers;
 		expect(c.args).toEqual(["worker"]);
-		expect(c.image).toBe("ghcr.io/factotuminok/askbot:0.1.0");
+		expect(c.image).toBe("ghcr.io/mlewisitconsulting/askbot:0.1.0");
 		expect(c.readinessProbe).toMatchObject({ exec: { command: ["askbot", "health", "--claimed"] }, periodSeconds: 1, failureThreshold: 1 });
 		expect(c.livenessProbe.exec).toEqual({ command: ["askbot", "health"] });
 		expect(env(c)).toEqual({
@@ -440,11 +440,11 @@ describe.skipIf(!HELM)("helm chart", () => {
 		expect(job.spec.maxReplicaCount).toBe(3);
 		const spec = podSpec(job);
 		expect(spec.nodeSelector).toEqual({ pool: "workers" });
-		expect(spec.containers[0]?.image).toBe("ghcr.io/factotuminok/askbot:0.1.42");
+		expect(spec.containers[0]?.image).toBe("ghcr.io/mlewisitconsulting/askbot:0.1.42");
 		expect(spec.containers[0] && env(spec.containers[0]).ASKBOT_WORKER_DISK).toBe("5g");
 		expect(spec.volumes.find(v => v.name === "scratch")?.emptyDir?.sizeLimit).toBe("5Gi");
 		const orch = podSpec(find(objects, "Deployment", "askbot-orchestrator")).containers[0];
-		expect(orch?.image).toBe("ghcr.io/factotuminok/askbot:0.1.42");
+		expect(orch?.image).toBe("ghcr.io/mlewisitconsulting/askbot:0.1.42");
 		expect(orch && env(orch).ASKBOT_WORKER_CAPACITY).toBe("3");
 	});
 

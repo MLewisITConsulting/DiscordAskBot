@@ -4,7 +4,7 @@ A long-running service that answers questions in Discord with the omp agent (`@o
 
 ## Installation
 
-AskBot ships as one image, `ghcr.io/factotuminok/askbot:<version>` / `:latest`; the role is the command argument (`orchestrator`, `web`, `worker`, `launcher`; OPS-01). There are two supported installation paths: rootless Podman and Kubernetes. Docker Engine cannot run the full stack.
+AskBot ships as one image, `ghcr.io/mlewisitconsulting/askbot:<version>` / `:latest`; the role is the command argument (`orchestrator`, `web`, `worker`, `launcher`; OPS-01). There are two supported installation paths: rootless Podman and Kubernetes. Docker Engine cannot run the full stack.
 
 | | Podman (rootless) | Kubernetes | Docker Engine |
 |---|---|---|---|
@@ -15,7 +15,7 @@ AskBot ships as one image, `ghcr.io/factotuminok/askbot:<version>` / `:latest`; 
 | Secrets | `scripts/init-secrets.sh`: files in `secrets/` and the Podman secret `askbot_worker_token` | the chart generates Secret `askbot`, or use `secrets.existingSecret` | none |
 | Steps | [Running on Podman](#running-on-podman) | [Running on Kubernetes](#running-on-kubernetes) | [Docker Engine](#docker-engine-not-supported) |
 
-CI only tests, publishes `ghcr.io/factotuminok/askbot:<version>` and `:latest`, and tags `v<version>`; deployments of a particular installation are not run from this repository.
+CI only tests, publishes `ghcr.io/mlewisitconsulting/askbot:<version>` and `:latest`, and tags `v<version>`; deployments of a particular installation are not run from this repository.
 
 ## Running on Podman
 
@@ -30,7 +30,7 @@ CI only tests, publishes `ghcr.io/factotuminok/askbot:<version>` and `:latest`, 
    loginctl enable-linger "$USER"   # keep it, and the stack, running after you log out
    ```
 
-2. **Get the image.** Released images are `ghcr.io/factotuminok/askbot:<version>` and `:latest` (the default):
+2. **Get the image.** Released images are `ghcr.io/mlewisitconsulting/askbot:<version>` and `:latest` (the default):
 
    ```sh
    podman compose pull

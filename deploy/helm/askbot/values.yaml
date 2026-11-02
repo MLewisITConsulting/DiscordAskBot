@@ -4,7 +4,7 @@
 
 # The one AskBot image; the role is the container argument. The tag defaults to the chart's appVersion.
 image:
-  repository: ghcr.io/factotuminok/askbot
+  repository: ghcr.io/mlewisitconsulting/askbot
   tag: ""
   pullPolicy: IfNotPresent
 

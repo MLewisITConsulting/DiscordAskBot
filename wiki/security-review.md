@@ -226,6 +226,6 @@ On a resumed run, a thread reply is the prompt's first line (`prompts.ts:50`). `
 
 ## Not tested
 
-- Nothing was executed during this review. The tools available had no shell. The F1 proof script still has to be run, and the F1/F3 integration tests still have to be written.
+- Nothing was executed during the review itself: the tools available had no shell. The F1 and F3 fixes were tested afterwards (`test/integration/promptMentions.test.ts`, `test/unit/workerIsolation.test.ts`; see the status table).
 - Whether Podman's secret mount or the Helm secret volume would let the worker `chmod` or unmount the token after reading it. The Helm mount is `readOnly: true`, so probably not. This could be an alternative to F1 fix 2.
 - Whether a `^provider/model` mention or prewalk settings change anything in a restricted parent beyond what spike A2 measured.
