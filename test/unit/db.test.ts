@@ -2,17 +2,22 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Database } from "bun:sqlite";
-import { dbPath, hashLeaseToken, openDb } from "../../src/orchestrator/store/db";
+import { type Db, dbPath, hashLeaseToken, openDb } from "../../src/orchestrator/store/db";
 
 const LEASE_MS = 45_000;
 const later = (ms: number) => new Date(Date.now() + ms);
 
+/** A pending run of a new ask thread `thread` (runs belong to an ask thread, DB-02). */
+function newRun(db: Db, thread: string) {
+	if (!db.getAskChat(thread)) db.insertAskChat(thread, "channel", "owner");
+	return db.insertRun({ threadId: thread });
+}
+
 describe("runs", () => {
 	test("workers claim the oldest pending run, each run once, with a lease token", () => {
 		const db = openDb(":memory:");
-		const first = db.insertRun({ kind: "draft", draftId: "d1" });
-		const second = db.insertRun({ kind: "draft", draftId: "d2" });
+		const first = newRun(db, "d1");
+		const second = newRun(db, "d2");
 
 		const a = db.claimRun("worker-a", LEASE_MS)!;
 		expect(a.id).toBe(first.id);
@@ -30,29 +35,7 @@ describe("runs", () => {
 		expect(db.claimRun("worker-c", LEASE_MS)).toBeNull();
 	});
 
-	test("a lease token stored raw by an older version is hashed at open and still authorises (SEC-14)", async () => {
-		const dir = await mkdtemp(join(tmpdir(), "askbot-db-"));
-		try {
-			const first = openDb(dbPath(dir));
-			const run = first.insertRun({ kind: "draft", draftId: "d1" });
-			first.claimRun("w1", LEASE_MS);
-			first.close();
-			// What an older version left behind: the plain token in the column.
-			const raw = new Database(dbPath(dir));
-			raw.run("UPDATE runs SET lease_token = ? WHERE id = ?", ["plain-old-token", run.id]);
-			raw.close();
-			const db = openDb(dbPath(dir));
-			expect(db.getRun(run.id)!.lease_token).toBe(hashLeaseToken("plain-old-token"));
-			expect(db.runForLease("plain-old-token")?.id).toBe(run.id);
-			expect(db.runForLease(hashLeaseToken("plain-old-token"))).toBeNull();
-			expect(db.renewLease(run.id, "plain-old-token", LEASE_MS)).not.toBeNull();
-			db.close();
-		} finally {
-			await rm(dir, { recursive: true, force: true });
-		}
-	});
-
-	test("the store is WAL with synchronous=NORMAL: only checkpoints fsync, not every commit (phase 11 load test)", async () => {
+	test("the store is WAL with synchronous=NORMAL: only checkpoints fsync, not every commit (AgentBot load test)", async () => {
 		const dir = await mkdtemp(join(tmpdir(), "askbot-db-"));
 		try {
 			const db = openDb(dbPath(dir));
@@ -70,7 +53,7 @@ describe("runs", () => {
 		try {
 			const one = openDb(dbPath(dir));
 			const two = openDb(dbPath(dir));
-			for (let i = 0; i < 6; i++) one.insertRun({ kind: "draft", draftId: `d${i}` });
+			for (let i = 0; i < 6; i++) newRun(one, `t${i}`);
 			const claimed: string[] = [];
 			for (let i = 0; i < 6; i++) claimed.push((i % 2 ? one : two).claimRun(`w${i}`, LEASE_MS)!.id);
 			expect(new Set(claimed).size).toBe(6);
@@ -85,9 +68,9 @@ describe("runs", () => {
 
 	test("an expired lease requeues an assigned run and loses a running one, revoking the token", () => {
 		const db = openDb(":memory:");
-		const assigned = db.insertRun({ kind: "draft", draftId: "d1" });
-		const running = db.insertRun({ kind: "draft", draftId: "d2" });
-		const fresh = db.insertRun({ kind: "draft", draftId: "d3" });
+		const assigned = newRun(db, "d1");
+		const running = newRun(db, "d2");
+		const fresh = newRun(db, "d3");
 		const lease1 = db.claimRun("w1", LEASE_MS)!.leaseToken;
 		const lease2 = db.claimRun("w2", LEASE_MS)!.leaseToken;
 		expect(db.transitionRun(running.id, ["assigned"], "running")?.started_at).toBeTruthy();
@@ -112,7 +95,7 @@ describe("runs", () => {
 
 	test("a heartbeat keeps the lease alive; a wrong token does not", () => {
 		const db = openDb(":memory:");
-		const run = db.insertRun({ kind: "draft", draftId: "d1" });
+		const run = newRun(db, "d1");
 		const { leaseToken } = db.claimRun("w", 1000)!;
 		expect(db.renewLease(run.id, "not-the-token", LEASE_MS)).toBeNull();
 		expect(db.renewLease(run.id, leaseToken, LEASE_MS)).not.toBeNull();
@@ -121,7 +104,7 @@ describe("runs", () => {
 
 	test("after a restart, live leases get the reattach grace period", () => {
 		const db = openDb(":memory:");
-		const run = db.insertRun({ kind: "draft", draftId: "d1" });
+		const run = newRun(db, "d1");
 		db.claimRun("w", 1000);
 		db.graceLeases(90_000);
 		expect(db.expireLeases(later(60_000)).requeued).toEqual([]);
@@ -130,7 +113,7 @@ describe("runs", () => {
 
 	test("transitions only apply from the expected state", () => {
 		const db = openDb(":memory:");
-		const run = db.insertRun({ kind: "draft", draftId: "d1" });
+		const run = newRun(db, "d1");
 		expect(db.transitionRun(run.id, ["running"], "finishing")).toBeNull();
 		const cancelled = db.transitionRun(run.id, ["pending"], "finished", { outcome: "cancelled" })!;
 		expect(cancelled).toMatchObject({ state: "finished", outcome: "cancelled" });
@@ -138,24 +121,25 @@ describe("runs", () => {
 		expect(db.claimRun("w", LEASE_MS)).toBeNull();
 	});
 
-	test("an owner has at most one unfinished run, and exactly one owner is required", () => {
+	test("a thread has at most one unfinished run, and runs need an existing ask thread (RUN-21)", () => {
 		const db = openDb(":memory:");
-		const issue = db.insertIssue("o/r", 1, "t");
-		const job = db.insertJob(issue.id, "plan");
-		const run = db.insertRun({ kind: "plan", jobId: job.id });
-		expect(() => db.insertRun({ kind: "plan", jobId: job.id })).toThrow();
+		const run = newRun(db, "t1");
+		expect(() => db.insertRun({ threadId: "t1" })).toThrow();
+		expect(db.currentRun("t1")?.id).toBe(run.id);
 		db.transitionRun(run.id, ["pending"], "finished", { outcome: "cancelled" });
-		expect(db.insertRun({ kind: "plan", jobId: job.id }).state).toBe("pending");
-		expect(() => db.insertRun({ kind: "draft" })).toThrow();
-		expect(() => db.insertRun({ kind: "plan", jobId: job.id, draftId: "d" })).toThrow();
+		expect(db.currentRun("t1")).toBeNull();
+		const next = db.insertRun({ threadId: "t1", continuesRunId: run.id });
+		expect(next).toMatchObject({ state: "pending", continues_run_id: run.id });
+		expect(db.latestRun("t1")?.id).toBe(next.id);
+		expect(() => db.insertRun({ threadId: "no-such-thread" })).toThrow();
 	});
 });
 
 describe("relay", () => {
 	test("outgoing messages are numbered per run and dropped once acknowledged", () => {
 		const db = openDb(":memory:");
-		const run = db.insertRun({ kind: "draft", draftId: "d1" });
-		const other = db.insertRun({ kind: "draft", draftId: "d2" });
+		const run = newRun(db, "d1");
+		const other = newRun(db, "d2");
 		expect([1, 2, 3].map(n => db.appendOutbox(run.id, { type: "steer", n }))).toEqual([1, 2, 3]);
 		expect(db.appendOutbox(other.id, { type: "abort" })).toBe(1);
 
@@ -171,7 +155,7 @@ describe("relay", () => {
 
 	test("incoming duplicates are recognised by sequence number", () => {
 		const db = openDb(":memory:");
-		const run = db.insertRun({ kind: "draft", draftId: "d1" });
+		const run = newRun(db, "d1");
 		expect(db.acceptInbound(run.id, 1)).toBe(true);
 		expect(db.acceptInbound(run.id, 2)).toBe(true);
 		expect(db.acceptInbound(run.id, 2)).toBe(false);
@@ -180,17 +164,3 @@ describe("relay", () => {
 	});
 });
 
-describe("watches", () => {
-	test("re-watching an unwatched repository resets its cursor; resuming a suspended one keeps it", () => {
-		const db = openDb(":memory:");
-		const watch = { repoId: 42, repo: "Owner/Repo", channelId: "c1", createdBy: "u1" };
-		expect(db.watchRepo(watch)).toMatchObject({ state: "watching", cursor: null });
-		db.updateWatch(42, { cursor: "2026-01-01T00:00:00Z", state: "suspended", last_error: "no access" });
-		expect(db.watchRepo(watch)).toMatchObject({ state: "watching", cursor: "2026-01-01T00:00:00Z", last_error: null });
-
-		db.updateWatch(42, { state: "unwatched" });
-		expect(db.watchRepo({ ...watch, createdBy: "admin" })).toMatchObject({ state: "watching", cursor: null, created_by: "admin" });
-		expect(db.watchByName("owner/repo")?.repo_id).toBe(42);
-		expect(db.watchByChannel("c1")?.repo_id).toBe(42);
-	});
-});

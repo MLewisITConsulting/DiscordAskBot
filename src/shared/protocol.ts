@@ -64,7 +64,7 @@ export type ChildMessage =
 	| { t: "transcript"; event: TranscriptEvent }
 	| { t: "loadout"; loadout: Loadout }
 	| { t: "usage"; usage: RunUsage }
-	/** Sent before the prompt; the session waits for the reply so a restart can always resume it (JOB-10, RUN-18). */
+	/** Sent before the prompt; the session waits for the reply so a restart can always resume it (RUN-18). */
 	| { t: "session_file"; id: number; path: string }
 	/** The session accepts `steer` and `abort` from now on. */
 	| { t: "registered" }

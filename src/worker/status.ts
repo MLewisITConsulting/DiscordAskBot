@@ -23,14 +23,14 @@ export interface WorkerStatus {
 
 export const STATUS_FILE = "status.json";
 
-/** Parent of every worker's checkout root on this host: container storage (architecture §5, "worker checkout"). */
+/** Parent of every worker's root on this host: container storage (architecture §5, "worker scratch"). */
 export function workerBaseDir(): string {
 	return join(tmpdir(), "askbot-worker");
 }
 
 /**
  * Parent of every worker's run-local root (architecture §5, "run-local"): `ASKBOT_WORKER_RUN_DIR`, which the image
- * points at the launcher's tmpfs or the pod's memory `emptyDir`; outside the image the same parent as the checkout root.
+ * points at the launcher's tmpfs or the pod's memory `emptyDir`; outside the image the same parent as the worker root.
  */
 export function workerRunBaseDir(runDir: string | undefined = loadEnv().workerRunDir): string {
 	return runDir ?? workerBaseDir();

@@ -1,16 +1,16 @@
-import type { McpRow, McpTestState, OmpSettingInfo, OmpUpdateAdminView, OmpView, PinnedSetting, SecretKeyRow } from "../shared/adminOmp";
-import { AUTO_UPDATE_BY, installedByText, MCP_TRANSPORTS } from "../shared/adminOmp";
+import type { OmpSettingInfo, OmpUpdateView, OmpView, PinnedSetting } from "../shared/adminOmp";
+import { AUTO_UPDATE_BY, installedByText } from "../shared/adminOmp";
 import { AdminApiError } from "./adminClient";
 import { field } from "./forms";
 import { html, json, type PageContext, type PageRoutes, redirect } from "./http";
+import { formatTime } from "./live";
 import { type OmpFormState, ompFormFromSubmission, ompFormFromView, ompSaveRequestFromForm, settingText } from "./ompForms";
 import type { Flash } from "./sessions";
 import { esc, layout, messages, nav } from "./views";
 
-/** `/admin/omp`: omp setting overrides with a searchable reference, and MCP servers (AGT-20 to AGT-23). */
+/** `/admin/omp`: omp setting overrides with a searchable reference (AGT-20, AGT-23), and the update panel (WEB-33). */
 
 export const OMP_SAVED = "Saved. New agent runs use these settings; runs already in progress keep the configuration they started with.";
-export const MCP_WAITING = "Waiting for a worker…";
 
 function setBadge(set: boolean): string {
 	return `<span class="hint">${set ? "set" : "not set"}</span>`;
@@ -98,181 +98,106 @@ document.getElementById("omp-ref-filter").addEventListener("input", event => {
 </script>`;
 }
 
-/** Key/value editor with write-only values: stored keys are read-only, plus one empty add row. */
-function keyValueTable(prefix: string, label: string, rows: SecretKeyRow[]): string {
-	const body = rows.map(
-		(row, j) => `<tr><td><input type="text" name="${prefix}.${j}.key" value="${esc(row.key)}" readonly></td>
-<td><input type="password" name="${prefix}.${j}.value" autocomplete="off" placeholder="blank keeps current"> ${setBadge(row.set)}</td>
-<td><input type="checkbox" name="${prefix}.${j}.remove" aria-label="Remove ${esc(row.key)}"></td></tr>`,
-	);
-	body.push(`<tr><td><input type="text" name="${prefix}.${rows.length}.key" placeholder="new ${esc(label.toLowerCase())}"></td>
-<td><input type="password" name="${prefix}.${rows.length}.value" autocomplete="off"></td><td></td></tr>`);
-	return `<table><thead><tr><th>${esc(label)}</th><th>Value (write-only)</th><th>Remove</th></tr></thead><tbody>
-${body.join("\n")}
-</tbody></table>`;
+/** Who started an install, as the panel shows it. */
+function startedBy(by: string): string {
+	return by === AUTO_UPDATE_BY ? "started automatically" : `approved by ${by}`;
 }
 
-const EMPTY_SERVER: McpRow = {
-	name: "",
-	existing: false,
-	type: "stdio",
-	enabled: true,
-	instructions: true,
-	timeout: "",
-	command: "",
-	args: "",
-	cwd: "",
-	url: "",
-	env: [],
-	headers: [],
-};
-
-/** One server's fieldset; `row` undefined renders the empty "Add server" fieldset. */
-function serverFieldset(row: McpRow | undefined, i: number): string {
-	const server = row ?? EMPTY_SERVER;
-	const p = `mcp.${i}`;
-	const text = (name: string, label: string, value: string, attrs = "") =>
-		`<label><span>${esc(label)}</span> <input type="text" name="${p}.${name}" value="${esc(value)}" ${attrs}></label>`;
-	const check = (name: string, label: string, checked: boolean) => `<label><input type="checkbox" name="${p}.${name}"${checked ? " checked" : ""}> ${esc(label)}</label>`;
-	const transports = MCP_TRANSPORTS.map(type => `<option${type === server.type ? " selected" : ""}>${type}</option>`).join("");
-	const legend = row ? `MCP server ${esc(row.name)}` : "Add server";
-	const actions = server.existing
-		? `${check("delete", "Delete this server", false)}
-<button type="submit" formaction="/admin/omp/mcp/test" name="server" value="${esc(server.name)}">Test connection</button> <span class="hint">tests the saved configuration on a worker</span>`
-		: "";
-	return `<fieldset><legend>${legend}</legend>
-${text("name", "Name", server.name, server.existing ? "readonly" : 'placeholder="letters, digits, - and _ (max 48)"')}
-<label><span>Transport</span> <select name="${p}.type">${transports}</select></label>
-${check("enabled", "Enabled", server.enabled)}
-${check("instructions", "Include server instructions in the system prompt", server.instructions)}
-${text("timeout", "Timeout (ms)", server.timeout, 'inputmode="numeric"')}
-<h4>stdio</h4>
-${text("command", "Command", server.command)}
-<label><span>Arguments (one per line)</span> <textarea name="${p}.args">${esc(server.args)}</textarea></label>
-${text("cwd", "Working directory", server.cwd)}
-${keyValueTable(`${p}.env`, "Environment variable", server.env)}
-<h4>http / sse</h4>
-${text("url", "URL", server.url)}
-${keyValueTable(`${p}.header`, "Header", server.headers)}
-${actions}
-</fieldset>`;
-}
-
-/** What the Check now flash adds when an update is available: automatic with `omp.autoUpdate`, else approved in Discord. */
-function availableText(update: OmpUpdateAdminView): string {
-	if (!update.autoUpdate) return ` omp ${update.available} is available for workers; approve it in the Discord work channel.`;
-	return update.lastAttempt?.version === update.available && update.lastAttempt?.outcome === "failed"
-		? ` omp ${update.available} is available for workers; its automatic install failed, so approve it in the Discord work channel.`
-		: ` omp ${update.available} is available for workers; it is installed automatically (Settings → omp).`;
-}
-
-/** UPD-10: the image's omp and the workers' copy when they differ, the npm check, the last attempt, and "Check now". */
-function updateSection(update: OmpUpdateAdminView): string {
+/**
+ * WEB-33: the running omp (UPD-10: both versions when a copy is active), the npm check with **Check now**, **Approve
+ * update** when a newer omp is on offer and no install runs, the current or last attempt, and `omp.autoUpdate`.
+ */
+export function updateSection(update: OmpUpdateView): string {
 	const workers = update.active
 		? `<p>Workers use omp <code>${esc(update.active.version)}</code> (in-place update ${esc(update.active.copy)}, ${esc(installedByText(update.active.by))}, ${(update.active.size / 1024 ** 2).toFixed(1)} MiB).
 The orchestrator keeps the image's omp <code>${esc(update.image)}</code> for settings validation and sign-in.</p>`
-		: `<p>Image omp <code>${esc(update.image)}</code>, used by the orchestrator and by workers.</p>`;
+		: `<p>Running omp <code>${esc(update.image)}</code> (the image's), used by the orchestrator and by workers.</p>`;
 	const rows: [string, string][] = [
-		["Latest on npm", update.latest ? `<code>${esc(update.latest)}</code>` : "not checked yet"],
-		["Checked at", update.checkedAt ? esc(update.checkedAt) : "never"],
+		["Latest found", update.latest ? `<code>${esc(update.latest)}</code>` : "not checked yet"],
+		["Last check", update.checkedAt ? esc(formatTime(update.checkedAt)) : "never"],
 	];
 	if (update.checkError) rows.push(["Check error", `<span class="error">${esc(update.checkError)}</span>`]);
 	const state = !update.supported
 		? esc(update.unsupportedReason ?? "updates are not supported here")
 		: update.installing
-			? `installing omp ${esc(update.installing.version)} (${esc(update.installing.by === AUTO_UPDATE_BY ? "started automatically" : installedByText(update.installing.by))} at ${esc(update.installing.startedAt)})`
+			? `installing omp ${esc(update.installing.version)} (${esc(startedBy(update.installing.by))} at ${esc(formatTime(update.installing.startedAt))})…`
 			: update.available
-				? update.autoUpdate
-					? update.lastAttempt?.version === update.available && update.lastAttempt.outcome === "failed"
-						? `omp ${esc(update.available)} is available: its automatic install failed; approve it in the Discord work channel`
-						: `omp ${esc(update.available)} is available: it is installed automatically (Settings → omp)`
-					: `omp ${esc(update.available)} is available: approve it in the Discord work channel`
+				? `omp ${esc(update.available)} is available`
 				: "up to date";
 	rows.push(["Update", state]);
-	const attempt = update.lastAttempt;
+	rows.push(["Automatic updates", update.autoUpdate ? "on (<code>omp.autoUpdate</code>)" : 'off (turn on <code>omp.autoUpdate</code> in <a href="/admin">Settings</a>)']);
+	const attempt = update.attempt;
 	if (attempt) {
-		const error = attempt.error ? `: ${esc(attempt.error)}` : "";
+		const error = attempt.error ? `<div class="error">${esc(attempt.error)}</div>` : "";
 		const log = attempt.log ? `<details><summary>Output</summary><pre>${esc(attempt.log)}</pre></details>` : "";
-		const by = attempt.by === AUTO_UPDATE_BY && attempt.outcome !== "installed" ? "started automatically" : installedByText(attempt.by);
-		rows.push(["Last attempt", `omp ${esc(attempt.version)} (from ${esc(attempt.from)}), ${esc(attempt.outcome)}${error}; ${esc(by)}, ${esc(attempt.at)}${log}`]);
+		rows.push([
+			attempt.outcome === "installing" ? "Current attempt" : "Last attempt",
+			`omp ${esc(attempt.version)} (from ${esc(attempt.from)}): <strong>${esc(attempt.outcome)}</strong>; ${esc(startedBy(attempt.by))}, ${esc(formatTime(attempt.at))}${error}${log}`,
+		]);
 	}
-	return `<h2>omp version and updates</h2>
+	const approve =
+		update.supported && update.available && !update.installing
+			? `<form method="post" action="/admin/omp/update-approve"><input type="hidden" name="version" value="${esc(update.available)}"><button type="submit">Approve update to omp ${esc(update.available)}</button></form>`
+			: "";
+	return `<section id="omp-update"><h2>omp version and updates</h2>
 ${workers}
 <table><tbody>
 ${rows.map(([label, value]) => `<tr><th>${label}</th><td>${value}</td></tr>`).join("\n")}
 </tbody></table>
-<form method="post" action="/admin/omp/update-check"><button type="submit">Check now</button></form>`;
+<form method="post" action="/admin/omp/update-check"><button type="submit">Check now</button></form>
+${approve}
+</section>`;
 }
 
-export function ompPage(view: OmpView, form: OmpFormState, opts: { vscode: boolean; flash?: Flash; error?: string }): string {
-	const byId = new Map(view.reference.map(info => [info.id, info]));
-	const servers = [...form.servers, undefined].map((row, i) => serverFieldset(row, i));
-	const storedError = view.storedError
-		? `<p class="warning">The stored omp configuration no longer validates (${esc(view.storedError)}); the form shows what still does. Saving replaces it.</p>`
-		: "";
-	return layout(
-		"omp",
-		`${nav("omp", opts.vscode)}
-<h1>omp configuration</h1>
-${messages(opts.error, opts.flash)}
-${updateSection(view.update)}
-<p class="hint">Changes apply to agent runs that start after saving; runs already in progress keep the configuration they started with.
-MCP servers are connected only by implement runs and their subagents.</p>
-${storedError}
-<form method="post" action="/admin/omp">
-<button type="submit">Save omp configuration</button>
-${settingsSection(form, byId, view.reference)}
-<h2>MCP servers</h2>
-${servers.join("\n")}
-<button type="submit">Save omp configuration</button>
-</form>
-${pinnedSection(view.pinned)}
-${referenceSection(view.reference)}`,
-	);
-}
-
-const TEST_LABELS: Record<McpTestState["status"], string> = { starting: "Starting…", waiting: MCP_WAITING, running: "Connecting…", done: "Finished" };
-
-/** Reloads the page when the test's status changes (no script once it is done). */
-function testPollScript(state: McpTestState): string {
+/**
+ * WEB-33: while an install runs, polls the update state and reloads when it changes, unless the settings form was
+ * edited (then it says so instead of discarding the edits).
+ */
+function installPollScript(update: OmpUpdateView): string {
+	if (!update.installing) return "";
 	return `<script>
-setInterval(async () => {
-	try {
-		const res = await fetch(${JSON.stringify(`/admin/omp/mcp/test/${encodeURIComponent(state.id)}.json`)}, { headers: { accept: "application/json" } });
-		if (!res.ok) return location.reload();
-		if ((await res.json()).status !== ${JSON.stringify(state.status)}) location.reload();
-	} catch {}
-}, 1000);
+(function () {
+	let dirty = false;
+	document.getElementById("omp-settings")?.addEventListener("input", () => { dirty = true; });
+	const started = ${JSON.stringify(update.installing.startedAt)};
+	const timer = setInterval(async () => {
+		try {
+			const res = await fetch("/admin/omp/update.json", { headers: { accept: "application/json" } });
+			if (!res.ok) return;
+			const update = await res.json();
+			if (update.installing && update.installing.startedAt === started) return;
+			clearInterval(timer);
+			if (!dirty) return location.reload();
+			const note = document.createElement("p");
+			note.className = "status";
+			note.textContent = "The omp install finished; save or reload the page to see the result.";
+			document.getElementById("omp-update").append(note);
+		} catch {}
+	}, 3000);
+})();
 </script>`;
 }
 
-export function mcpTestPage(state: McpTestState, vscode: boolean): string {
-	const parts = [`<p>Status: <strong>${esc(TEST_LABELS[state.status])}</strong></p>`];
-	if (state.status === "waiting") parts.push(`<p class="hint">The 20 s connection timeout starts when a worker picks the test up.</p>`);
-	const result = state.result;
-	if (result?.ok) {
-		const tools = result.tools.length ? `<ul>${result.tools.map(tool => `<li><code>${esc(tool)}</code></li>`).join("")}</ul>` : "<p>The server offers no tools.</p>";
-		parts.push(`<p class="flash">Connected to ${esc(state.name)}: ${result.tools.length} tool${result.tools.length === 1 ? "" : "s"}.</p>${tools}`);
-	} else if (result) {
-		parts.push(`<p class="error" role="alert">Connection failed: ${esc(result.error ?? "unknown error")}</p>`);
-	}
-	parts.push(`<p><a href="/admin/omp">Back to omp configuration</a></p>`);
+export function ompPage(view: OmpView, form: OmpFormState, opts: { flash?: Flash; error?: string }): string {
+	const byId = new Map(view.reference.map(info => [info.id, info]));
+	const storedError = view.storedError
+		? `<p class="warning">The stored omp configuration no longer validates (${esc(view.storedError)}); the form shows the stored overrides. Saving replaces them.</p>`
+		: "";
 	return layout(
-		`Test ${state.name}`,
-		`${nav("omp", vscode)}
-<h1>Test MCP server ${esc(state.name)}</h1>
-${parts.join("\n")}
-${state.status === "done" ? "" : testPollScript(state)}`,
-	);
-}
-
-function testNotFoundPage(vscode: boolean): string {
-	return layout(
-		"Test not found",
-		`${nav("omp", vscode)}
-<h1>Test not found</h1>
-<p>This connection test does not exist or has expired.</p>
-<p><a href="/admin/omp">Back to omp configuration</a></p>`,
+		"omp",
+		`${nav("omp")}
+<h1>omp</h1>
+${messages(opts.error, opts.flash)}
+${updateSection(view.update)}
+<p class="hint">Changes apply to agent runs that start after saving; runs already in progress keep the configuration they started with.</p>
+${storedError}
+<form method="post" action="/admin/omp" id="omp-settings">
+${settingsSection(form, byId, view.reference)}
+<button type="submit">Save omp settings</button>
+</form>
+${pinnedSection(view.pinned)}
+${referenceSection(view.reference)}
+${installPollScript(view.update)}`,
 	);
 }
 
@@ -282,8 +207,16 @@ async function loadView(ctx: PageContext): Promise<OmpView | Response> {
 		return await ctx.admin.call<OmpView>("GET", "/omp");
 	} catch (err) {
 		if (!(err instanceof AdminApiError && err.status === 409)) throw err;
-		return html(layout("omp", `${nav("omp", ctx.vscode)}<h1>omp configuration</h1>${messages(err.message)}`), 409);
+		return html(layout("omp", `${nav("omp")}<h1>omp</h1>${messages(err.message)}`), 409);
 	}
+}
+
+/** The Check now flash: the npm result and what happens next. */
+function checkedText(update: OmpUpdateView): string {
+	const latest = `Checked npm: the latest omp is ${update.latest ?? "unknown"}.`;
+	if (!update.available) return latest;
+	if (update.installing) return `${latest} omp ${update.installing.version} is being installed (${startedBy(update.installing.by)}).`;
+	return `${latest} omp ${update.available} is available for workers; approve it below.`;
 }
 
 export const ompPages: PageRoutes = {
@@ -293,8 +226,13 @@ export const ompPages: PageRoutes = {
 			if (view instanceof Response) return view;
 			const flash = ctx.session.flash;
 			ctx.session.flash = undefined;
-			return html(ompPage(view, ompFormFromView(view), { vscode: ctx.vscode, flash }));
+			return html(ompPage(view, ompFormFromView(view), { flash }));
 		},
+	},
+
+	"GET /admin/omp/update.json": {
+		json: true,
+		handle: async (_req, _url, ctx) => json(await ctx.admin.call<OmpUpdateView>("GET", "/omp/update")),
 	},
 
 	"POST /admin/omp": {
@@ -307,7 +245,7 @@ export const ompPages: PageRoutes = {
 				if (!(err instanceof AdminApiError && (err.status === 400 || err.status === 409))) throw err;
 				const view = await loadView(ctx);
 				if (view instanceof Response) return view;
-				return html(ompPage(view, ompFormFromSubmission(form, view), { vscode: ctx.vscode, error: err.message }), 400);
+				return html(ompPage(view, ompFormFromSubmission(form, view), { error: err.message }), 400);
 			}
 			ctx.session.flash = { text: OMP_SAVED };
 			return redirect("/admin/omp");
@@ -316,41 +254,24 @@ export const ompPages: PageRoutes = {
 
 	"POST /admin/omp/update-check": {
 		async handle(_req, _url, ctx) {
-			const update = await ctx.admin.call<OmpUpdateAdminView>("POST", "/omp/update-check", { admin: ctx.session.username });
-			ctx.session.flash = update.checkError
-				? { text: `The npm check failed: ${update.checkError}`, error: true }
-				: { text: `Checked npm: the latest omp is ${update.latest ?? "unknown"}.${update.available ? availableText(update) : ""}` };
+			const update = await ctx.admin.call<OmpUpdateView>("POST", "/omp/update-check", { admin: ctx.session.username });
+			ctx.session.flash = update.checkError ? { text: `The npm check failed: ${update.checkError}`, error: true } : { text: checkedText(update) };
 			return redirect("/admin/omp");
 		},
 	},
 
-	"POST /admin/omp/mcp/test": {
+	/** UPD-03: a stale or concurrent approval comes back 409 and is shown as the error. */
+	"POST /admin/omp/update-approve": {
 		async handle(req, _url, ctx) {
-			const name = field(await req.formData(), "server");
+			const version = field(await req.formData(), "version");
 			try {
-				const state = await ctx.admin.call<McpTestState>("POST", "/omp/mcp-tests", { body: { name }, admin: ctx.session.username });
-				return redirect(`/admin/omp/mcp/test/${encodeURIComponent(state.id)}`);
+				await ctx.admin.call<OmpUpdateView>("POST", "/omp/update-approve", { body: { version }, admin: ctx.session.username });
+				ctx.session.flash = { text: `Installing omp ${version} for workers. This page refreshes when the install ends.` };
 			} catch (err) {
-				if (!(err instanceof AdminApiError && (err.status === 404 || err.status === 409))) throw err;
-				ctx.session.flash = { text: err.message, error: true };
-				return redirect("/admin/omp");
+				if (!(err instanceof AdminApiError && (err.status === 400 || err.status === 409))) throw err;
+				ctx.session.flash = { text: `The update was not started: ${err.message}`, error: true };
 			}
-		},
-	},
-
-	"GET /admin/omp/mcp/test/": {
-		async handle(_req, url, ctx) {
-			const tail = decodeURIComponent(url.pathname.slice("/admin/omp/mcp/test/".length));
-			const asJson = tail.endsWith(".json");
-			const id = asJson ? tail.slice(0, -".json".length) : tail;
-			let state: McpTestState | undefined;
-			try {
-				state = id && !id.includes("/") ? await ctx.admin.call<McpTestState>("GET", `/omp/mcp-tests/${encodeURIComponent(id)}`) : undefined;
-			} catch (err) {
-				if (!(err instanceof AdminApiError && err.status === 404)) throw err;
-			}
-			if (asJson) return state ? json(state) : json({ error: "not found" }, 404);
-			return state ? html(mcpTestPage(state, ctx.vscode)) : html(testNotFoundPage(ctx.vscode), 404);
+			return redirect("/admin/omp");
 		},
 	},
 };

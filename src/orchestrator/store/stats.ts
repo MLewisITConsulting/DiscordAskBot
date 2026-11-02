@@ -1,12 +1,10 @@
 import type { Loadout } from "../../shared/agent";
-import type { StatusReport, UsageWindow } from "../../shared/adminApi";
-import type { IssueState, JobKind, RunKind } from "../engine/state";
+import type { StatusReport, UsageGroup, UsageWindow } from "../../shared/adminApi";
 import type { Db } from "./db";
 
-/** Usage accounting and issue overview for the status page (OBS-06), read from the database. Ported from DevForge `src/stats.ts`. */
+/** Usage accounting (OBS-05, OBS-06), setup times (NFR-06), active ask threads and the latest loadout (AGT-27) for the status page. */
 
 export type UsageReport = StatusReport["usage"];
-export type IssueOverview = StatusReport["issues"];
 
 export const USAGE_WINDOWS: Readonly<Record<UsageWindow, number | undefined>> = Object.freeze({
 	"24h": 24 * 3_600_000,
@@ -27,10 +25,23 @@ const DAILY_DAYS = 14;
 const TOTALS_SQL = `COUNT(*) AS runs, COALESCE(SUM(cost_usd), 0) AS costUsd, COALESCE(SUM(tokens_in), 0) AS tokensIn,
 	COALESCE(SUM(tokens_out), 0) AS tokensOut, COALESCE(SUM(cache_read), 0) AS cacheRead, COALESCE(SUM(cache_write), 0) AS cacheWrite`;
 
+const MS_BETWEEN = (from: string, to: string) => `(julianday(${to}) - julianday(${from})) * 86400000`;
+
+/** Usage of the window grouped by `column` (`channel_id` or `user_id`), highest cost first. */
+function groupBy(db: Db, column: "channel_id" | "user_id", since: string): UsageGroup[] {
+	return db.raw
+		.query<UsageGroup, [string]>(
+			`SELECT ${column} AS id, COUNT(*) AS runs, COALESCE(SUM(cost_usd), 0) AS costUsd, COALESCE(SUM(tokens_in), 0) AS tokensIn,
+				COALESCE(SUM(tokens_out), 0) AS tokensOut
+			FROM agent_runs WHERE finished_at >= ? GROUP BY ${column} ORDER BY costUsd DESC, id`,
+		)
+		.all(since);
+}
+
 /**
- * OBS-06: totals for the window, by kind and by repo (sorted by cost), job outcomes and mean duration per kind, and the
- * cost per UTC day for the last 14 days (oldest first, zero-filled, independent of the window). NFR-06: setup time of
- * the runs started in the window per repository (`/ask` runs, which have none, as `ask`), slowest average first.
+ * OBS-06: totals for the window, by ask channel and by Discord user (highest cost first), run counts by outcome with the
+ * average duration, and the cost per UTC day for the last 14 days (oldest first, zero-filled, independent of the window).
+ * NFR-06: setup time (claim → agent start) of the runs started in the window.
  */
 export function usageReport(db: Db, window: UsageWindow, now = new Date()): UsageReport {
 	const span = USAGE_WINDOWS[window];
@@ -39,37 +50,22 @@ export function usageReport(db: Db, window: UsageWindow, now = new Date()): Usag
 	const raw = db.raw;
 
 	const totals = raw.query<UsageReport["totals"], [string]>(`SELECT ${TOTALS_SQL} FROM agent_runs WHERE finished_at >= ?`).get(since)!;
-	const byKind = raw
-		.query<{ kind: RunKind; runs: number; costUsd: number }, [string]>(
-			`SELECT kind, COUNT(*) AS runs, COALESCE(SUM(cost_usd), 0) AS costUsd FROM agent_runs WHERE finished_at >= ?
-			GROUP BY kind ORDER BY costUsd DESC, kind`,
+	const counts = raw
+		.query<{ finished: number; failed: number; stopped: number; limit: number; avgDurationMs: number | null }, [string]>(
+			`SELECT COALESCE(SUM(outcome = 'finished'), 0) AS finished, COALESCE(SUM(outcome = 'failed'), 0) AS failed,
+				COALESCE(SUM(outcome = 'stopped'), 0) AS stopped, COALESCE(SUM(outcome = 'limit'), 0) AS "limit",
+				AVG(${MS_BETWEEN("started_at", "finished_at")}) AS avgDurationMs
+			FROM agent_runs WHERE finished_at >= ?`,
 		)
-		.all(since);
-	const byRepo = raw
-		.query<{ repo: string; runs: number; costUsd: number }, [string]>(
-			`SELECT repo, COUNT(*) AS runs, COALESCE(SUM(cost_usd), 0) AS costUsd FROM agent_runs WHERE finished_at >= ?
-			GROUP BY repo ORDER BY costUsd DESC, repo`,
+		.get(since)!;
+	const outcomes = { ...counts, avgDurationMs: counts.avgDurationMs === null ? null : Math.round(counts.avgDurationMs) };
+	const setupRow = raw
+		.query<{ runs: number; avgMs: number | null; maxMs: number | null }, [string]>(
+			`SELECT COUNT(*) AS runs, AVG(${MS_BETWEEN("claimed_at", "started_at")}) AS avgMs, MAX(${MS_BETWEEN("claimed_at", "started_at")}) AS maxMs
+			FROM runs WHERE started_at IS NOT NULL AND claimed_at IS NOT NULL AND started_at >= ?`,
 		)
-		.all(since);
-	const jobs = raw
-		.query<{ kind: JobKind; succeeded: number; failed: number; cancelled: number; avgDurationMs: number | null }, [string]>(
-			`SELECT kind,
-				SUM(status = 'succeeded') AS succeeded, SUM(status = 'failed') AS failed, SUM(status = 'cancelled') AS cancelled,
-				AVG(CASE WHEN started_at IS NOT NULL
-					THEN (julianday(finished_at) - julianday(started_at)) * 86400000 END) AS avgDurationMs
-			FROM jobs WHERE finished_at IS NOT NULL AND finished_at >= ? GROUP BY kind ORDER BY kind`,
-		)
-		.all(since);
-	const setup = raw
-		.query<{ repo: string; runs: number; avgMs: number; maxMs: number }, [string]>(
-			`SELECT COALESCE(repo, kind) AS repo, COUNT(*) AS runs,
-				AVG((julianday(started_at) - julianday(claimed_at)) * 86400000) AS avgMs,
-				MAX((julianday(started_at) - julianday(claimed_at)) * 86400000) AS maxMs
-			FROM runs WHERE started_at IS NOT NULL AND claimed_at IS NOT NULL AND started_at >= ?
-			GROUP BY COALESCE(repo, kind) ORDER BY avgMs DESC, repo`,
-		)
-		.all(since)
-		.map(row => ({ ...row, avgMs: Math.round(row.avgMs), maxMs: Math.round(row.maxMs) }));
+		.get(since)!;
+	const setup = setupRow.runs ? { runs: setupRow.runs, avgMs: Math.round(setupRow.avgMs ?? 0), maxMs: Math.round(setupRow.maxMs ?? 0) } : null;
 
 	const firstDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - (DAILY_DAYS - 1)));
 	const perDay = new Map<string, number>();
@@ -85,49 +81,38 @@ export function usageReport(db: Db, window: UsageWindow, now = new Date()): Usag
 		return { day, costUsd: perDay.get(day) ?? 0 };
 	});
 
-	return { window, ...(span === undefined ? {} : { since }), totals, byKind, byRepo, jobs, daily, setup };
-}
-
-/** Issue counts for every state, and the open issues with their active job. */
-export function issueOverview(db: Db): IssueOverview {
-	const counts: Record<IssueState, number> = {
-		queued: 0,
-		planning: 0,
-		awaiting_approval: 0,
-		implementing: 0,
-		in_review: 0,
-		done: 0,
-		failed: 0,
-		cancelled: 0,
+	return {
+		window,
+		...(span === undefined ? {} : { since }),
+		totals,
+		byChannel: groupBy(db, "channel_id", since),
+		byUser: groupBy(db, "user_id", since),
+		outcomes,
+		daily,
+		setup,
 	};
-	for (const row of db.raw.query<{ state: IssueState; n: number }, []>("SELECT state, COUNT(*) AS n FROM issues GROUP BY state").all()) {
-		counts[row.state] = row.n;
-	}
-	const open = db.openIssues().map(issue => {
-		const job = db.activeJob(issue.id);
-		return {
-			repo: issue.repo,
-			number: issue.number,
-			title: issue.title,
-			state: issue.state,
-			threadId: issue.thread_id,
-			...(job ? { job: job.kind } : {}),
-		};
-	});
-	return { counts, open };
 }
 
-const LOADOUT_PROFILES = ["plan", "implement", "chat", "draft", "ask"] as const satisfies readonly Loadout["profile"][];
-
-/** kv key holding the most recent loadout seen for a profile (survives restarts, AGT-27). */
-export function loadoutKey(profile: Loadout["profile"]): string {
-	return `loadout:${profile}`;
+/** Ask threads with a pending or active run, oldest run first. */
+export function activeThreads(db: Db): StatusReport["activeThreads"] {
+	return db.raw
+		.query<StatusReport["activeThreads"][number], []>(
+			`SELECT r.thread_id AS threadId, a.channel_id AS channelId, a.owner_id AS ownerId
+			FROM runs r JOIN ask_chats a ON a.thread_id = r.thread_id WHERE r.state != 'finished' ORDER BY r.created_at`,
+		)
+		.all();
 }
 
-/** Most recent loadout per profile, in plan/implement/chat/draft/ask order; profiles never run are omitted. */
-export function latestLoadouts(db: Db): Loadout[] {
-	return LOADOUT_PROFILES.flatMap(profile => {
-		const raw = db.kvGet(loadoutKey(profile));
-		return raw ? [JSON.parse(raw) as Loadout] : [];
-	});
+/** kv key holding the latest loadout of the `ask` profile (survives restarts, AGT-27). */
+export const LOADOUT_KEY = "loadout:ask";
+
+/** Records the loadout a session reported (AGT-27). */
+export function saveLoadout(db: Db, loadout: Loadout): void {
+	db.kvSet(LOADOUT_KEY, JSON.stringify(loadout));
+}
+
+/** The latest loadout; undefined before any run reported one. */
+export function latestLoadout(db: Db): Loadout | undefined {
+	const raw = db.kvGet(LOADOUT_KEY);
+	return raw ? (JSON.parse(raw) as Loadout) : undefined;
 }

@@ -1,38 +1,23 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { EnginePhase, StatusReport } from "../../shared/adminApi";
-import { type EngineConfig, hasWorkChannel, type LabelNames, resolveLabelNames, type Settings, WORK_CHANNEL_MISSING } from "../../shared/config";
+import { ASK_CHANNEL_MISSING, type Config, hasAskChannel, type Settings } from "../../shared/config";
 import { errorMessage, log } from "../../shared/log";
 import { attachBot } from "../discord/bot";
 import { createDiscordJsConnection } from "../discord/discordjs";
-import { createInteractionRouter } from "../discord/interactionRouter";
-import { createThreadReplies } from "../discord/replies";
-import { createOmpNotices } from "../discord/ompUpdate";
 import type { DiscordConnection } from "../discord/surface";
 import type { Dispatcher } from "../dispatch/dispatcher";
-import { createGitHub } from "../github/app";
-import { relabelTrackedIssues } from "../github/labels";
-import { createPoller } from "../github/poller";
-import type { GitHub } from "../github/types";
-import type { OmpUpdater } from "../omp/updates";
 import type { AgentLog } from "../store/agentlog";
 import type { Db } from "../store/db";
-import { sweepSessions } from "../store/sessions";
 import type { Vault } from "../store/vault";
 import { createAskChat } from "./chat";
-import { createIssueDrafter } from "./draft";
-import { createPlanner } from "./plans";
-import { createRepoChat } from "./repoChat";
 import type { EngineDeps } from "./deps";
-import { createTrackIssue } from "./issues";
-import { createScheduler } from "./scheduler";
-import { createChatSlots } from "./chatSlots";
 
 export type { EnginePhase };
 
 export interface EngineStatus {
 	phase: EnginePhase;
-	/** Startup error of the last apply. */
+	/** Startup error of the last apply, or why the engine is `unconfigured`. */
 	error?: string;
 	since: string;
 }
@@ -53,11 +38,11 @@ export interface Controller {
 	snapshot(): EngineSnapshot | undefined;
 }
 
-export type GitHubFactory = (opts: { appId: number; privateKey: string; labels: LabelNames }) => Promise<GitHub>;
-
 export interface ControllerOptions {
 	/** `<state>` (ASKBOT_STATE_DIR). */
 	stateDir: string;
+	/** The admin's skills and agents (ASKBOT_OMP_DIR, AGT-24). */
+	ompDir: string;
 	db: Db;
 	vault: Vault;
 	agentLog: AgentLog;
@@ -67,10 +52,6 @@ export interface ControllerOptions {
 	applyLogCap?(maxGiB: number): void;
 	/** One Discord connection per engine instance; defaults to discord.js. */
 	connectDiscord?(): DiscordConnection;
-	/** The GitHub App client per engine instance; defaults to `createGitHub` against api.github.com. */
-	connectGitHub?: GitHubFactory;
-	/** Process-wide in-place omp updates (UPD-02, UPD-03): each engine posts the notices and handles Approve. */
-	ompUpdates?: OmpUpdater;
 }
 
 /** A running engine instance: everything that must be torn down before settings can be re-applied. */
@@ -80,87 +61,36 @@ interface RunningEngine {
 }
 
 /** State directories the engine works in (ENG-03 step 1). */
-const STATE_DIRS = ["sessions", "scratch", "omp-agent", "repos"] as const;
+const STATE_DIRS = ["sessions", "scratch", "omp-agent"] as const;
 
-async function startEngine(opts: ControllerOptions, config: EngineConfig, secrets: Settings["secrets"]): Promise<RunningEngine> {
+async function startEngine(opts: ControllerOptions, config: Config, secrets: Settings["secrets"]): Promise<RunningEngine> {
 	const { stateDir, db, agentLog, dispatcher } = opts;
 	for (const dir of STATE_DIRS) await mkdir(join(stateDir, dir), { recursive: true });
-	const sessionDir = join(stateDir, "sessions");
-	// Before the scheduler starts, so no job is touching sessions yet.
-	await sweepSessions({ db, sessionDir });
 
-	const labels = resolveLabelNames(config);
-	const github = await (opts.connectGitHub ?? createGitHub)({ appId: config.github.appId, privateKey: secrets.githubAppPrivateKey, labels });
 	const connection = (opts.connectDiscord ?? createDiscordJsConnection)();
 	const lifetime = new AbortController();
-	const deps: EngineDeps = {
-		config,
-		labels,
-		db,
-		github,
-		discord: connection,
-		dispatcher,
-		replies: createThreadReplies(),
-		interactions: createInteractionRouter(),
-		agentLog,
-		sessionDir,
-		chatSlots: createChatSlots(config.limits.maxChatSessions),
-		signal: lifetime.signal,
-	};
-	const scheduler = createScheduler(deps);
-	const trackIssue = createTrackIssue(deps, scheduler);
-	const poller = createPoller(deps, scheduler, trackIssue);
-	const askChat = createAskChat(deps, { scratchRoot: join(stateDir, "scratch") });
-	const repoChat = createRepoChat(deps);
-	const planner = createPlanner(deps, { scheduler });
-	const drafter = createIssueDrafter(deps, { trackIssue });
-	/** Run-owning features that outlive the engine: started after login, detached at stop (RUN-09, RUN-14). */
-	const features = [
-		{ name: "ask chat", feature: askChat },
-		{ name: "repo chat", feature: repoChat },
-		{ name: "planner", feature: planner },
-		{ name: "issue drafter", feature: drafter },
-	];
-	const detachFeatures = () =>
-		Promise.all(
-			features.map(({ name, feature }) => feature.stop().catch(err => log("error", `${name} detach failed`, { error: errorMessage(err) }))),
-		);
-	const ompNotices = opts.ompUpdates ? createOmpNotices(deps, opts.ompUpdates) : undefined;
+	const deps: EngineDeps = { config, db, discord: connection, dispatcher, agentLog, signal: lifetime.signal };
+	const askChat = createAskChat(deps, { scratchRoot: join(stateDir, "scratch"), ompDir: opts.ompDir });
 	// Attached before login: command registration and the nickname run on every ready event (DSC-01, DSC-29).
-	const bot = attachBot({ deps, connection, scheduler, trackIssue, poller, askChat, repoChat, planner, drafter, ompNotices });
+	const bot = attachBot({ deps, connection, askChat });
 	try {
-		try {
-			await connection.login(secrets.discordToken);
-		} catch (err) {
-			throw new Error(`Discord login failed: ${errorMessage(err)}`);
-		}
-		// GH-23: before the first poll, so a label rename is applied before new work is looked for.
-		await relabelTrackedIssues(deps);
-		scheduler.recover();
-		scheduler.tick();
-		for (const { feature } of features) feature.start();
-		poller.start();
-		ompNotices?.start();
+		await connection.login(secrets.discordToken);
 	} catch (err) {
-		poller.stop();
 		lifetime.abort();
-		await scheduler.detach().catch(detachErr => log("warn", "scheduler detach failed", { error: errorMessage(detachErr) }));
-		await detachFeatures();
 		bot.detach();
 		await connection.destroy().catch(destroyErr => log("warn", "discord destroy failed", { error: errorMessage(destroyErr) }));
-		throw err;
+		throw new Error(`Discord login failed: ${errorMessage(err)}`);
 	}
+	// ENG-03 steps 2 and 3: re-attach to the ask threads' runs (RUN-07, RUN-14), then the idle sweep (CHAT-06).
+	askChat.start();
 	const startedAt = new Date().toISOString();
-	log("info", "engine started", { githubApp: github.identity.login, watches: db.listWatches("watching").length });
+	log("info", "engine started", { askChannels: config.discord.askChannelIds.length });
 
 	return {
 		async stop() {
-			// ENG-04 order: poller, dispatch (detach from runs; never abort them), then Discord.
-			poller.stop();
-			ompNotices?.stop();
+			// ENG-04 order: the idle sweep and dispatch (detach from runs; never abort them), then Discord.
 			lifetime.abort();
-			await scheduler.detach().catch(err => log("error", "scheduler detach failed", { error: errorMessage(err) }));
-			await detachFeatures();
+			await askChat.detach().catch(err => log("error", "ask chat detach failed", { error: errorMessage(err) }));
 			bot.detach();
 			await connection.destroy();
 			log("info", "engine stopped");
@@ -170,10 +100,7 @@ async function startEngine(opts: ControllerOptions, config: EngineConfig, secret
 			return {
 				startedAt,
 				discord: { ready: discord.ready, user: discord.user, pingMs: discord.pingMs, nicknameWarning: bot.nicknameWarning() },
-				githubApp: github.identity.login,
 				discordQueue: connection.queueStats(),
-				watches: poller.status().watches,
-				queuedJobs: db.queuedJobCount(),
 			};
 		},
 	};
@@ -193,7 +120,7 @@ export function createController(opts: ControllerOptions): Controller {
 
 	function set(phase: EnginePhase, error?: string): void {
 		current = { phase, error, since: new Date().toISOString() };
-		if (error) log("error", "engine status", { phase, error });
+		if (error) log(phase === "error" ? "error" : "info", "engine status", { phase, error });
 		else log("info", "engine status", { phase });
 	}
 
@@ -223,7 +150,7 @@ export function createController(opts: ControllerOptions): Controller {
 		} catch (err) {
 			log("error", "applying log size failed", { error: errorMessage(err) });
 		}
-		if (!hasWorkChannel(settings.config)) return set("unconfigured", WORK_CHANNEL_MISSING);
+		if (!hasAskChannel(settings.config)) return set("unconfigured", ASK_CHANNEL_MISSING);
 		set("starting");
 		try {
 			running = await startEngine(opts, settings.config, settings.secrets);

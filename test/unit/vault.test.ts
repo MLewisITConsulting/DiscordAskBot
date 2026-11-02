@@ -9,11 +9,8 @@ import { loadMasterKey, openVault, VaultLocked } from "../../src/orchestrator/st
 const KEY = Buffer.from("k".repeat(48));
 const OTHER_KEY = Buffer.from("z".repeat(48));
 const settings: Settings = parseSettings({
-	config: {
-		discord: { guildId: "g", allowedUserIds: ["u"], workChannelId: "work-channel" },
-		github: { appId: 9 },
-	},
-	secrets: { discordToken: "discord-secret", githubAppPrivateKey: "pem-secret", providerKeys: { anthropic: "sk-secret" } },
+	config: { discord: { guildId: "g", allowedUserIds: ["u"], askChannelIds: ["ask-channel"] } },
+	secrets: { discordToken: "discord-secret", providerKeys: { anthropic: "sk-secret" } },
 });
 
 async function initialized(db: Db, masterKey?: Uint8Array) {
@@ -27,11 +24,11 @@ describe("vault", () => {
 	test("settings and omp config are stored encrypted and round-trip", async () => {
 		const db = openDb(":memory:");
 		const vault = await initialized(db);
-		vault.writeOmpConfig({ mcpServers: { search: { token: "mcp-secret" } } });
+		vault.writeOmpConfig({ settings: { "search.apiKey": "search-secret" } });
 		expect(vault.readSettings()).toEqual(settings);
-		expect(vault.readOmpConfig()).toEqual({ mcpServers: { search: { token: "mcp-secret" } } });
+		expect(vault.readOmpConfig()).toEqual({ settings: { "search.apiKey": "search-secret" } });
 		const stored = db.kvGet("vault")!;
-		for (const secret of ["discord-secret", "pem-secret", "sk-secret", "mcp-secret", "work-channel", "correct horse"]) {
+		for (const secret of ["discord-secret", "sk-secret", "search-secret", "ask-channel", "correct horse"]) {
 			expect(stored).not.toContain(secret);
 		}
 	});

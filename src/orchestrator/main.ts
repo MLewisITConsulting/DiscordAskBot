@@ -10,7 +10,6 @@ import { createAdminApi, generateSetupToken, loadWebApiToken } from "./api/admin
 import { createAdminFeatures } from "./api/features";
 import { type InternalApi, loadInternalToken, startInternalApi } from "./api/server";
 import { createWorkerDispatcher, dispatchLimits, type WorkerDispatcher } from "./dispatch/workers";
-import { createRepos } from "./git/repos";
 import { type Controller, createController } from "./engine/controller";
 import { createOmpUpdater, type OmpUpdater } from "./omp/updates";
 import { openAgentLog } from "./store/agentlog";
@@ -66,6 +65,7 @@ export async function runOrchestrator(): Promise<void> {
 		identity: await appIdentity(),
 		imageOmpVersion: installedOmpVersion(APP_ROOT),
 		imageAppDir: APP_ROOT,
+		autoUpdate: () => settings()?.config.omp.autoUpdate ?? false,
 	});
 	// Process-wide: engine restarts never touch runs, and shutdown never aborts them (RUN-09).
 	const dispatcher = createWorkerDispatcher({
@@ -82,30 +82,16 @@ export async function runOrchestrator(): Promise<void> {
 		},
 		skills: () => skillsBundle(env.ompDir),
 		credentialRequest: req => signins.handleCredentialRequest(req),
-		repos: createRepos({ stateDir: env.stateDir }),
 		ompRuntime: ompUpdates,
 		bindWorkerAddresses: env.workerAddressBinding,
-		workerDiskBytes: env.workerDiskBytes,
 	});
 	// UPD-09 cleanup now; the first npm check 60 s from now.
 	ompUpdates.start();
-	const controller = createController({ stateDir: env.stateDir, db, vault, agentLog, dispatcher, applyLogCap, ompUpdates });
+	const controller = createController({ stateDir: env.stateDir, ompDir: env.ompDir, db, vault, agentLog, dispatcher, applyLogCap });
 
 	// First run: whoever can read the orchestrator log proves it before claiming the admin account (WEB-02).
 	const setupToken = vault.isInitialized() ? undefined : generateSetupToken();
-	const features = createAdminFeatures({
-		db,
-		vault,
-		signins,
-		dispatcher,
-		agentLog,
-		processLog,
-		stateDir: env.stateDir,
-		ompDir: env.ompDir,
-		controller,
-		workerCapacity: env.workerCapacity,
-		ompUpdates,
-	});
+	const features = createAdminFeatures({ vault, signins, agentLog, processLog, stateDir: env.stateDir, ompDir: env.ompDir, ompUpdates });
 	const admin = createAdminApi({
 		db,
 		vault,
@@ -160,7 +146,7 @@ export interface OrchestratorParts {
 }
 
 /**
- * ENG-04 order: update checks, the internal API (worker sockets close with 1001), the engine (poller, sweeps, dispatch,
+ * ENG-04 order: update checks, the internal API (worker sockets close with 1001), the engine (idle sweep, dispatch,
  * then Discord), the database. RUN-09: runs keep going on their workers and re-attach after the restart. Bounded at
  * 10 s by postmortem's cleanup deadline. Never throws.
  */

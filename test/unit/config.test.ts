@@ -1,46 +1,31 @@
 import { describe, expect, test } from "bun:test";
-import { ConfigError, parseConfig, parseSecrets, resolveLabelNames } from "../../src/shared/config";
+import { ASK_CHANNEL_MISSING, ConfigError, hasAskChannel, isAllowedMember, isAskChannel, parseConfig, parseSecrets } from "../../src/shared/config";
 
 const minimal = {
-	discord: { guildId: "1", allowedUserIds: ["42"], workChannelId: "100" },
-	github: { appId: 7 },
+	discord: { guildId: "1", allowedUserIds: ["42"] },
 };
 
 describe("parseConfig", () => {
-	test("applies defaults", () => {
+	test("applies defaults (requirements §9)", () => {
 		const config = parseConfig(minimal);
 		expect(config.discord.allowedRoleIds).toEqual([]);
 		expect(config.discord.askChannelIds).toEqual([]);
-		expect(config.discord.watchCategoryId).toBeUndefined();
-		expect(config.github).toEqual({ appId: 7, pollIntervalSeconds: 60, mentionKeyword: "/askbot" });
 		expect(config.agent.name).toBe("AskBot");
-		expect(config.labels.trigger).toBe("askbot");
 		expect(config.models).toEqual({ thinking: "high" });
+		expect(config.limits).toEqual({ maxChatSessions: 2, maxCostUsdPerTurn: 15, chatIdleMinutes: 30 });
 		expect(config.workers).toEqual({ reattachGraceSeconds: 90 });
 		expect(config.logs).toEqual({ maxGiB: 5 });
 		expect(config.omp).toEqual({ autoUpdate: false });
-		expect(config.limits).toEqual({
-			maxConcurrentJobs: 2,
-			maxChatSessions: 2,
-			planMinutes: 30,
-			implementMinutes: 120,
-			fixMinutes: 45,
-			maxCostUsdPerJob: 15,
-			maxCiFixAttempts: 3,
-			ciWaitMinutes: 60,
-			askTimeoutHours: 24,
-			chatIdleMinutes: 30,
-		});
 	});
 
 	test("errors use `Invalid config: <path>: <message>`", () => {
-		expect(() => parseConfig({ ...minimal, github: { appId: -1 } })).toThrow(/^Invalid config: github\.appId: /);
+		expect(() => parseConfig({ ...minimal, limits: { maxChatSessions: 0 } })).toThrow(/^Invalid config: limits\.maxChatSessions: /);
 	});
 
-	test("old repos/updates sections are dropped", () => {
-		const config = parseConfig({ ...minimal, repos: [{ name: "a/b" }], updates: {} });
-		expect(config).not.toHaveProperty("repos");
-		expect(config).not.toHaveProperty("updates");
+	test("unknown sections are dropped", () => {
+		const config = parseConfig({ ...minimal, github: { appId: 7 }, labels: {} });
+		expect(config).not.toHaveProperty("github");
+		expect(config).not.toHaveProperty("labels");
 	});
 
 	test("agent.name is 1-32 characters", () => {
@@ -49,9 +34,16 @@ describe("parseConfig", () => {
 		expect(() => parseConfig({ ...minimal, agent: { name: "" } })).toThrow(/agent\.name:/);
 	});
 
-	test("models.thinking accepts only the listed levels", () => {
-		expect(parseConfig({ ...minimal, models: { thinking: "xhigh", chat: "m" } }).models.chat).toBe("m");
+	test("models.ask is optional; models.thinking accepts only the listed levels", () => {
+		expect(parseConfig({ ...minimal, models: { thinking: "xhigh", ask: "m" } }).models.ask).toBe("m");
 		expect(() => parseConfig({ ...minimal, models: { thinking: "ultra" } })).toThrow(/models\.thinking:/);
+	});
+
+	test("limits are positive", () => {
+		expect(parseConfig({ ...minimal, limits: { maxCostUsdPerTurn: 0.5, chatIdleMinutes: 1.5 } }).limits).toMatchObject({ maxCostUsdPerTurn: 0.5, chatIdleMinutes: 1.5 });
+		expect(() => parseConfig({ ...minimal, limits: { maxChatSessions: 1.5 } })).toThrow(/limits\.maxChatSessions:/);
+		expect(() => parseConfig({ ...minimal, limits: { maxCostUsdPerTurn: 0 } })).toThrow(/limits\.maxCostUsdPerTurn:/);
+		expect(() => parseConfig({ ...minimal, limits: { chatIdleMinutes: -1 } })).toThrow(/limits\.chatIdleMinutes:/);
 	});
 
 	test("workers settings", () => {
@@ -70,66 +62,48 @@ describe("parseConfig", () => {
 		expect(() => parseConfig({ ...minimal, omp: { autoUpdate: "yes" } })).toThrow(/omp\.autoUpdate:/);
 	});
 
-	test("rejects empty allow-lists", () => {
+	test("rejects empty allow-lists (DSC-02)", () => {
 		const raw = { ...minimal, discord: { ...minimal.discord, allowedUserIds: [], allowedRoleIds: [] } };
 		expect(() => parseConfig(raw)).toThrow(ConfigError);
+		expect(parseConfig({ discord: { guildId: "1", allowedRoleIds: ["r"] } }).discord.allowedRoleIds).toEqual(["r"]);
 	});
 
-	test("rejects a duplicate ask-only channel and the work channel", () => {
+	test("rejects a duplicate ask-only channel (DSC-03)", () => {
 		expect(parseConfig({ ...minimal, discord: { ...minimal.discord, askChannelIds: ["200", "201"] } }).discord.askChannelIds).toEqual(["200", "201"]);
 		const dup = { ...minimal, discord: { ...minimal.discord, askChannelIds: ["200", "200"] } };
 		expect(() => parseConfig(dup)).toThrow(/discord\.askChannelIds\.1: duplicate channel 200/);
-		const clash = { ...minimal, discord: { ...minimal.discord, askChannelIds: ["100"] } };
-		expect(() => parseConfig(clash)).toThrow(/discord\.askChannelIds\.0: channel 100 is already the work channel/);
 	});
 });
 
-describe("labels", () => {
-	test("default names", () => {
-		expect(resolveLabelNames(parseConfig(minimal))).toEqual({
-			trigger: "askbot",
-			states: {
-				planning: "askbot:planning",
-				awaitingApproval: "askbot:awaiting-approval",
-				implementing: "askbot:implementing",
-				inReview: "askbot:in-review",
-				failed: "askbot:failed",
-			},
-		});
+describe("config helpers", () => {
+	test("the engine needs an ask-only channel (ENG-02)", () => {
+		expect(hasAskChannel(parseConfig(minimal))).toBe(false);
+		expect(hasAskChannel(parseConfig({ discord: { ...minimal.discord, askChannelIds: ["200"] } }))).toBe(true);
+		expect(ASK_CHANNEL_MISSING).toBe("Add an ask-only channel in Settings (Discord) to start the engine.");
 	});
 
-	test("unset state labels derive from a custom trigger; set ones are kept", () => {
-		const names = resolveLabelNames(parseConfig({ ...minimal, labels: { trigger: "bot", states: { failed: "broken" } } }));
-		expect(names).toEqual({
-			trigger: "bot",
-			states: { planning: "bot:planning", awaitingApproval: "bot:awaiting-approval", implementing: "bot:implementing", inReview: "bot:in-review", failed: "broken" },
-		});
+	test("isAllowedMember: a listed user or any listed role", () => {
+		const config = parseConfig({ discord: { guildId: "1", allowedUserIds: ["42"], allowedRoleIds: ["r1"] } });
+		expect(isAllowedMember(config, "42", [])).toBe(true);
+		expect(isAllowedMember(config, "7", ["r0", "r1"])).toBe(true);
+		expect(isAllowedMember(config, "7", ["r0"])).toBe(false);
 	});
 
-	test("names are 1-50 characters", () => {
-		expect(parseConfig({ ...minimal, labels: { trigger: "t".repeat(50) } }).labels.trigger).toHaveLength(50);
-		expect(() => parseConfig({ ...minimal, labels: { trigger: "t".repeat(51) } })).toThrow(/labels\.trigger:/);
-		expect(() => parseConfig({ ...minimal, labels: { trigger: "" } })).toThrow(/labels\.trigger:/);
-		expect(() => parseConfig({ ...minimal, labels: { states: { inReview: "" } } })).toThrow(/labels\.states\.inReview:/);
-		expect(() => parseConfig({ ...minimal, labels: { states: { planning: "p".repeat(51) } } })).toThrow(/labels\.states\.planning:/);
-	});
-
-	test("rejects case-insensitive duplicates, including with the trigger", () => {
-		expect(() => parseConfig({ ...minimal, labels: { states: { failed: "AskBot:Planning" } } })).toThrow(
-			/Invalid config: labels\.states\.failed: label AskBot:Planning is the same as labels\.states\.planning/,
-		);
-		expect(() => parseConfig({ ...minimal, labels: { states: { planning: "ASKBOT" } } })).toThrow(/labels\.states\.planning: .*labels\.trigger/);
+	test("isAskChannel matches only listed channels", () => {
+		const config = parseConfig({ discord: { ...minimal.discord, askChannelIds: ["200"] } });
+		expect(isAskChannel(config, "200")).toBe(true);
+		expect(isAskChannel(config, "201")).toBe(false);
+		expect(isAskChannel(config, null)).toBe(false);
 	});
 });
 
 describe("parseSecrets", () => {
 	test("rejects missing discordToken with a secrets path", () => {
-		expect(() => parseSecrets({ githubAppPrivateKey: "pem" })).toThrow(/^Invalid config: secrets\.discordToken:/);
-		expect(() => parseSecrets({ discordToken: "t" })).toThrow(/secrets\.githubAppPrivateKey:/);
+		expect(() => parseSecrets({})).toThrow(/^Invalid config: secrets\.discordToken:/);
 	});
 
 	test("accepts valid secrets; providerKeys defaults to {}", () => {
-		expect(parseSecrets({ discordToken: "t", githubAppPrivateKey: "pem" })).toEqual({ discordToken: "t", githubAppPrivateKey: "pem", providerKeys: {} });
-		expect(parseSecrets({ discordToken: "t", githubAppPrivateKey: "pem", providerKeys: { openai: "k" } }).providerKeys).toEqual({ openai: "k" });
+		expect(parseSecrets({ discordToken: "t" })).toEqual({ discordToken: "t", providerKeys: {} });
+		expect(parseSecrets({ discordToken: "t", providerKeys: { openai: "k" } }).providerKeys).toEqual({ openai: "k" });
 	});
 });

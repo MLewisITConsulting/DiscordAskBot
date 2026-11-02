@@ -16,7 +16,7 @@ export function sameToken(given: string, expected: string): boolean {
 	return timingSafeEqual(digest(given), digest(expected));
 }
 
-/** A fresh random lease token (also used for `mcp-test` tasks, which are not in the runs table). */
+/** A fresh random lease token. */
 export function newLeaseToken(): string {
 	return Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
 }

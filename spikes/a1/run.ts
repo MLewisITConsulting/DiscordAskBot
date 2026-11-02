@@ -61,7 +61,12 @@ Object.assign(env, {
 	A1_SCRATCH: scratch,
 	A1_REAL_AGENT_DIR: process.env.PI_CODING_AGENT_DIR || join(homedir(), ".omp", "agent"),
 });
-const proc = Bun.spawn(["bun", join(import.meta.dir, "child.ts")], { cwd: scratch, env, stdout: "inherit", stderr: "inherit" });
-const code = await proc.exited;
+let code = 0;
+for (const mode of ["discover", "explicit"]) {
+	console.log(`\n=== A1_MODE=${mode} ===`);
+	const proc = Bun.spawn(["bun", join(import.meta.dir, "child.ts")], { cwd: scratch, env: { ...env, A1_MODE: mode }, stdout: "inherit", stderr: "inherit" });
+	code ||= await proc.exited;
+}
 await rm(sandbox, { recursive: true, force: true });
+console.log(`\nA1 RESULT: ${code === 0 ? "PASS" : "FAIL"}`);
 process.exit(code);

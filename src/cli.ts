@@ -2,7 +2,7 @@
 import { ROLES } from "./shared/env";
 import { errorMessage, log, setLogComponent } from "./shared/log";
 
-/** One image, one entry point: a role (architecture A-7, requirements §13) or the `health` probe command (architecture §4.5). */
+/** One image, one entry point: a role (architecture A-7, requirements OPS-01) or the `health` probe command (architecture §4.5). */
 const COMMANDS = [...ROLES, "health"] as const;
 type Command = (typeof COMMANDS)[number];
 

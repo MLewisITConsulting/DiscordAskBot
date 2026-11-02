@@ -1,52 +1,25 @@
-/**
- * Routes a typed message in a thread to the agent question waiting there (an ask dialog, input or editor prompt),
- * so the reply answers the question instead of reaching the agent a second time as steering.
- * Each thread runs at most one agent session, so there is at most one waiting question per thread.
- */
-export interface ThreadReplies {
-	/**
-	 * Resolves with the next reply delivered to `threadId`, or undefined after `timeoutMs`.
-	 * Rejects with an AbortError when `signal` aborts. A newer wait on the same thread replaces an older one.
-	 */
-	next(threadId: string, timeoutMs: number, signal?: AbortSignal): Promise<string | undefined>;
-	/** Hands `text` to the question waiting in `threadId`; false when nothing is waiting there. */
-	deliver(threadId: string, text: string): boolean;
-}
+import { errorMessage, log } from "../../shared/log";
+import type { DiscordSurface, MsgRef } from "./surface";
 
-export function createThreadReplies(): ThreadReplies {
-	const waiting = new Map<string, (text: string | undefined) => void>();
-	return {
-		next(threadId, timeoutMs, signal) {
-			const { promise, resolve, reject } = Promise.withResolvers<string | undefined>();
-			if (signal?.aborted) {
-				reject(new DOMException("aborted", "AbortError"));
-				return promise;
-			}
-			// A replaced wait resolves as "no answer" rather than hanging.
-			waiting.get(threadId)?.(undefined);
-			const cleanup = () => {
-				clearTimeout(timer);
-				signal?.removeEventListener("abort", onAbort);
-				if (waiting.get(threadId) === finish) waiting.delete(threadId);
-			};
-			const finish = (text: string | undefined) => {
-				cleanup();
-				resolve(text);
-			};
-			const onAbort = () => {
-				cleanup();
-				reject(new DOMException("aborted", "AbortError"));
-			};
-			const timer = setTimeout(() => finish(undefined), Math.max(timeoutMs, 1));
-			signal?.addEventListener("abort", onAbort, { once: true });
-			waiting.set(threadId, finish);
-			return promise;
-		},
-		deliver(threadId, text) {
-			const finish = waiting.get(threadId);
-			if (!finish) return false;
-			finish(text);
-			return true;
-		},
-	};
+/** RUN-15: the reply to a steering message the run ended before reading. */
+export const NOT_DELIVERED = "Not delivered: the run ended before it could read this.";
+
+/**
+ * RUN-15, DSC-24: acknowledges a steering message as `steer` settles it: ⏳ while the run cannot take it yet, then 👀
+ * once the run received it, or a reply when the run ended first. Discord failures are only logged.
+ */
+export async function acknowledgeSteer(
+	surface: DiscordSurface,
+	message: MsgRef,
+	steer: (onQueued: () => void) => Promise<"delivered" | "ended">,
+): Promise<"delivered" | "ended"> {
+	let queued: Promise<void> | undefined;
+	const quiet = (err: unknown) => log("debug", "steer acknowledgement failed", { channel: message.channelId, error: errorMessage(err) });
+	const outcome = await steer(() => {
+		queued ??= surface.react(message, "⏳").catch(quiet);
+	});
+	if (queued) await queued.then(() => surface.unreact(message, "⏳")).catch(quiet);
+	if (outcome === "delivered") await surface.react(message, "👀").catch(quiet);
+	else await surface.reply(message, { content: NOT_DELIVERED }, "high").catch(quiet);
+	return outcome;
 }

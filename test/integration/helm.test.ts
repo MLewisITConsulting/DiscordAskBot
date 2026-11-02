@@ -182,7 +182,6 @@ describe.skipIf(!HELM)("helm chart", () => {
 			"NetworkPolicy/askbot-web",
 			"NetworkPolicy/askbot-worker",
 			"PersistentVolumeClaim/askbot-state",
-			"PersistentVolumeClaim/askbot-web-home",
 			"ScaledJob/askbot-worker",
 			"Secret/askbot",
 			"Service/askbot-orchestrator",
@@ -209,7 +208,6 @@ describe.skipIf(!HELM)("helm chart", () => {
 			ASKBOT_WORKER_TOKEN_FILE: "/run/secrets/askbot_worker_token",
 			ASKBOT_SCALE_TOKEN_FILE: "/run/secrets/askbot_scale_token",
 			ASKBOT_WORKER_CAPACITY: "10",
-			ASKBOT_WORKER_DISK: "20g",
 		});
 		expect(c.resources).toEqual({ requests: { cpu: "250m", memory: "512Mi" }, limits: { memory: "1Gi" } });
 		expect(mounts(c)).toEqual({ "/state": "state", "/run/secrets": "secrets" });
@@ -224,7 +222,7 @@ describe.skipIf(!HELM)("helm chart", () => {
 		expect(find(objects, "PersistentVolumeClaim", "askbot-state").spec.accessModes).toEqual(["ReadWriteOnce"]);
 	});
 
-	test("web: /healthz probes, home volume, only the web token, no Ingress by default", () => {
+	test("web: /healthz probes, no volume, only the web token, no Ingress by default", () => {
 		const objects = render();
 		const deploy = find(objects, "Deployment", "askbot-web");
 		expect(deploy.spec.replicas).toBe(1);
@@ -237,10 +235,9 @@ describe.skipIf(!HELM)("helm chart", () => {
 		expect(env(c)).toEqual({
 			ASKBOT_WEB_API_TOKEN_FILE: "/run/secrets/askbot_web_api_token",
 			ASKBOT_ORCHESTRATOR_URL: "http://askbot-orchestrator.askbot.svc:8081",
-			ASKBOT_WEB_VSCODE: "on",
 		});
-		expect(c.resources).toEqual({ requests: { cpu: "100m", memory: "768Mi" }, limits: { memory: "2Gi" } });
-		expect(mounts(c)).toEqual({ "/home/askbot": "home", "/run/secrets": "secrets" });
+		expect(c.resources).toEqual({ requests: { cpu: "100m", memory: "128Mi" }, limits: { memory: "512Mi" } });
+		expect(mounts(c)).toEqual({ "/run/secrets": "secrets" });
 		expect(secretVolume(spec).items.map(i => i.key)).toEqual(["web-api-token"]);
 		expect(find(objects, "Service", "askbot-web").spec.ports?.map(p => p.port)).toEqual([8080]);
 		expect(objects.some(o => o.kind === "Ingress")).toBe(false);
@@ -288,14 +285,14 @@ describe.skipIf(!HELM)("helm chart", () => {
 		expect(env(c)).toEqual({
 			ASKBOT_ORCHESTRATOR_URL: "http://askbot-orchestrator.askbot.svc:8081",
 			ASKBOT_WORKER_TOKEN_FILE: "/run/secrets/askbot_worker_token",
-			ASKBOT_WORKER_DISK: "20g",
+			ASKBOT_WORKER_DISK: "2g",
 		});
 		expect(c.resources).toEqual({
-			requests: { cpu: "500m", memory: "1536Mi", "ephemeral-storage": "20Gi" },
+			requests: { cpu: "250m", memory: "512Mi", "ephemeral-storage": "2Gi" },
 			limits: { memory: "4Gi" },
 		});
-		expect(mounts(c)).toEqual({ "/tmp": "checkout", "/run/askbot": "run-local", "/run/secrets": "secrets" });
-		expect(spec.volumes.find(v => v.name === "checkout")?.emptyDir).toEqual({ sizeLimit: "20Gi" });
+		expect(mounts(c)).toEqual({ "/tmp": "scratch", "/run/askbot": "run-local", "/run/secrets": "secrets" });
+		expect(spec.volumes.find(v => v.name === "scratch")?.emptyDir).toEqual({ sizeLimit: "2Gi" });
 		expect(spec.volumes.find(v => v.name === "run-local")?.emptyDir).toEqual({ medium: "Memory", sizeLimit: "256Mi" });
 		expect(secretVolume(spec).items.map(i => i.key)).toEqual(["worker-token"]);
 	});
@@ -360,7 +357,7 @@ describe.skipIf(!HELM)("helm chart", () => {
 				],
 			},
 		]);
-		// The orchestrator's egress stays open (Discord, GitHub, npm, sign-in endpoints).
+		// The orchestrator's egress stays open (Discord, npm, sign-in endpoints).
 		expect(orch.spec.egress).toBeUndefined();
 	});
 
@@ -435,11 +432,7 @@ describe.skipIf(!HELM)("helm chart", () => {
 			"--set",
 			"worker.diskLimit=5Gi",
 			"--set",
-			"worker.image.repository=ghcr.io/me/askbot-worker",
-			"--set",
 			"image.tag=0.1.42",
-			"--set",
-			"web.vscode=false",
 			"--set",
 			"worker.nodeSelector.pool=workers",
 		);
@@ -447,14 +440,12 @@ describe.skipIf(!HELM)("helm chart", () => {
 		expect(job.spec.maxReplicaCount).toBe(3);
 		const spec = podSpec(job);
 		expect(spec.nodeSelector).toEqual({ pool: "workers" });
-		expect(spec.containers[0]?.image).toBe("ghcr.io/me/askbot-worker:0.1.42");
+		expect(spec.containers[0]?.image).toBe("ghcr.io/factotuminok/askbot:0.1.42");
 		expect(spec.containers[0] && env(spec.containers[0]).ASKBOT_WORKER_DISK).toBe("5g");
-		expect(spec.volumes.find(v => v.name === "checkout")?.emptyDir?.sizeLimit).toBe("5Gi");
+		expect(spec.volumes.find(v => v.name === "scratch")?.emptyDir?.sizeLimit).toBe("5Gi");
 		const orch = podSpec(find(objects, "Deployment", "askbot-orchestrator")).containers[0];
 		expect(orch?.image).toBe("ghcr.io/factotuminok/askbot:0.1.42");
 		expect(orch && env(orch).ASKBOT_WORKER_CAPACITY).toBe("3");
-		const web = podSpec(find(objects, "Deployment", "askbot-web")).containers[0];
-		expect(web && env(web).ASKBOT_WEB_VSCODE).toBe("off");
 	});
 
 	test("fails without the KEDA ScaledJob API, unless the check is skipped", () => {

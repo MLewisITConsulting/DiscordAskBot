@@ -1,17 +1,16 @@
-import type { ExtensionAskDialogSubmitResult, ExtensionUIDialogOptions } from "@oh-my-pi/pi-coding-agent";
-import type { Loadout, TodoItem } from "../../shared/agent";
+import type { Loadout } from "../../shared/agent";
 import { errorMessage, setLogSink } from "../../shared/log";
-import type { ChildMessage, DialogData, HostResult, HostRuntime, ParentMessage, StartOptions, UiMethod } from "../../shared/protocol";
+import type { ChildMessage, HostResult, HostRuntime, ParentMessage, StartOptions } from "../../shared/protocol";
 import { type RunUsage, type TranscriptEvent, truncateEvent } from "../../shared/transcript";
-import { abortError, createPauseClock, type HeadlessUI, headlessUIBase } from "../../shared/ui";
+import { abortError } from "../../shared/ui";
 import type { SessionRuntime } from "./session";
 
 /**
  * The agent host's side of the protocol (`src/shared/protocol.ts`), without the SDK: `host.ts` is the real entry and
  * passes the SDK-backed session, tests pass a scripted one (`test/fixtures/agent-host.ts`). A process serves exactly one
  * run: it receives one `start` message, runs the session with callbacks that post messages back, and exits after
- * reporting `done` or `failed`. Everything else (Discord, GitHub, storage) is the orchestrator's, reached through the
- * worker supervisor.
+ * reporting `done` or `failed`. Everything else (Discord, storage) is the orchestrator's, reached through the worker
+ * supervisor.
  */
 
 export type AbortReason = NonNullable<HostResult["aborted"]>;
@@ -30,9 +29,6 @@ export interface SessionHandle {
 	abort(reason: AbortReason): Promise<void>;
 }
 
-/** A UI context that also reports the time spent waiting on a human, which the wall-clock limit excludes (AGT-14). */
-export type SessionUI = HeadlessUI & { pausedMs(): number };
-
 /** A fresh access token for one sign-in, from the orchestrator (CRED-03). */
 export interface FreshCredential {
 	accessToken: string;
@@ -47,20 +43,16 @@ export type CredentialRequester = (
 ) => Promise<FreshCredential>;
 
 /** The start options plus the callbacks that post messages to the supervisor. */
-export type SessionOptions = Omit<StartOptions, "createIssueRepo" | "wantLoadout"> & {
-	ui: SessionUI;
+export type SessionOptions = Omit<StartOptions, "wantLoadout"> & {
 	onProgress(p: { tool?: string; intent?: string; usage: RunUsage; elapsedMs: number }): void;
 	onTranscript(event: TranscriptEvent): void;
-	onTodos(todos: TodoItem[]): void;
 	/** Called once when the run ends, also when it throws, with what this run consumed. */
 	onUsage(usage: RunUsage): void;
 	/** Present when the supervisor wants the loadout (AGT-27). */
 	onLoadout?(loadout: Loadout): void;
-	/** Resolves when the orchestrator stored the session file; the prompt is only sent after that (JOB-10). */
+	/** Resolves when the orchestrator stored the session file; the prompt is only sent after that (RUN-18). */
 	onSessionFile(path: string): Promise<void>;
 	register(handle: SessionHandle): void;
-	/** The `create_issue` tool (AGT-10); `file` is executed by the orchestrator. */
-	createIssue?: { repo: string; file(title: string, body: string): Promise<{ number: number; url: string }> };
 };
 
 /** What the host runs. */
@@ -75,13 +67,6 @@ const ORPHAN_EXIT_MS = 5_000;
 const FLUSH_EXIT_MS = 2_000;
 
 type StartMessage = Extract<ParentMessage, { t: "start" }>;
-
-/** The serializable members of omp's dialog options (the signal travels as `ui_cancel`, callbacks are not forwarded). */
-function dialogData(options: ExtensionUIDialogOptions | undefined): DialogData {
-	if (!options) return {};
-	const { timeout, initialIndex, outline, helpText, selectionMarker, checkedIndices, markableCount, acceptImages } = options;
-	return { timeout, initialIndex, outline, helpText, selectionMarker, checkedIndices, markableCount, acceptImages };
-}
 
 export function serveAgentHost(deps: HostDeps): void {
 	const channel = process.send?.bind(process);
@@ -112,40 +97,6 @@ export function serveAgentHost(deps: HostDeps): void {
 		pending.set(id, { resolve, reject });
 		send(build(id));
 		return { id, promise };
-	}
-
-	function createProxyUI(): SessionUI {
-		const clock = createPauseClock();
-		function ask(method: Exclude<UiMethod, "notify">, args: unknown[], options: ExtensionUIDialogOptions | undefined): Promise<unknown> {
-			const signal = options?.signal;
-			if (signal?.aborted) return Promise.reject(abortError());
-			// Time spent waiting on a person does not count against the wall-clock limit.
-			return clock.during(async () => {
-				const { id, promise } = rpc(id => ({ t: "ui", id, method, args, dialog: dialogData(options) }));
-				const onAbort = () => {
-					const waiting = pending.get(id);
-					pending.delete(id);
-					send({ t: "ui_cancel", id });
-					waiting?.reject(abortError());
-				};
-				signal?.addEventListener("abort", onAbort, { once: true });
-				try {
-					return await promise;
-				} finally {
-					signal?.removeEventListener("abort", onAbort);
-				}
-			});
-		}
-		return {
-			...headlessUIBase(),
-			pausedMs: clock.pausedMs,
-			askDialog: (questions, options) => ask("askDialog", [questions], options) as Promise<ExtensionAskDialogSubmitResult>,
-			select: (title, options, dialogOptions) => ask("select", [title, options], dialogOptions) as Promise<string | undefined>,
-			input: (title, placeholder, dialogOptions) => ask("input", [title, placeholder], dialogOptions) as Promise<string | undefined>,
-			editor: (title, prefill, dialogOptions) => ask("editor", [title, prefill], dialogOptions) as Promise<string | undefined>,
-			confirm: (title, message, dialogOptions) => ask("confirm", [title, message], dialogOptions) as Promise<boolean>,
-			notify: (message, type) => send({ t: "ui", id: ++nextId, method: "notify", args: [message, type] }),
-		};
 	}
 
 	const requestCredential: CredentialRequester = async (request, signal) => {
@@ -186,14 +137,12 @@ export function serveAgentHost(deps: HostDeps): void {
 	async function start(message: StartMessage): Promise<void> {
 		try {
 			const runtime = await deps.openRuntime(message.runtime, requestCredential);
-			const { createIssueRepo, wantLoadout, ...rest }: StartOptions = message.opts;
+			const { wantLoadout, ...rest }: StartOptions = message.opts;
 			const result = await deps.run(runtime, {
 				...rest,
-				ui: createProxyUI(),
 				onProgress: p => send({ t: "progress", ...p }),
 				// Field limits applied here, before the IPC hop (RUN-16).
 				onTranscript: event => send({ t: "transcript", event: truncateEvent(event) }),
-				onTodos: todos => send({ t: "todos", todos }),
 				onUsage: usage => send({ t: "usage", usage }),
 				onLoadout: wantLoadout ? loadout => send({ t: "loadout", loadout }) : undefined,
 				onSessionFile: async path => {
@@ -205,13 +154,6 @@ export function serveAgentHost(deps: HostDeps): void {
 					// A cancel that arrived before the session was ready (AGT-07).
 					if (abortRequested) sessionHandle.abort(abortRequested).catch(() => {});
 				},
-				createIssue: createIssueRepo
-					? {
-							repo: createIssueRepo,
-							file: async (title, body) =>
-								(await rpc(id => ({ t: "tool_call", id, name: "create_issue", params: { title, body } })).promise) as { number: number; url: string },
-						}
-					: undefined,
 			});
 			finish({ t: "done", result });
 		} catch (err) {

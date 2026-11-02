@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runRelay } from "../../src/orchestrator/dispatch/relay";
-import { dbPath, openDb } from "../../src/orchestrator/store/db";
+import { type Db, dbPath, type NewRun, openDb, type RunRow } from "../../src/orchestrator/store/db";
 
 const dirs: string[] = [];
 afterEach(async () => {
@@ -16,10 +16,16 @@ async function stateDir(): Promise<string> {
 	return dir;
 }
 
+/** A pending run of a new ask thread `threadId` (runs belong to an ask chat, DB-02). */
+function pending(db: Db, threadId: string, extra: Omit<NewRun, "threadId"> = {}): RunRow {
+	db.insertAskChat(threadId, "c1", "u1");
+	return db.insertRun({ threadId, ...extra });
+}
+
 describe("run relay (RUN-06)", () => {
 	test("outgoing messages get increasing sequence numbers, double as request ids, and stay until acknowledged", () => {
 		const db = openDb(":memory:");
-		const run = db.insertRun({ kind: "draft", draftId: "d1" });
+		const run = pending(db, "d1");
 		const relay = runRelay(db, run.id);
 		const first = relay.enqueue(id => ({ t: "steer", id, text: "one" }));
 		const second = relay.enqueue(id => ({ t: "abort", id, reason: "user" }));
@@ -40,7 +46,7 @@ describe("run relay (RUN-06)", () => {
 
 	test("incoming duplicates are dropped and gaps are accepted", () => {
 		const db = openDb(":memory:");
-		const run = db.insertRun({ kind: "draft", draftId: "d1" });
+		const run = pending(db, "d1");
 		const relay = runRelay(db, run.id);
 		expect(relay.received()).toBe(0);
 		expect(relay.accept(1)).toBe(true);
@@ -54,7 +60,7 @@ describe("run relay (RUN-06)", () => {
 	test("the outbox and the received sequence survive an orchestrator restart", async () => {
 		const dir = await stateDir();
 		const before = openDb(dbPath(dir));
-		const run = before.insertRun({ kind: "draft", draftId: "d1" });
+		const run = pending(before, "d1");
 		const relay = runRelay(before, run.id);
 		relay.enqueue(id => ({ t: "steer", id, text: "keep me" }));
 		relay.enqueue(() => ({ t: "reply", id: 3, ok: true, value: "yes" }));

@@ -1,68 +1,19 @@
-import type { EngineConfig, LabelNames } from "../../shared/config";
-import type { Dispatcher, SteerOptions } from "../dispatch/dispatcher";
-import type { InteractionRouter } from "../discord/interactions";
-import type { ThreadReplies } from "../discord/replies";
+import type { Config } from "../../shared/config";
 import type { DiscordSurface } from "../discord/surface";
-import type { GitHub, GhIssue } from "../github/types";
+import type { Dispatcher } from "../dispatch/dispatcher";
 import type { AgentLog } from "../store/agentlog";
-import type { Db, IssueRow, JobRow } from "../store/db";
-import type { JobKind } from "./state";
-import type { ChatSlots } from "./chatSlots";
+import type { Db } from "../store/db";
 
 /**
- * Everything one engine instance works with (ENG-02: rebuilt on every settings apply). Ported from DevForge `EngineDeps`
- * (src/engine/jobs.ts) with: `client` → `discord` (the surface, no discord.js), `runtime`/`activeSessions` → `dispatcher`
- * (process-wide, outlives the engine), no `workspace` (checkouts live on workers; the dispatcher keeps the mirrors and
- * pushes results), label names from settings.
+ * Everything one engine instance works with (ENG-02: rebuilt on every settings apply). The dispatcher is process-wide
+ * and outlives the engine, so an engine restart never touches runs (RUN-09).
  */
 export interface EngineDeps {
-	config: EngineConfig;
-	/** Effective label names (GH-08, GH-22). */
-	labels: LabelNames;
+	config: Config;
 	db: Db;
-	github: GitHub;
 	discord: DiscordSurface;
 	dispatcher: Dispatcher;
-	/** Typed thread replies waiting to answer an agent's question (checked before steering, DSC-18). */
-	replies: ThreadReplies;
-	interactions: InteractionRouter;
 	agentLog: AgentLog;
-	/** `<state>/sessions` (ENG-05). */
-	sessionDir: string;
-	/** The `maxChatSessions` budget shared by chats, plans and drafts (CHAT-04, DSC-25); one per engine instance. */
-	chatSlots: ChatSlots;
-	/** Aborted when this engine instance stops: in-flight work detaches from its runs and stops touching Discord/GitHub. */
+	/** Aborted when this engine instance stops: in-flight work detaches from its runs and stops touching Discord. */
 	signal: AbortSignal;
 }
-
-/** Ported from DevForge `src/engine/scheduler.ts` (JOB-01 to JOB-09). Implemented by `createScheduler(deps)`. */
-export interface Scheduler {
-	enqueue(issueId: number, kind: JobKind, input?: object): JobRow;
-	/** Starts queued jobs up to `maxConcurrentJobs`, oldest first, one per issue (JOB-02, JOB-03). */
-	tick(): void;
-	/** JOB-05: `stopJobs`, then the issue moves to `cancelled` (unless already terminal) with the reason. */
-	cancelIssue(issueId: number, reason: string): Promise<void>;
-	/** Cancels the issue's queued jobs and aborts its live run; leaves the issue's state alone (GH-14). */
-	stopJobs(issueId: number): Promise<void>;
-	/** True when the issue has a queued or running job. */
-	isBusy(issueId: number): boolean;
-	/**
-	 * Steers the issue's live run (AGT-15, DSC-24, RUN-15): `delivered`/`ended` as the run settled it, `not-ready` when the
-	 * job's run has not registered yet, `none` when the issue has no job executing.
-	 */
-	steer(issueId: number, text: string, from: string, opts?: SteerOptions): Promise<"delivered" | "ended" | "not-ready" | "none">;
-	/** Engine start (JOB-08): re-executes jobs left `running`; the dispatcher re-attaches to their runs or reports them lost. */
-	recover(): void;
-	/** Engine stop: stop claiming and detach from runs. Never aborts runs (RUN-09). */
-	detach(): Promise<void>;
-}
-
-/** How an issue came to be tracked; decides where its thread opens (DSC-34). */
-export type TrackSource = { via: "label" } | { via: "command"; actorId: string };
-
-/**
- * GH-12 and `/work start`: post the 📥 top message in the repo's watch channel (or the work channel), start the thread,
- * record the issue `queued` with its thread, post "Queued for planning", enqueue `plan`. Implemented by `trackIssue` in
- * `engine/issues.ts`; used by the poller and the bot.
- */
-export type TrackIssue = (repo: string, issue: GhIssue, source: TrackSource) => Promise<IssueRow>;

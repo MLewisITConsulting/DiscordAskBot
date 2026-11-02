@@ -2,11 +2,10 @@ import type { RunStatus, WorkerStatus } from "../../shared/adminApi";
 import type { Loadout } from "../../shared/agent";
 import { existsSync } from "node:fs";
 import type { ServerWebSocket, WebSocketHandler } from "bun";
+import type { Config } from "../../shared/config";
 import { addLogSecret, errorMessage, log, removeLogSecret, writeRelayedLogLine } from "../../shared/log";
-import { MCP_TEST_TIMEOUT_MS, type McpServer, parseOmpConfig } from "../../shared/ompconfig";
-import type { ChildMessage, Reply, UiMethod } from "../../shared/protocol";
+import type { ChildMessage } from "../../shared/protocol";
 import type { RunUsage } from "../../shared/transcript";
-import { callUi } from "../../shared/ui";
 import {
 	type DownMessage,
 	LEASE_MS,
@@ -17,35 +16,26 @@ import {
 	type WorkerControl,
 	type WorkerPhase,
 } from "../../shared/wire";
-import { type ClaimedRun, type Db, parseJson, type RunOutcome, type RunOwnerColumn, type RunRow } from "../store/db";
-import type { Config } from "../../shared/config";
-import { sessionPath } from "../store/sessions";
-import { createGitEndpoint } from "../git/endpoint";
-import type { Repos } from "../git/repos";
 import type { OmpRuntimeSource } from "../omp/updates";
-import { changedOutputs, createArtifactHandler, MAX_BUNDLE_BYTES, STATE_FREE_FLOOR_BYTES } from "./artifacts";
-import { createRunRefs, type PreparedCheckout, prepareCheckout, readRepoConfig } from "./checkouts";
+import { type ClaimedRun, type Db, parseJson, type RunOutcome, type RunRow } from "../store/db";
+import { sessionDir, sessionPath } from "../store/sessions";
+import type { CredentialAnswer, CredentialRequest } from "../store/signins";
+import { changedOutputs, createArtifactHandler, STATE_FREE_FLOOR_BYTES } from "./artifacts";
 import {
 	type AbortReason,
 	type Dispatcher,
 	NoStructuredOutput,
-	ownerKey,
 	RunDetached,
 	type RunHandle,
 	type RunHooks,
 	RunLost,
-	type RunOwner,
 	type RunRequest,
 	type RunResult,
 	type SteerOptions,
-	UI_CALL_CONTEXT,
-	type UiCallContext,
-	writesCode,
 } from "./dispatcher";
-import { claimNextRun, holdsLease, newLeaseToken, sameToken } from "./leases";
+import { claimNextRun, holdsLease } from "./leases";
 import { type RunRelay, runRelay } from "./relay";
-import { buildRunSpec, type SpecSources, sessionDir, unrunnableReason } from "./spec";
-import type { CredentialAnswer, CredentialRequest } from "../store/signins";
+import { buildRunSpec, type SpecSources, unrunnableReason } from "./spec";
 
 /**
  * The real `Dispatcher` (architecture §4.1 to §4.5): runs live in the `runs` table, each on its own worker. Workers
@@ -56,19 +46,14 @@ import type { CredentialAnswer, CredentialRequest } from "../store/signins";
 
 /** RUN-01 caps; `maxConcurrentRuns` already defaults to the worker capacity. */
 export interface DispatchLimits {
-	maxConcurrentJobs: number;
 	maxChatSessions: number;
 	maxConcurrentRuns: number;
 }
 
-/**
- * The caps for the saved settings' `config`. Without it (settings unsaved, invalid or locked) no job or chat can start,
- * but MCP connection tests (AGT-21) still run, up to the worker capacity: an admin can test servers before the first save.
- */
-export function dispatchLimits(config: Pick<Config, "limits" | "workers"> | undefined, workerCapacity: number): DispatchLimits {
-	if (!config) return { maxConcurrentJobs: 0, maxChatSessions: 0, maxConcurrentRuns: workerCapacity };
-	const { maxConcurrentJobs, maxChatSessions } = config.limits;
-	return { maxConcurrentJobs, maxChatSessions, maxConcurrentRuns: config.workers.maxConcurrentRuns ?? workerCapacity };
+/** The caps for the saved settings' `config`; undefined (settings unsaved, invalid or locked): no run can start. */
+export function dispatchLimits(config: Pick<Config, "limits" | "workers"> | undefined, workerCapacity: number): DispatchLimits | undefined {
+	if (!config) return undefined;
+	return { maxChatSessions: config.limits.maxChatSessions, maxConcurrentRuns: config.workers.maxConcurrentRuns ?? workerCapacity };
 }
 
 export interface WorkerDispatcherOptions {
@@ -89,8 +74,6 @@ export interface WorkerDispatcherOptions {
 	/** Lease length (default `LEASE_MS`) and how often expired leases are swept (default 1 s); shorter in tests. */
 	leaseMs?: number;
 	sweepMs?: number;
-	/** Mirrors and runs repos (WS-01, RUN-17 to RUN-20). */
-	repos: Repos;
 	/** In-place omp updates (UPD-07, UPD-08): the copy runs are given, its archive, canary failures; none outside the image. */
 	ompRuntime?: OmpRuntimeSource;
 	/**
@@ -99,8 +82,6 @@ export interface WorkerDispatcherOptions {
 	 * workers share a source address (a service mesh, or local worker processes in tests).
 	 */
 	bindWorkerAddresses: boolean;
-	/** `ASKBOT_WORKER_DISK` (STO-06): checkpoint and result bundles above it are refused; default `MAX_BUNDLE_BYTES`. */
-	workerDiskBytes?: number;
 	/** Free space the state volume keeps: uploads that would go below it are refused; default `STATE_FREE_FLOOR_BYTES`. */
 	stateFreeFloorBytes?: number;
 }
@@ -118,21 +99,13 @@ export interface WorkerDispatcher extends Dispatcher {
 	readonly websocket: WebSocketHandler<WorkerSocketData>;
 	/** `/internal/runs/<id>/…`, lease-token authorised. */
 	artifact(req: Request): Promise<Response>;
-	/** `/internal/git/<owner>/<name>.git/…`: read-only git from the mirror of the lease's repo (RUN-17). */
-	git(req: Request): Promise<Response>;
-	/** Settles when the start-up pass is done: refs of finished runs not kept for Retry pruned, unused mirrors deleted (WS-07, WS-01). */
-	maintenance(): Promise<void>;
 	/** Stops timers (RUN-09: never aborts runs). */
 	close(): void;
 }
 
 /** omp refreshes within 10 s; the answer must arrive before that (CRED-03). */
 const CREDENTIAL_ANSWER_MS = 9_500;
-/** After `assign`, an mcp-test result must arrive within its timeout plus this (worker start, transfer). */
-const MCP_TEST_SLACK_MS = 10_000;
 const ACTIVE_STATES = ["pending", "assigned", "running", "finishing", "lost"] as const;
-/** WS-01: how often unused mirrors are looked for after the one pass at start. */
-const MIRROR_EXPIRY_MS = 24 * 3_600_000;
 /** Architecture §6: how long an address can't claim after a claim from it ended (its worker may still be exiting). */
 const ADDRESS_QUIET_MS = 60_000;
 
@@ -152,16 +125,6 @@ interface Steer {
 	queuedReported: boolean;
 }
 
-interface Question {
-	caller: Caller;
-	controller: AbortController;
-	settle(delivered: boolean): void;
-	/** Superseded by a newer caller's invocation: its outcome is ignored. */
-	stale: boolean;
-	/** The host withdrew it (`ui_cancel`): no reply is sent. */
-	cancelled: boolean;
-}
-
 interface Conn {
 	ws: ServerWebSocket<WorkerSocketData>;
 	address: string;
@@ -170,7 +133,7 @@ interface Conn {
 	version?: string;
 	ompVersion?: string;
 	runOmpVersion?: string;
-	/** The run or mcp-test task this connection holds the lease of. */
+	/** The run this connection holds the lease of. */
 	runId?: string;
 	phase?: WorkerPhase;
 	claimTimer?: ReturnType<typeof setTimeout>;
@@ -183,10 +146,7 @@ interface Conn {
 }
 
 interface Run {
-	type: "run";
-	key: string;
-	owner: RunOwner;
-	category: "job" | "chat";
+	threadId: string;
 	/** Set once the run is admitted (a `runs` row exists). */
 	id: string | undefined;
 	/** Unknown for a run found in the database after a restart until a caller attaches. */
@@ -196,7 +156,7 @@ interface Run {
 	registered: boolean;
 	conn: Conn | undefined;
 	usage: RunUsage;
-	/** Tool of the latest progress report and the reported loadout, for the status page (§9.3); lost on restart. */
+	/** Tool of the latest progress report and the reported loadout, for the status page (NFR-06); lost on restart. */
 	lastTool: string | undefined;
 	loadout: Loadout | undefined;
 	aborted: AbortReason | undefined;
@@ -204,62 +164,12 @@ interface Run {
 	queued: Steer[];
 	/** Steers sent, by request id, waiting for the host's reply. */
 	sent: Map<number, Steer>;
-	questions: Map<number, Question>;
-	/** Answers sent, settled when the worker acknowledges their sequence number (RUN-15). */
-	deliveries: { seq: number; settle(delivered: boolean): void }[];
 	/** `scratch-input` names to send before the relay message with this sequence number (CHAT-08). */
 	scratchBefore: Map<number, string[]>;
-	/** `tool_call`s that arrived while no caller was attached (after a restart). */
-	deferredTools: Extract<ChildMessage, { t: "tool_call" }>[];
 	outcome: StoredOutcome | undefined;
 }
 
-interface McpTask {
-	type: "mcp";
-	id: string;
-	name: string;
-	server: McpServer;
-	createdAt: number;
-	state: "waiting" | "pending" | "assigned" | "done";
-	token?: string;
-	workerId?: string;
-	conn?: Conn;
-	leaseExpiresAt?: number;
-	timer?: ReturnType<typeof setTimeout>;
-	resolve(result: { ok: boolean; tools: string[]; error?: string }): void;
-	/** A worker picked the test up: its timeout starts now. */
-	onStarted?(): void;
-}
-
 const ZERO_USAGE: RunUsage = { costUsd: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-
-function ownerColumn(owner: RunOwner): [RunOwnerColumn, string] {
-	switch (owner.kind) {
-		case "job":
-			return ["job_id", owner.jobId];
-		case "chat":
-			return ["chat_thread_id", owner.threadId];
-		case "plan":
-			return ["plan_thread_id", owner.threadId];
-		case "draft":
-			return ["draft_id", owner.draftId];
-	}
-}
-
-function rowOwner(row: RunRow): RunOwner {
-	if (row.job_id) return { kind: "job", jobId: row.job_id };
-	if (row.chat_thread_id) return { kind: "chat", threadId: row.chat_thread_id };
-	if (row.plan_thread_id) return { kind: "plan", threadId: row.plan_thread_id };
-	return { kind: "draft", draftId: row.draft_id ?? "" };
-}
-
-/** The part of a run request that defines the turn and survives in the `runs` row; the rest are the live engine's closures. */
-type RunTurn = Pick<RunRequest, "profile" | "prompt" | "outputSchema" | "model" | "thinking" | "limits" | "session" | "resume" | "threadId" | "scratchDir">;
-
-function turnOf(req: RunRequest): RunTurn {
-	const { profile, prompt, outputSchema, model, thinking, limits, session, resume, threadId, scratchDir } = req;
-	return { profile, prompt, outputSchema, model, thinking, limits, session, resume, threadId, scratchDir };
-}
 
 function toError(error: { name: string; message: string }): Error {
 	if (error.name === "RunLost") return new RunLost();
@@ -287,20 +197,17 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 	const { db } = opts;
 	const leaseMs = opts.leaseMs ?? LEASE_MS;
 	const claimWaitMs = opts.claimWaitMs ?? 10_000;
-	/** Runs by owner key: waiting for a slot, active, or finished and not yet delivered. */
+	/** Runs by ask thread: waiting for a slot, active, or finished and not yet delivered. */
 	const runs = new Map<string, Run>();
 	const byId = new Map<string, Run>();
-	/** Runs and mcp tests above their caps, oldest first (RUN-01): in memory only, not `pending`. */
-	const waiting: (Run | McpTask)[] = [];
-	const tasks = new Map<string, McpTask>();
+	/** Runs above their caps, oldest first (RUN-01): in memory only, not `pending`. */
+	const waiting: Run[] = [];
 	const conns = new Map<WorkerSocketData, Conn>();
 	const claimers: Conn[] = [];
 	const relays = new Map<string, RunRelay>();
-	/** Runs admitted past their caps whose checkout is being prepared (RUN-17): they count as active, not yet `pending`. */
-	const preparing = new Set<Run>();
-	/** When a connection holding a run or mcp test last closed, by address (architecture §6 quiet period). */
+	/** When a connection holding a run last closed, by address (architecture §6 quiet period). */
 	const released = new Map<string, number>();
-	/** Live lease tokens by run or mcp-test id: masked in every log line while they open anything (F9). */
+	/** Live lease tokens by run id: masked in every log line while they open anything (F9). */
 	const liveLeases = new Map<string, string>();
 	const leaseLive = (id: string, token: string): void => {
 		liveLeases.set(id, token);
@@ -310,18 +217,13 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 		removeLogSecret(liveLeases.get(id));
 		liveLeases.delete(id);
 	};
-	const refs = createRunRefs(db, opts.repos);
 	const artifacts = createArtifactHandler({
 		db,
 		stateDir: opts.stateDir,
 		skills: opts.skills,
-		repos: opts.repos,
-		refs,
 		ompRuntime: opts.ompRuntime,
-		bundleLimitBytes: Math.min(MAX_BUNDLE_BYTES, opts.workerDiskBytes ?? MAX_BUNDLE_BYTES),
 		freeFloorBytes: opts.stateFreeFloorBytes ?? STATE_FREE_FLOOR_BYTES,
 	});
-	const gitEndpoint = createGitEndpoint({ repos: opts.repos, authorize: token => db.runForLease(token)?.repo ?? undefined });
 
 	const relayOf = (id: string): RunRelay => {
 		let relay = relays.get(id);
@@ -353,12 +255,9 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 
 	// ── Runs in memory ──────────────────────────────────────────────────────────────────────────
 
-	function newRun(owner: RunOwner, req: RunRequest | undefined): Run {
+	function newRun(threadId: string, req: RunRequest | undefined): Run {
 		const run: Run = {
-			type: "run",
-			key: ownerKey(owner),
-			owner,
-			category: owner.kind === "job" ? "job" : "chat",
+			threadId,
 			id: undefined,
 			req,
 			caller: undefined,
@@ -370,10 +269,7 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 			aborted: undefined,
 			queued: [],
 			sent: new Map(),
-			questions: new Map(),
-			deliveries: [],
 			scratchBefore: new Map(),
-			deferredTools: [],
 			outcome: undefined,
 			handle: {
 				steer: (text, from, steerOpts) => steer(run, `[Discord @${from}]: ${text}`, steerOpts),
@@ -387,17 +283,17 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 	function ensureRun(row: RunRow): Run {
 		const known = byId.get(row.id);
 		if (known) return known;
-		const run = newRun(rowOwner(row), undefined);
+		const run = newRun(row.thread_id, undefined);
 		run.id = row.id;
 		run.registered = row.state === "running";
 		if (row.state === "finished" && row.result) run.outcome = JSON.parse(row.result) as StoredOutcome;
-		runs.set(run.key, run);
+		runs.set(run.threadId, run);
 		byId.set(row.id, run);
 		return run;
 	}
 
 	function forget(run: Run): void {
-		if (runs.get(run.key) === run) runs.delete(run.key);
+		if (runs.get(run.threadId) === run) runs.delete(run.threadId);
 		if (run.id) {
 			byId.delete(run.id);
 			relays.delete(run.id);
@@ -446,31 +342,21 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 					result: JSON.stringify(outcome),
 				});
 				relayOf(id).clear();
-				for (const q of db.questionsForRun(id)) db.deleteQuestion(id, q.request_id);
 			})();
 			artifacts.release(id);
 			leaseEnded(id);
-			refs.settle(id, dbOutcome).catch(err => log("warn", "settling the run's refs failed", { run: id, error: errorMessage(err) }));
 		}
 		const index = waiting.indexOf(run);
 		if (index >= 0) waiting.splice(index, 1);
 		for (const s of [...run.queued, ...run.sent.values()]) s.resolve("ended");
 		run.queued = [];
 		run.sent.clear();
-		for (const q of run.questions.values()) {
-			q.stale = true;
-			q.controller.abort();
-			q.settle(false);
-		}
-		run.questions.clear();
-		for (const d of run.deliveries) d.settle(false);
-		run.deliveries = [];
-		log("info", "run finished", { run: id, owner: run.key, outcome: dbOutcome });
+		log("info", "run finished", { run: id, thread: run.threadId, outcome: dbOutcome });
 		deliver(run);
 		admit();
 	}
 
-	/** A `runs` row nobody can continue (no request known): finished without a result, so the owner's next call starts afresh. */
+	/** A `runs` row nobody can continue (no request known): finished without a result, so the thread's next turn starts afresh. */
 	function dropOrphan(row: RunRow): void {
 		db.transitionRun(row.id, ["pending"], "finished", { outcome: "cancelled" });
 		relayOf(row.id).clear();
@@ -481,107 +367,46 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 
 	// ── Admission and claims (RUN-01, RUN-02) ─────────────────────────────────────────────────
 
-	function activeCounts(): { job: number; chat: number; total: number } {
-		let job = 0;
-		let chat = 0;
-		for (const row of db.runsInState(...ACTIVE_STATES)) {
-			if (row.job_id) job++;
-			else chat++;
-		}
-		for (const run of preparing) {
-			if (run.category === "job") job++;
-			else chat++;
-		}
-		let mcp = 0;
-		for (const task of tasks.values()) if (task.state === "pending" || task.state === "assigned") mcp++;
-		return { job, chat, total: job + chat + mcp };
+	/** Runs that hold a slot: pending or active (RUN-01). */
+	function activeCount(): number {
+		return db.runsInState(...ACTIVE_STATES).length;
 	}
 
-	/** The run becomes claimable: its `runs` row is inserted as `pending`, with its checkout when it has one. */
-	function insertPending(entry: Run, prepared: PreparedCheckout | undefined): void {
+	/** The run becomes claimable: its `runs` row is inserted as `pending`; a resumed turn continues the thread's previous run (DB-02). */
+	function insertPending(entry: Run): void {
 		const req = entry.req!;
-		const [column, ownerId] = ownerColumn(entry.owner);
 		try {
+			const continuesRunId = req.resume ? db.latestRun(req.threadId)?.id : undefined;
 			const row = db.insertRun({
-				kind: req.kind,
-				jobId: column === "job_id" ? ownerId : undefined,
-				chatThreadId: column === "chat_thread_id" ? ownerId : undefined,
-				planThreadId: column === "plan_thread_id" ? ownerId : undefined,
-				draftId: column === "draft_id" ? ownerId : undefined,
 				threadId: req.threadId,
-				repo: prepared?.repo,
-				startRef: prepared?.startRef,
-				startCommit: prepared?.startCommit,
-				setupCommand: prepared?.setupCommand,
-				continuesRunId: prepared?.continuesRunId,
+				continuesRunId,
 				sessionKey: req.session,
 				scratchDir: req.scratchDir,
-				request: JSON.stringify(turnOf(req)),
+				request: JSON.stringify(req),
 			});
 			entry.id = row.id;
 			byId.set(row.id, entry);
-			log("info", "run pending", {
-				run: row.id,
-				owner: entry.key,
-				kind: req.kind,
-				...(prepared ? { repo: prepared.repo, start: prepared.startRef, commit: prepared.startCommit, continues: prepared.continuesRunId } : {}),
-			});
+			log("info", "run pending", { run: row.id, thread: req.threadId, continues: continuesRunId });
 		} catch (err) {
 			finishRun(entry, errorOutcome(entry, err), "failed");
 		}
 	}
 
-	/** RUN-17: fetch the mirror and fix the start commit before the run becomes `pending`; the slot is held meanwhile. */
-	async function prepare(entry: Run): Promise<void> {
-		let prepared: PreparedCheckout | undefined;
-		let failure: unknown;
-		try {
-			prepared = await prepareCheckout(opts.repos, db, entry.req!);
-		} catch (err) {
-			failure = err;
-		}
-		preparing.delete(entry);
-		// Aborted (or otherwise ended) while the mirror was fetched: its slot is free again.
-		if (entry.outcome) return admit();
-		if (prepared) insertPending(entry, prepared);
-		else {
-			log("warn", "run checkout preparation failed", { owner: entry.key, repo: entry.req?.checkout?.repo, error: errorMessage(failure) });
-			finishRun(entry, errorOutcome(entry, failure), "failed");
-		}
-		admit();
-	}
-
-	/** Moves waiting runs and mcp tests to `pending` as far as the caps allow, oldest first. */
+	/** Moves waiting runs to `pending` as far as the caps allow, oldest first (RUN-01). */
 	function admit(): void {
 		const limits = opts.limits();
 		if (limits && waiting.length > 0) {
-			const counts = activeCounts();
-			for (let i = 0; i < waiting.length && counts.total < limits.maxConcurrentRuns; ) {
-				const entry = waiting[i]!;
-				if (entry.type === "mcp") {
-					waiting.splice(i, 1);
-					entry.state = "pending";
-					counts.total++;
-					continue;
-				}
-				const full = entry.category === "job" ? counts.job >= limits.maxConcurrentJobs : counts.chat >= limits.maxChatSessions;
-				if (full) {
-					i++;
-					continue;
-				}
-				waiting.splice(i, 1);
-				counts[entry.category]++;
-				counts.total++;
-				if (entry.req!.checkout) {
-					preparing.add(entry);
-					prepare(entry).catch(err => log("error", "run admission failed", { owner: entry.key, error: errorMessage(err) }));
-				} else insertPending(entry, undefined);
+			let active = activeCount();
+			const cap = Math.min(limits.maxChatSessions, limits.maxConcurrentRuns);
+			while (waiting.length > 0 && active < cap) {
+				insertPending(waiting.shift()!);
+				active++;
 			}
 		}
 		match();
 	}
 
-	/** Hands pending runs and mcp tests to waiting claims, oldest first. */
+	/** Hands pending runs to waiting claims, oldest first. */
 	function match(): void {
 		while (claimers.length > 0) {
 			let row: RunRow | undefined;
@@ -592,18 +417,12 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 				}
 				dropOrphan(pending);
 			}
-			let task: McpTask | undefined;
-			for (const t of tasks.values()) if (t.state === "pending" && (!task || t.createdAt < task.createdAt)) task = t;
-			if (!row && !task) return;
+			if (!row) return;
 			const conn = claimers.shift()!;
 			clearTimeout(conn.claimTimer);
 			if (!conn.open || !conn.workerId) continue;
 			if (addressBusy(conn)) {
 				send(conn, { t: "nothing" });
-				continue;
-			}
-			if (task && (!row || task.createdAt <= Date.parse(row.created_at))) {
-				assignTask(conn, task);
 				continue;
 			}
 			const claimed = claimNextRun(db, conn.workerId, leaseMs, conn.address);
@@ -616,7 +435,7 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 	}
 
 	/**
-	 * Architecture §6: another connection from `conn`'s address holds a run or mcp test, or one claimed from it ended
+	 * Architecture §6: another connection from `conn`'s address holds a run, or one claimed from it ended
 	 * less than `ADDRESS_QUIET_MS` ago. The runs table keeps the address, so this holds across a restart.
 	 */
 	function addressBusy(conn: Conn): boolean {
@@ -639,8 +458,7 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 		log("info", "run claimed", { run: row.id, worker: conn.workerId });
 		let spec: RunSpec;
 		try {
-			const previous = row.continues_run_id ? db.getRun(row.continues_run_id) : null;
-			spec = await buildRunSpec(row, run.req!, opts.spec, previous !== null && refs.restoreKind(previous) !== undefined, opts.ompRuntime?.forRun(row.id));
+			spec = await buildRunSpec(row, run.req!, opts.spec, opts.ompRuntime?.forRun(row.id));
 		} catch (err) {
 			log("error", "run spec failed", { run: row.id, error: errorMessage(err) });
 			const holder = run.conn;
@@ -652,49 +470,6 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 		if (run.outcome || now?.lease_token !== row.lease_token || now?.state !== "assigned") return;
 		leaseLive(row.id, row.leaseToken);
 		send(run.conn, { t: "assign", runId: row.id, token: row.leaseToken, kind: "run", spec });
-	}
-
-	function assignTask(conn: Conn, task: McpTask): void {
-		if (!db.recordWorkerClaim(conn.workerId!, task.id)) {
-			send(conn, { t: "nothing" });
-			return;
-		}
-		task.state = "assigned";
-		task.workerId = conn.workerId;
-		task.token = newLeaseToken();
-		leaseLive(task.id, task.token);
-		task.conn = conn;
-		task.leaseExpiresAt = Date.now() + leaseMs;
-		conn.runId = task.id;
-		sendTaskAssign(task);
-		guard("mcp test start sink", () => task.onStarted?.());
-		task.timer = setTimeout(
-			() => settleTask(task, { ok: false, tools: [], error: `no answer from the worker within ${(MCP_TEST_TIMEOUT_MS + MCP_TEST_SLACK_MS) / 1000} s` }),
-			MCP_TEST_TIMEOUT_MS + MCP_TEST_SLACK_MS,
-		);
-	}
-
-	function sendTaskAssign(task: McpTask): void {
-		send(task.conn, {
-			t: "assign",
-			runId: task.id,
-			token: task.token!,
-			kind: "mcp-test",
-			mcp: { name: task.name, server: task.server, timeoutMs: MCP_TEST_TIMEOUT_MS },
-		});
-	}
-
-	function settleTask(task: McpTask, result: { ok: boolean; tools: string[]; error?: string }): void {
-		if (task.state === "done") return;
-		const wasWaiting = task.state === "waiting";
-		task.state = "done";
-		clearTimeout(task.timer);
-		tasks.delete(task.id);
-		leaseEnded(task.id);
-		if (wasWaiting) waiting.splice(waiting.indexOf(task), 1);
-		send(task.conn, { t: "lease-invalid", runId: task.id });
-		task.resolve(result);
-		admit();
 	}
 
 	// ── Leases (RUN-02, RUN-04, RUN-07) ────────────────────────────────────────────────────────
@@ -724,16 +499,11 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 			else finishRun(run, { ok: false, error: { name: "RunLost", message: new RunLost().message }, usage: run.usage }, "lost");
 		}
 		const now = Date.now();
-		for (const task of tasks.values()) {
-			if (task.state === "assigned" && (task.leaseExpiresAt ?? 0) < now) {
-				settleTask(task, { ok: false, tools: [], error: new RunLost().message });
-			}
-		}
 		for (const [address, at] of released) if (at <= now - ADDRESS_QUIET_MS) released.delete(address);
 		if (requeued.length > 0 || waiting.length > 0) admit();
 	}
 
-	// ── Steering, abort, questions (RUN-05, RUN-08, RUN-15) ──────────────────────────────────
+	// ── Steering and abort (RUN-05, RUN-15) ──────────────────────────────────
 
 	function reportQueued(s: Steer): void {
 		if (s.queuedReported) return;
@@ -776,7 +546,7 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 		if (run.outcome || run.aborted) return;
 		run.aborted = reason;
 		const state = rowState(run);
-		log("info", "run abort requested", { run: run.id, owner: run.key, reason, state });
+		log("info", "run abort requested", { run: run.id, thread: run.threadId, reason, state });
 		if (state === "assigned" && !run.conn?.open) {
 			// RUN-05: its worker is away and may have started the run meanwhile: finished when it re-announces, or at lease expiry.
 			return;
@@ -792,69 +562,6 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 		sendRelay(run, id => ({ t: "abort", id, reason }));
 	}
 
-	function invokeQuestion(run: Run, requestId: string): void {
-		const caller = run.caller;
-		const row = run.id ? db.getQuestion(run.id, requestId) : null;
-		if (!caller || !row || run.outcome) return;
-		const id = Number(requestId);
-		const previous = run.questions.get(id);
-		if (previous?.caller === caller) return;
-		if (previous) {
-			previous.stale = true;
-			previous.controller.abort();
-			previous.settle(false);
-		}
-		const { method, args, dialog } = JSON.parse(row.options) as { method: Exclude<UiMethod, "notify">; args: unknown[]; dialog?: object };
-		const delivered = Promise.withResolvers<boolean>();
-		const question: Question = { caller, controller: new AbortController(), settle: delivered.resolve, stale: false, cancelled: false };
-		run.questions.set(id, question);
-		const runId = run.id!;
-		const context: UiCallContext = {
-			key: `${runId}:${requestId}`,
-			...(row.channel_id ? { posted: { channelId: row.channel_id, messageIds: row.message_id ? row.message_id.split(",") : [] } } : {}),
-			onPosted: posted => guard("question record", () => db.setQuestionPosted(runId, requestId, posted.channelId, posted.messageIds), { run: runId }),
-			delivered: delivered.promise,
-		};
-		const answer = (result: { ok: true; value?: unknown } | { ok: false; error: string; aborted?: boolean }) => {
-			if (question.stale) return;
-			if (run.questions.get(id) === question) run.questions.delete(id);
-			if (run.outcome || question.cancelled) {
-				question.settle(false);
-				return;
-			}
-			db.deleteQuestion(runId, requestId);
-			const envelope = sendRelay(run, () => ({ t: "reply", id, ...result }));
-			run.deliveries.push({ seq: envelope.seq, settle: question.settle });
-		};
-		void Promise.resolve()
-			.then(() => callUi(caller.hooks.ui, method, args, { ...dialog, signal: question.controller.signal, [UI_CALL_CONTEXT]: context }))
-			.then(
-				value => answer({ ok: true, value }),
-				err =>
-					answer({
-						ok: false,
-						error: errorMessage(err),
-						...(err instanceof Error && err.name === "AbortError" ? { aborted: true } : {}),
-					}),
-			);
-	}
-
-	function runTool(run: Run, call: Extract<ChildMessage, { t: "tool_call" }>): void {
-		const createIssue = run.req?.createIssue;
-		const work =
-			call.name === "create_issue" && createIssue
-				? createIssue.file(call.params.title, call.params.body)
-				: Promise.reject(new Error(`Tool ${call.name} is not available`));
-		void work.then(
-			value => {
-				if (!run.outcome) sendRelay(run, () => ({ t: "reply", id: call.id, ok: true, value }));
-			},
-			err => {
-				if (!run.outcome) sendRelay(run, () => ({ t: "reply", id: call.id, ok: false, error: errorMessage(err) }));
-			},
-		);
-	}
-
 	// ── Relay from the agent host (architecture §4.2) ────────────────────────────────────────
 
 	async function onRelay(run: Run, msg: ChildMessage): Promise<void> {
@@ -868,9 +575,6 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 				return;
 			case "transcript":
 				guard("transcript sink", () => hooks?.onTranscript?.(msg.event), fields);
-				return;
-			case "todos":
-				guard("todo sink", () => hooks?.onTodos?.(msg.todos), fields);
 				return;
 			case "loadout":
 				run.loadout = msg.loadout;
@@ -895,36 +599,6 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 				log("info", "run started", fields);
 				for (const s of run.queued.splice(0)) sendSteer(run, s);
 				return;
-			case "ui":
-				if (msg.method === "notify") {
-					const a = msg.args as never[];
-					guard("notify", () => void hooks?.ui.notify(a[0], a[1]), fields);
-					return;
-				}
-				if (!db.getQuestion(run.id!, String(msg.id))) {
-					db.insertQuestion({
-						runId: run.id!,
-						requestId: String(msg.id),
-						channelId: "",
-						messageId: "",
-						options: { method: msg.method, args: msg.args, dialog: msg.dialog },
-					});
-				}
-				invokeQuestion(run, String(msg.id));
-				return;
-			case "ui_cancel": {
-				const question = run.questions.get(msg.id);
-				if (question) {
-					question.cancelled = true;
-					question.controller.abort();
-				}
-				db.deleteQuestion(run.id!, String(msg.id));
-				return;
-			}
-			case "tool_call":
-				if (run.req) runTool(run, msg);
-				else run.deferredTools.push(msg);
-				return;
 			case "reply": {
 				const s = run.sent.get(msg.id);
 				if (!s) return;
@@ -940,15 +614,8 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 			case "done": {
 				const r = msg.result;
 				const row = db.getRun(run.id!);
+				// RUN-19: the worker uploaded the session and the outputs before relaying this.
 				const outputs = row?.scratch_dir ? await changedOutputs(row) : undefined;
-				// RUN-19: the worker uploaded the result bundle before relaying this; none means no new commits.
-				let code: RunResult["code"];
-				try {
-					if (row?.repo && writesCode(row.kind)) code = { runId: row.id, commits: await refs.resultCommits(row) };
-				} catch (err) {
-					finishRun(run, errorOutcome(run, new Error(`The run's result could not be read: ${errorMessage(err)}`)), "failed");
-					return;
-				}
 				const result: RunResult = {
 					output: r.output,
 					usage: r.usage,
@@ -956,7 +623,6 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 					oomKills: r.oomKills,
 					hasSession: sessionExists(run),
 					...(outputs ? { outputs } : {}),
-					...(code ? { code } : {}),
 				};
 				run.usage = r.usage;
 				finishRun(run, { ok: true, result }, r.aborted ? "aborted" : "succeeded");
@@ -1010,15 +676,6 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 		log("info", "worker connected", { worker: msg.workerId, address: conn.address, version: msg.identity.version, lease: msg.lease?.runId });
 		if (!msg.lease) return;
 		const { runId, token } = msg.lease;
-		const task = tasks.get(runId);
-		if (task) {
-			if (task.state === "assigned" && task.workerId === msg.workerId && task.token && sameToken(token, task.token)) {
-				task.conn = conn;
-				conn.runId = task.id;
-				task.leaseExpiresAt = Date.now() + leaseMs;
-			} else send(conn, { t: "lease-invalid", runId });
-			return;
-		}
 		const row = db.getRun(runId);
 		if (!holdsLease(row, msg.workerId, token) || !db.renewLease(runId, token, leaseMs)) {
 			log("info", "stale lease refused", { worker: msg.workerId, run: runId });
@@ -1093,11 +750,6 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 				return onClaim(conn);
 			case "heartbeat": {
 				conn.phase = msg.phase;
-				const task = tasks.get(msg.runId);
-				if (task?.token && task.workerId === conn.workerId && sameToken(msg.token, task.token) && task.state === "assigned") {
-					task.leaseExpiresAt = Date.now() + leaseMs;
-					return;
-				}
 				if (!holdsLease(db.getRun(msg.runId), conn.workerId, msg.token) || !db.renewLease(msg.runId, msg.token, leaseMs)) {
 					send(conn, { t: "lease-invalid", runId: msg.runId });
 				}
@@ -1125,9 +777,6 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 				if (!run) return;
 				relayOf(msg.runId).ack(msg.seq);
 				for (const seq of run.scratchBefore.keys()) if (seq <= msg.seq) run.scratchBefore.delete(seq);
-				const settled = run.deliveries.filter(d => d.seq <= msg.seq);
-				run.deliveries = run.deliveries.filter(d => d.seq > msg.seq);
-				for (const d of settled) d.settle(true);
 				return;
 			}
 			case "run-info": {
@@ -1142,11 +791,8 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 				guard("omp runtime canary report", () => opts.ompRuntime?.canaryFailed(report), { run: msg.runId, copy: msg.copy });
 				return;
 			}
-			case "setup-output":
-				log("info", "setup command finished", { run: msg.runId, exitCode: msg.exitCode, tail: msg.tail });
-				return;
-			case "checkpoint":
-				log("debug", "checkpoint uploaded", { run: msg.runId });
+			case "session-upload":
+				log("debug", "session uploaded", { run: msg.runId });
 				return;
 			case "gone": {
 				const run = heldRun(conn, msg.runId);
@@ -1171,12 +817,6 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 				}
 				void answerCredential(conn, msg);
 				return;
-			case "mcp-test-result": {
-				const task = tasks.get(msg.runId);
-				if (!task || task.conn !== conn) return;
-				settleTask(task, { ok: msg.ok, tools: msg.tools, ...(msg.error ? { error: msg.error } : {}) });
-				return;
-			}
 		}
 	}
 
@@ -1192,8 +832,6 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 		if (conn.runId) {
 			const run = byId.get(conn.runId);
 			if (run?.conn === conn) run.conn = undefined;
-			const task = tasks.get(conn.runId);
-			if (task?.conn === conn) task.conn = undefined;
 		}
 		if (conn.workerId) log("info", "worker disconnected", { worker: conn.workerId, run: conn.runId });
 	}
@@ -1236,12 +874,12 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 
 	// ── Start: RUN-07 ────────────────────────────────────────────────────────────────────────
 
-	// NFR-03: a run still pending has no worker and its request (closures included) was only in memory, so its row is
-	// finished; its turn is kept for the reattach grace so the owner's engine, re-attaching on start, re-issues the same turn.
-	const reissue = new Map<string, RunTurn>();
+	// NFR-03: a run still pending has no worker, so its row is finished; its turn is kept for the reattach grace so the
+	// thread's engine, re-attaching on start, re-issues the same turn.
+	const reissue = new Map<string, RunRequest>();
 	for (const row of db.runsInState("pending")) {
-		const turn = row.request ? parseJson<RunTurn>(row.request) : undefined;
-		if (turn) reissue.set(ownerKey(rowOwner(row)), turn);
+		const turn = parseJson<RunRequest>(row.request);
+		if (turn) reissue.set(row.thread_id, turn);
 		dropOrphan(row);
 	}
 	const reissueExpiry = setTimeout(() => reissue.clear(), opts.reattachGraceMs);
@@ -1251,12 +889,6 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 	}
 	db.graceLeases(opts.reattachGraceMs);
 	const sweeper = setInterval(() => guard("lease sweep", sweep), opts.sweepMs ?? 1000);
-	// WS-07, RUN-20: refs of runs that are finished and not kept for Retry go at start; WS-01: unused mirrors go daily.
-	const maintenance = (async () => {
-		await refs.prune();
-		await refs.expireMirrors();
-	})().catch(err => log("warn", "start-up run ref maintenance failed", { error: errorMessage(err) }));
-	const mirrorExpiry = setInterval(() => void refs.expireMirrors(), MIRROR_EXPIRY_MS);
 
 	// ── Dispatcher API ──────────────────────────────────────────────────────────────────────
 
@@ -1266,9 +898,8 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 			reject(new RunDetached());
 			return promise;
 		}
-		// The newest caller's request carries the live engine's closures (create_issue); the turn stays the one requested
-		// (an engine re-attaching after a restart asks with no turn of its own).
-		run.req = run.req ? { ...req, ...turnOf(run.req) } : req;
+		// The turn stays the one requested first (an engine re-attaching after a restart asks with no turn of its own).
+		run.req ??= req;
 		const previous = run.caller;
 		if (previous) {
 			previous.cleanup();
@@ -1278,12 +909,6 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 			if (run.caller !== caller) return;
 			run.caller = undefined;
 			caller.cleanup();
-			for (const q of run.questions.values()) {
-				if (q.caller !== caller) continue;
-				q.stale = true;
-				q.controller.abort();
-				q.settle(false);
-			}
 			reject(new RunDetached());
 		};
 		const caller: Caller = { hooks, resolve, reject, cleanup: () => signal?.removeEventListener("abort", onAbort) };
@@ -1297,50 +922,41 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 		if (!run.id || state === "pending" || state === "assigned") guard("waiting sink", () => hooks.onWaitingForWorker?.(), { run: run.id });
 		// Abort and steering work from the start: a run no worker started is finished at once (RUN-05); steers wait (⏳) for `registered` (RUN-15).
 		guard("register sink", () => hooks.register(run.handle), { run: run.id });
-		if (run.id) {
-			// RUN-08: questions still open bind to the messages already posted.
-			for (const q of db.questionsForRun(run.id)) invokeQuestion(run, q.request_id);
-			for (const call of run.deferredTools.splice(0)) runTool(run, call);
-		}
 		if (state === "pending") match();
 		return promise;
 	}
 
 	return {
 		runAgent(req, hooks, signal) {
-			const key = ownerKey(req.owner);
+			const key = req.threadId;
 			let run = runs.get(key);
 			if (!run) {
-				const [column, ownerId] = ownerColumn(req.owner);
-				const row = db.currentRun(column, ownerId);
+				const row = db.currentRun(key);
 				if (row) run = ensureRun(row);
 			}
 			if (run) return attach(run, req, hooks, signal);
 			if (signal?.aborted) return Promise.reject(new RunDetached());
 			const kept = reissue.get(key);
 			reissue.delete(key);
-			const turnReq: RunRequest = kept ? { ...req, ...kept } : req;
-			if (kept) log("info", "pending run re-issued after restart", { owner: key });
+			const turnReq = kept ?? req;
+			if (kept) log("info", "pending run re-issued after restart", { thread: key });
 			const reason = unrunnableReason(turnReq);
 			if (reason) return Promise.reject(new Error(reason));
-			const fresh = newRun(req.owner, turnReq);
+			const fresh = newRun(key, turnReq);
 			runs.set(key, fresh);
 			waiting.push(fresh);
 			const result = attach(fresh, turnReq, hooks, signal);
 			admit();
 			return result;
 		},
-		hasRun(owner) {
-			if (runs.has(ownerKey(owner)) || reissue.has(ownerKey(owner))) return true;
-			const [column, ownerId] = ownerColumn(owner);
-			return db.currentRun(column, ownerId) !== null;
+		hasRun(threadId) {
+			return runs.has(threadId) || reissue.has(threadId) || db.currentRun(threadId) !== null;
 		},
-		hasUnfinishedRun(owner) {
-			const run = runs.get(ownerKey(owner));
+		hasUnfinishedRun(threadId) {
+			const run = runs.get(threadId);
 			if (run) return !run.outcome;
-			if (reissue.has(ownerKey(owner))) return true;
-			const [column, ownerId] = ownerColumn(owner);
-			const row = db.currentRun(column, ownerId);
+			if (reissue.has(threadId)) return true;
+			const row = db.currentRun(threadId);
 			return row !== null && row.state !== "finished";
 		},
 		counts() {
@@ -1356,37 +972,7 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 				const since = Date.parse(row.created_at);
 				if (oldest === undefined || since < oldest) oldest = since;
 			}
-			for (const task of tasks.values()) {
-				if (task.state === "assigned") running++;
-				if (task.state !== "pending") continue;
-				pending++;
-				if (oldest === undefined || task.createdAt < oldest) oldest = task.createdAt;
-			}
 			return { pending, running, oldestPendingMs: oldest === undefined ? null : Date.now() - oldest };
-		},
-		async mcpTest(spec, testOpts) {
-			let server: McpServer;
-			try {
-				server = parseOmpConfig({ mcpServers: { [spec.name]: spec.server } }).mcpServers[spec.name]!;
-			} catch (err) {
-				return { ok: false, tools: [], error: errorMessage(err) };
-			}
-			const { promise, resolve } = Promise.withResolvers<{ ok: boolean; tools: string[]; error?: string }>();
-			const task: McpTask = {
-				type: "mcp",
-				id: `mcp-${crypto.randomUUID()}`,
-				name: spec.name,
-				server,
-				createdAt: Date.now(),
-				state: "waiting",
-				resolve,
-				...(testOpts?.onStarted ? { onStarted: testOpts.onStarted } : {}),
-			};
-			tasks.set(task.id, task);
-			waiting.push(task);
-			guard("waiting sink", () => testOpts?.onWaitingForWorker?.());
-			admit();
-			return promise;
 		},
 		activeRuns() {
 			return db.runsInState("pending", "assigned", "running", "finishing").map(row => {
@@ -1394,14 +980,11 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 				const claimed = row.state !== "pending" && row.claimed_at ? row.claimed_at : undefined;
 				const status: RunStatus = {
 					id: row.id,
-					kind: row.kind,
 					state: row.state as RunStatus["state"],
-					owner: ownerKey(rowOwner(row)),
+					threadId: row.thread_id,
 					createdAt: row.created_at,
 					usage: run?.usage ?? ZERO_USAGE,
 				};
-				if (row.repo) status.repo = row.repo;
-				if (row.thread_id) status.threadId = row.thread_id;
 				if (row.worker_id && row.state !== "pending") status.workerId = row.worker_id;
 				if (claimed) status.claimedAt = claimed;
 				if (row.started_at) status.startedAt = row.started_at;
@@ -1427,43 +1010,14 @@ export function createWorkerDispatcher(opts: WorkerDispatcherOptions): WorkerDis
 			}
 			return list;
 		},
-		pendingRuns() {
-			let n = db.runsInState("pending").length;
-			for (const task of tasks.values()) if (task.state === "pending") n++;
-			return n;
-		},
+		pendingRuns: () => db.runsInState("pending").length,
 		socketData: address => ({ address }),
 		websocket,
 		artifact: req => artifacts.handle(req),
-		git: req => gitEndpoint(req),
-		async pushResult(runId, branch, token) {
-			const row = db.getRun(runId);
-			if (!row?.repo || !row.has_result) throw new Error(`run ${runId} keeps no result to push`);
-			const outcome = await opts.repos.push(row.repo, runId, branch, token);
-			log(outcome.pushed ? "info" : "warn", outcome.pushed ? "run result pushed" : "run result push rejected: the branch moved", {
-				run: runId,
-				repo: row.repo,
-				branch,
-				...(outcome.pushed ? { sha: outcome.sha } : {}),
-			});
-			return outcome;
-		},
-		async discardResult(runId) {
-			const row = db.getRun(runId);
-			if (row) await refs.release(row, ["result"]);
-		},
-		releaseIssue: issueId => refs.releaseIssue(issueId),
-		async repoConfig(checkout) {
-			const { baseBranch, setupCommand } = await readRepoConfig(opts.repos, checkout);
-			return { baseBranch, ...(setupCommand ? { setupCommand } : {}) };
-		},
-		maintenance: () => maintenance,
 		close() {
 			clearInterval(sweeper);
-			clearInterval(mirrorExpiry);
 			clearTimeout(reissueExpiry);
 			for (const conn of claimers.splice(0)) clearTimeout(conn.claimTimer);
-			for (const task of tasks.values()) clearTimeout(task.timer);
 		},
 	};
 }

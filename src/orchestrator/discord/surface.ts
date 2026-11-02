@@ -1,20 +1,14 @@
-import type {
-	APIActionRowComponent,
-	APIApplicationCommandOptionChoice,
-	APIComponentInMessageActionRow,
-	APIModalInteractionResponseCallbackData,
-	RESTPostAPIApplicationCommandsJSONBody,
-} from "discord-api-types/v10";
+import type { RESTPostAPIApplicationCommandsJSONBody } from "discord-api-types/v10";
 
 /**
- * The boundary between the engine and discord.js (implementation.md phase 2). The engine, poller, scheduler and bot logic
- * use only these types; `createDiscordJsConnection` implements them over discord.js, and `createFakeDiscord` (test/fakes)
- * records and drives them in tests. Components and modals use Discord's API JSON, so builders' `.toJSON()` output fits.
+ * The boundary between the engine and discord.js. The engine and the bot logic use only these types;
+ * `createDiscordJsConnection` implements them over discord.js, and `createFakeDiscord` (test/fakes) records and drives
+ * them in tests.
  */
 
 /** DSC-32 priorities, highest first. */
 export type Priority =
-	/** New messages, questions, delivery reactions, results and failures. */
+	/** New messages, delivery reactions, results and failures. */
 	| "high"
 	/** State-change edits. */
 	| "state"
@@ -31,34 +25,17 @@ export interface OutFile {
 	data: Uint8Array | string;
 }
 
-export type MessageRow = APIActionRowComponent<APIComponentInMessageActionRow>;
-
+/** Every bot message is sent with all mentions disabled (DSC-07). */
 export interface OutMessage {
 	/** At most 2000 characters (DSC-14); callers split longer text. */
 	content: string;
-	/** Replaces all components on edit; `[]` removes them. */
-	components?: MessageRow[];
 	files?: OutFile[];
-	/** Mentions are disabled unless listed here (DSC-07). */
-	mentions?: { users?: string[]; roles?: string[] };
-}
-
-export type ChannelKind = "text" | "category" | "thread" | "other";
-
-export interface ChannelInfo {
-	id: string;
-	name: string;
-	kind: ChannelKind;
-	/** Category of a channel, or the parent channel of a thread. */
-	parentId: string | null;
-	topic?: string;
-	archived?: boolean;
 }
 
 /** Outbound operations. Every write goes through the one outbound queue (DSC-32): coalescing, priorities, rate limits. */
 export interface DiscordSurface {
 	send(channelId: string, msg: OutMessage, priority?: Priority): Promise<MsgRef>;
-	/** Reply to a message (e.g. an idle-thread reply, DSC-23). */
+	/** Reply to a message (e.g. "Not delivered…", RUN-15). */
 	reply(to: MsgRef, msg: OutMessage, priority?: Priority): Promise<MsgRef>;
 	/**
 	 * At most one pending edit per message; a newer edit replaces an unsent one (latest state wins). Resolves when the edit
@@ -66,7 +43,6 @@ export interface DiscordSurface {
 	 */
 	edit(ref: MsgRef, msg: OutMessage, priority: Priority): Promise<void>;
 	startThread(from: MsgRef, opts: { name: string; autoArchiveMinutes: 60 | 1440 | 4320 | 10080 }): Promise<string>;
-	archiveThread(threadId: string): Promise<void>;
 	react(ref: MsgRef, emoji: string): Promise<void>;
 	/** Removes the bot's own reaction. */
 	unreact(ref: MsgRef, emoji: string): Promise<void>;
@@ -74,20 +50,16 @@ export interface DiscordSurface {
 	fetchMessage(ref: MsgRef): Promise<{ content: string } | null>;
 	/** The channel message a thread was started from (its "top message"), or null. */
 	starterMessage(threadId: string): Promise<(MsgRef & { content: string }) | null>;
-	/** null when the channel does not exist or the bot cannot see it. */
-	channel(id: string): Promise<ChannelInfo | null>;
-	/** DSC-35. Throws `MissingPermission` without Manage Channels (DSC-38). */
-	createTextChannel(guildId: string, opts: { name: string; topic: string; parentId?: string }): Promise<string>;
-	setChannel(id: string, patch: { name?: string; topic?: string }): Promise<void>;
 	/** DSC-29. Throws `MissingPermission` without Change Nickname. */
 	setNickname(guildId: string, nickname: string): Promise<void>;
 	/** DSC-32 visibility on the status page. */
 	queueStats(): { length: number; oldestAgeMs: number | null };
 }
 
+/** DSC-29: the bot lacks Change Nickname. */
 export class MissingPermission extends Error {
 	override name = "MissingPermission";
-	constructor(readonly permission: "ManageChannels" | "ChangeNickname" | "ViewChannel" | "SendMessages", message?: string) {
+	constructor(readonly permission: "ChangeNickname", message?: string) {
 		super(message ?? `missing Discord permission ${permission}`);
 	}
 }
@@ -130,51 +102,15 @@ export interface InteractionResponder {
 	followUp(msg: ReplyOptions): Promise<void>;
 }
 
+/** The two slash commands (DSC-01). */
+export type CommandName = "ask" | "stop";
+
 export interface CommandEvent extends InteractionResponder {
 	type: "command";
-	command: "work" | "ask";
-	subcommand: string | null;
+	command: CommandName;
 	options: Record<string, string | number | boolean>;
 	attachments: InAttachment[];
 	actor: Actor;
-	where: Where;
-}
-
-export interface AutocompleteEvent {
-	type: "autocomplete";
-	command: "work" | "ask";
-	subcommand: string | null;
-	focused: { name: string; value: string };
-	actor: Actor;
-	where: Where;
-	respond(choices: APIApplicationCommandOptionChoice<string>[]): Promise<void>;
-}
-
-export interface ComponentEvent extends InteractionResponder {
-	type: "component";
-	customId: string;
-	/** Selected values of a select menu; empty for buttons. */
-	values: string[];
-	message: MsgRef;
-	actor: Actor;
-	where: Where;
-	/** Edits the message the component is on, as the interaction response. */
-	update(msg: OutMessage): Promise<void>;
-	deferUpdate(): Promise<void>;
-	showModal(modal: APIModalInteractionResponseCallbackData): Promise<void>;
-}
-
-export interface ModalEvent extends InteractionResponder {
-	type: "modal";
-	customId: string;
-	fields: Record<string, string>;
-	/** The message whose component opened the modal, when there is one. */
-	message: MsgRef | null;
-	actor: Actor;
-	/** Only when `message` is set: edits that message as the interaction response (a question answered through "Other…"). */
-	update(msg: OutMessage): Promise<void>;
-	/** Only when `message` is set: acknowledges without a visible reply. */
-	deferUpdate(): Promise<void>;
 	where: Where;
 }
 
@@ -187,7 +123,7 @@ export interface MessageEvent {
 	where: Where;
 }
 
-export type InboundEvent = CommandEvent | AutocompleteEvent | ComponentEvent | ModalEvent | MessageEvent;
+export type InboundEvent = CommandEvent | MessageEvent;
 
 /** A logged-in Discord session: the surface plus inbound events and lifecycle (one per engine instance). */
 export interface DiscordConnection extends DiscordSurface {

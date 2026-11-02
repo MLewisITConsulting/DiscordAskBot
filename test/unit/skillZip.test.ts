@@ -55,7 +55,7 @@ describe("readSkillZip", () => {
 		["a size that lies", makeZip([{ path: "SKILL.md", data: SKILL_MD }, { path: "bomb", data: new Uint8Array(100_000), deflate: true, declaredSize: 10 }]), /"bomb" is damaged/],
 		["a bad CRC", makeZip([{ path: "SKILL.md", data: SKILL_MD, crc: 1 }]), /"SKILL\.md" is damaged/],
 		["a duplicate entry", makeZip([{ path: "SKILL.md", data: SKILL_MD }, { path: "SKILL.md", data: SKILL_MD }]), /appears more than once/],
-		["a bad name", makeZip([{ path: "SKILL.md", data: "---\nname: Bad_Name\ndescription: d\n---\n" }]), /Name "Bad_Name" must be/],
+		["a bad name", makeZip([{ path: "SKILL.md", data: "---\nname: Bad_Name\ndescription: d\n---\n" }]), /name "Bad_Name" must be/],
 		["no description", makeZip([{ path: "SKILL.md", data: "---\nname: ok\ndescription: \"\"\n---\n" }]), /non-empty "description"/],
 		["no frontmatter", makeZip([{ path: "SKILL.md", data: "# Just text\n" }]), /no YAML frontmatter/],
 	];

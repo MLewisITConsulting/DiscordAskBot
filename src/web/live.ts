@@ -19,17 +19,17 @@ export interface LiveContext {
 export interface LiveView {
 	/** Label/value rows of the "Current state" table. */
 	state: [string, Cell][];
-	watches: Cell[][];
 	/** Label/value rows of the limits table; empty while the settings are locked or not saved (RUN-12). */
 	limits: [string, Cell][];
 	warnings: string[][];
-	open: Cell[][];
-	/** Connected workers: id, address, run, phase, omp version, connected for (§9.3). */
+	/** Connected workers: id, address, run, phase, omp version, connected for (requirements §5.3). */
 	workers: Cell[][];
-	/** Pending runs: run, repository, waiting for (§9.3). */
+	/** Pending runs: thread, waiting for (requirements §5.3). */
 	pending: Cell[][];
-	/** Runs in progress: run, repository, worker, state, elapsed, setup time, last tool, cost, tokens, loadout (§9.3, NFR-06). */
+	/** Runs in progress: thread, worker, state, elapsed, setup time, last tool, cost, tokens, loadout (requirements §5.3, NFR-06). */
 	running: Cell[][];
+	/** Ask threads with a pending or active run: thread, channel, started by. */
+	threads: Cell[][];
 }
 
 /** `$1.23`; four decimals for non-zero amounts under a cent. */
@@ -57,11 +57,9 @@ export function formatTime(iso: string): string {
 	return `${iso.slice(0, 19).replace("T", " ")} UTC`;
 }
 
-/** `12 tools · 3 skills · 2 agents · MCP github ✓, docs ✗`. */
+/** `6 tools · 3 skills · 2 agents`. */
 export function loadoutSummary(loadout: Loadout): string {
-	const parts = [`${loadout.tools.length} tools`, `${loadout.skills.length} skills`, `${loadout.agents.length} agents`];
-	if (loadout.mcp.length) parts.push(`MCP ${loadout.mcp.map(m => `${m.server} ${m.status === "connected" ? "✓" : m.status === "pending" ? "…" : "✗"}`).join(", ")}`);
-	return parts.join(" · ");
+	return [`${loadout.tools.length} tools`, `${loadout.skills.length} skills`, `${loadout.agents.length} agents`].join(" · ");
 }
 
 export function liveView(report: StatusReport, ctx: LiveContext): LiveView {
@@ -80,31 +78,18 @@ export function liveView(report: StatusReport, ctx: LiveContext): LiveView {
 		if (discord.pingMs !== undefined && discord.pingMs >= 0) discordParts.push(`ping ${discord.pingMs} ms`);
 		state.push(["Uptime", formatDuration(ctx.now - Date.parse(engine.startedAt))], ["Discord", discordParts.join(" · ")]);
 		if (discord.nicknameWarning) state.push(["Nickname", discord.nicknameWarning]);
-		state.push(
-			["GitHub App", engine.githubApp],
-			[
-				"Discord write queue",
-				`${formatCount(discordQueue.length)} queued${discordQueue.oldestAgeMs === null ? "" : ` · oldest ${formatDuration(discordQueue.oldestAgeMs)}`}`,
-			],
-			["Queued jobs", formatCount(engine.queuedJobs)],
-		);
+		state.push([
+			"Discord write queue",
+			`${formatCount(discordQueue.length)} queued${discordQueue.oldestAgeMs === null ? "" : ` · oldest ${formatDuration(discordQueue.oldestAgeMs)}`}`,
+		]);
 	}
 	state.push([
 		"Runs",
 		`${formatCount(runs.pending)} pending${runs.oldestPendingMs === null ? "" : ` (oldest ${formatDuration(runs.oldestPendingMs)})`} · ${formatCount(runs.running)} running`,
 	]);
 
-	const watches: Cell[][] = (engine?.watches ?? []).map(watch => [
-		[watch.repo, `https://github.com/${watch.repo}`],
-		watch.channelId ? discordLink(`#${watch.channelId}`, watch.channelId) : "—",
-		watch.state,
-		watch.lastPollAt ? formatTime(watch.lastPollAt) : "never",
-		watch.lastError ?? "",
-	]);
-
 	const limits: [string, Cell][] = report.limits
 		? [
-				["Max concurrent jobs", formatCount(report.limits.maxConcurrentJobs)],
 				["Max chat sessions", formatCount(report.limits.maxChatSessions)],
 				["Max concurrent runs", formatCount(report.limits.maxConcurrentRuns)],
 				["Worker capacity", formatCount(report.limits.workerCapacity)],
@@ -113,13 +98,6 @@ export function liveView(report: StatusReport, ctx: LiveContext): LiveView {
 		: [];
 	const warnings = report.warnings.map(warning => [warning]);
 
-	const open: Cell[][] = report.issues.open.map(issue => [
-		[`${issue.repo}#${issue.number}`, `https://github.com/${issue.repo}/issues/${issue.number}`],
-		issue.title,
-		issue.state,
-		issue.job ?? "",
-		issue.threadId ? discordLink("thread", issue.threadId) : "",
-	]);
 	const workers: Cell[][] = report.workers.map(worker => [
 		worker.id,
 		worker.address,
@@ -131,17 +109,15 @@ export function liveView(report: StatusReport, ctx: LiveContext): LiveView {
 	const pending: Cell[][] = [];
 	const running: Cell[][] = [];
 	for (const run of report.activeRuns) {
-		const label = discordLink(run.kind, run.threadId ?? null);
-		const repo: Cell = run.repo ? [run.repo, `https://github.com/${run.repo}`] : "—";
+		const label = discordLink(run.threadId, run.threadId);
 		if (run.state === "pending") {
-			pending.push([label, repo, formatDuration(ctx.now - Date.parse(run.createdAt))]);
+			pending.push([label, formatDuration(ctx.now - Date.parse(run.createdAt))]);
 			continue;
 		}
 		const setup =
 			run.setupMs !== undefined ? formatDuration(run.setupMs) : run.claimedAt ? `${formatDuration(ctx.now - Date.parse(run.claimedAt))} so far` : "—";
 		running.push([
 			label,
-			repo,
 			run.workerId ?? "—",
 			run.state,
 			run.startedAt ? formatDuration(ctx.now - Date.parse(run.startedAt)) : "—",
@@ -152,5 +128,10 @@ export function liveView(report: StatusReport, ctx: LiveContext): LiveView {
 			run.loadout ? loadoutSummary(run.loadout) : "",
 		]);
 	}
-	return { state, watches, limits, warnings, open, workers, pending, running };
+	const threads: Cell[][] = report.activeThreads.map(thread => [
+		discordLink(thread.threadId, thread.threadId),
+		discordLink(`#${thread.channelId}`, thread.channelId),
+		thread.ownerId,
+	]);
+	return { state, limits, warnings, workers, pending, running, threads };
 }

@@ -3,8 +3,8 @@ import type { Server, ServerWebSocket } from "bun";
 import { ADMIN_PREFIX } from "../../shared/adminApi";
 import type { Config } from "../../shared/config";
 import { addLogSecret, errorMessage, log } from "../../shared/log";
-import { GIT_PATH_PREFIX, WORKER_WS_PATH } from "../../shared/wire";
-import { MAX_BUNDLE_BYTES, RUNS_PREFIX } from "../dispatch/artifacts";
+import { WORKER_WS_PATH } from "../../shared/wire";
+import { MAX_SESSION_BYTES, RUNS_PREFIX } from "../dispatch/artifacts";
 import type { Dispatcher } from "../dispatch/dispatcher";
 import { sameToken } from "../dispatch/leases";
 import type { WorkerDispatcher, WorkerSocketData } from "../dispatch/workers";
@@ -15,7 +15,7 @@ import { type EnginePhase, type HealthBody, healthLimits } from "./health";
 export const SCALE_PATH = "/internal/scale";
 
 /** The worker-facing surfaces of the dispatcher (architecture §4.5). */
-export type WorkerEndpoints = Pick<WorkerDispatcher, "socketData" | "websocket" | "artifact" | "git" | "pendingRuns">;
+export type WorkerEndpoints = Pick<WorkerDispatcher, "socketData" | "websocket" | "artifact" | "pendingRuns">;
 
 export interface InternalApiOptions {
 	host: string;
@@ -32,7 +32,7 @@ export interface InternalApiOptions {
 	dispatcher: Pick<Dispatcher, "counts">;
 	/** `/internal/admin/*`, web token only (SEC-14). */
 	admin: AdminApi;
-	/** `/internal/worker`, `/internal/runs/<id>/…`, `/internal/git/…` and `/internal/scale`; absent, they answer 503. */
+	/** `/internal/worker`, `/internal/runs/<id>/…` and `/internal/scale`; absent, they answer 503. */
 	workers?: WorkerEndpoints;
 	/** Content of `ASKBOT_WORKER_TOKEN_FILE`; undefined refuses every worker connection (SEC-14). */
 	workerToken?: string;
@@ -114,7 +114,7 @@ function healthBody(opts: InternalApiOptions, ok: boolean): HealthBody {
  * The orchestrator's internal API on 8081 (architecture §4.5). Health endpoints are unauthenticated and contain no names,
  * ids or error text (RUN-13). Every other surface takes only its own token (SEC-14): the web token on `/internal/admin/*`,
  * the worker token on `/internal/worker`, the scale token on `/internal/scale`, and a run's lease token on that run's
- * `/internal/runs/<id>/…` and on its repository's `/internal/git/…`.
+ * `/internal/runs/<id>/…`.
  */
 export function startInternalApi(opts: InternalApiOptions): InternalApi {
 	const { workers } = opts;
@@ -123,9 +123,9 @@ export function startInternalApi(opts: InternalApiOptions): InternalApi {
 	const server: Server<WorkerSocketData> = Bun.serve<WorkerSocketData>({
 		hostname: opts.host,
 		port: opts.port,
-		// Pack generation for a large repository and bundle uploads can stay quiet for a while (spike S3).
+		// A session upload of up to 256 MiB can stay quiet for a while on a slow link.
 		idleTimeout: 120,
-		maxRequestBodySize: MAX_BUNDLE_BYTES,
+		maxRequestBodySize: MAX_SESSION_BYTES,
 		routes: {
 			// Liveness: 200 while the process responds; same body as readiness.
 			"/livez": () => Response.json(healthBody(opts, ready(opts))),
@@ -154,7 +154,6 @@ export function startInternalApi(opts: InternalApiOptions): InternalApi {
 				return Response.json({ pendingRuns: workers.pendingRuns() });
 			}
 			if (pathname.startsWith(RUNS_PREFIX)) return workers ? workers.artifact(req) : unavailable();
-			if (pathname.startsWith(GIT_PATH_PREFIX)) return workers ? workers.git(req) : unavailable();
 			return Response.json({ error: "not found" }, { status: 404 });
 		},
 		// Never reached without `workers`: nothing upgrades then.

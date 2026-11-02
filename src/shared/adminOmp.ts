@@ -1,16 +1,15 @@
 /**
- * Admin API for the omp configuration (AGT-20 to AGT-23), under `/internal/admin`. The configuration lives in the
- * vault; credential settings and MCP env/header values are write-only and never leave the orchestrator.
+ * Admin API for the omp configuration (AGT-20, AGT-23) and in-place omp updates (UPD-02, UPD-03, WEB-33), under
+ * `/internal/admin`. The configuration lives in the vault; credential settings are write-only and never leave the
+ * orchestrator.
  *
  * - `GET /omp` → {@link OmpView} (409 while the vault is locked)
  * - `PUT /omp` {@link OmpSaveRequest} → `{ ok: true }` (400 with omp's parser message; 409 while locked)
- * - `POST /omp/mcp-tests` {@link McpTestRequest} → {@link McpTestState}: tests the saved server on a worker (AGT-21)
- * - `GET /omp/mcp-tests/<id>` → {@link McpTestState} (404 once expired)
- * - `POST /omp/update-check` → {@link OmpUpdateView}: asks the npm registry now (UPD-02, the page's "Check now")
+ * - `GET /omp/update` → {@link OmpUpdateView}: the update panel alone, for the page's refresh while an install runs
+ * - `POST /omp/update-check` → {@link OmpUpdateView}: asks the npm registry now (UPD-02, the page's **Check now**)
+ * - `POST /omp/update-approve` {@link OmpApproveRequest} → {@link OmpUpdateView}: starts the UPD-03 install, recorded
+ *   with the acting admin's username; 409 when `version` is no longer on offer or an install is already running
  */
-
-export type McpTransport = "stdio" | "http" | "sse";
-export const MCP_TRANSPORTS: readonly McpTransport[] = ["stdio", "http", "sse"];
 
 /** One registered omp setting, for the reference and the override editor. */
 export interface OmpSettingInfo {
@@ -41,92 +40,37 @@ export interface SettingRow {
 	credentialSet: boolean;
 }
 
-/** An env var or header; the value is write-only, so only whether one is stored. */
-export interface SecretKeyRow {
-	key: string;
-	set: boolean;
-}
-
-/** One MCP server as the form shows it. */
-export interface McpRow {
-	name: string;
-	/** Stored under this name: the name is read-only (rename = delete + add) and the server can be tested. */
-	existing: boolean;
-	type: McpTransport;
-	enabled: boolean;
-	instructions: boolean;
-	timeout: string;
-	command: string;
-	/** One argument per line. */
-	args: string;
-	cwd: string;
-	url: string;
-	env: SecretKeyRow[];
-	headers: SecretKeyRow[];
-}
-
 export interface OmpView {
-	/** omp versions and in-place worker updates (UPD-02 to UPD-10). */
-	update: OmpUpdateAdminView;
+	/** omp versions and in-place worker updates (WEB-33). */
+	update: OmpUpdateView;
 	/** Every registered omp setting, in omp's display order. */
 	reference: OmpSettingInfo[];
 	pinned: PinnedSetting[];
 	settings: SettingRow[];
-	servers: McpRow[];
 	/** The stored configuration no longer validates (e.g. omp dropped a setting); what is shown is what still parses. */
 	storedError?: string;
 }
 
-/** A key/value row as submitted; a blank `value` keeps the stored one. */
-export interface SecretKeyInput {
-	key: string;
-	value: string;
-}
-
-export interface McpServerInput {
-	name: string;
-	type: McpTransport;
-	enabled: boolean;
-	instructions: boolean;
-	/** Milliseconds as typed; "" for omp's default. */
-	timeout: string;
-	command: string;
-	args: string[];
-	cwd: string;
-	url: string;
-	env: SecretKeyInput[];
-	headers: SecretKeyInput[];
-}
-
-/** The whole configuration as submitted: replaces the stored one (blank write-only values keep what is stored). */
+/** The whole configuration as submitted: replaces the stored one (a blank credential setting keeps its stored value). */
 export interface OmpSaveRequest {
-	/** Setting id → form text, parsed by omp's own parser. A blank credential setting keeps its stored value. */
+	/** Setting id → form text, parsed by omp's own parser. */
 	settings: { id: string; value: string }[];
-	servers: McpServerInput[];
 }
 
-export interface McpTestRequest {
-	/** A saved server. */
-	name: string;
+/** Approve the update on offer (UPD-03). */
+export interface OmpApproveRequest {
+	/** The version shown on the page; a stale one is refused. */
+	version: string;
 }
 
-/** `waiting` until the dispatcher reports the test queued for a worker; then until a result arrives (AGT-21). */
-export interface McpTestState {
-	id: string;
-	name: string;
-	status: "starting" | "waiting" | "running" | "done";
-	result?: { ok: boolean; tools: string[]; error?: string };
-	startedAt: string;
-}
-
-/** One in-place update attempt (UPD-03, UPD-08): an approval and what came of it. */
+/** One in-place update attempt (UPD-03, UPD-08): an approval or automatic install and what came of it. */
 export interface OmpAttempt {
 	version: string;
-	/** The omp workers used when it was approved or started. */
+	/** The omp workers used when it started. */
 	from: string;
-	/** Who approved it, e.g. `@alice`, or `AUTO_UPDATE_BY` for an automatic install. */
+	/** The admin's username, or `AUTO_UPDATE_BY` for an automatic install. */
 	by: string;
-	/** `failed` covers both a failed install and a copy that failed its canary run (UPD-08). */
+	/** `failed` covers a failed install, a copy that failed its canary run (UPD-08) and a restart during the install. */
 	outcome: "installing" | "installed" | "failed";
 	error?: string;
 	/** Tail of the install output, or of the failed agent host's stderr. */
@@ -134,11 +78,9 @@ export interface OmpAttempt {
 	/** The runtime copy it made. */
 	copy?: string;
 	at: string;
-	/** The outcome was posted in Discord. An unattended install saves it `false`, and the Discord notices post it. */
-	reported?: boolean;
 }
 
-/** omp version and update status for the omp page (UPD-10). */
+/** omp version and update state for the omp page (WEB-33, UPD-10). */
 export interface OmpUpdateView {
 	/** The image's omp: the orchestrator's, and the workers' when no copy is active. */
 	image: string;
@@ -155,18 +97,16 @@ export interface OmpUpdateView {
 	supported: boolean;
 	unsupportedReason?: string;
 	installing?: { version: string; by: string; startedAt: string };
-	lastAttempt?: OmpAttempt;
+	/** The current or last attempt. */
+	attempt?: OmpAttempt;
+	/** `omp.autoUpdate` (UPD-02). */
+	autoUpdate: boolean;
 }
 
-/** The `by` of an install started by `omp.autoUpdate` instead of an Approve click. */
+/** The `by` of an install started by `omp.autoUpdate` instead of an approval. */
 export const AUTO_UPDATE_BY = "auto-update";
 
-/** "installed automatically" or "approved by @alice", for notices and the omp page. */
+/** "installed automatically" or "approved by alice", for the omp page. */
 export function installedByText(by: string): string {
 	return by === AUTO_UPDATE_BY ? "installed automatically" : `approved by ${by}`;
-}
-
-/** The update status plus the `omp.autoUpdate` setting, for the omp page. */
-export interface OmpUpdateAdminView extends OmpUpdateView {
-	autoUpdate: boolean;
 }

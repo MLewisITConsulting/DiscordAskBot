@@ -5,14 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Subprocess } from "bun";
 import { type InternalApi, startInternalApi } from "../../src/orchestrator/api/server";
-import { encodeId } from "../../src/orchestrator/discord/render";
-import { createOmpNotices, STALE_UPDATE } from "../../src/orchestrator/discord/ompUpdate";
 import { createWorkerDispatcher, type WorkerDispatcher } from "../../src/orchestrator/dispatch/workers";
 import { type Controller, createController } from "../../src/orchestrator/engine/controller";
-import { createGitHub } from "../../src/orchestrator/github/app";
-import { createRepos } from "../../src/orchestrator/git/repos";
 import type { CopyInstaller } from "../../src/orchestrator/omp/runtime";
-import { createOmpUpdater, type OmpUpdater, UNSUPPORTED } from "../../src/orchestrator/omp/updates";
+import { createOmpUpdater, type InstallResult, type OmpUpdater, UNSUPPORTED } from "../../src/orchestrator/omp/updates";
 import { openAgentLog } from "../../src/orchestrator/store/agentlog";
 import { type Db, dbPath, openDb } from "../../src/orchestrator/store/db";
 import { ensureOmpAssetsDir, skillsBundle } from "../../src/orchestrator/store/ompAssets";
@@ -23,21 +19,20 @@ import { parseSettings } from "../../src/shared/config";
 import { setLogSink } from "../../src/shared/log";
 import { OMP_PACKAGE } from "../../src/shared/ompPins";
 import { workerRoot } from "../../src/worker/status";
-import { createFakeDiscord, type Emitted, type FakeDiscord, type FakeMessage } from "../fakes/discord";
-import { type FakeGitHub, startFakeGitHub } from "../fakes/github";
+import { createFakeDiscord, type FakeDiscord } from "../fakes/discord";
 import { TEST_IDENTITY } from "../fakes/ompUpdates";
 
 /**
- * Phase 10 exit (implementation.md §4, requirements UPD-02 to UPD-05, architecture UPD-06 to UPD-10): approving an omp
- * update in Discord makes the next worker use the new omp while a running worker keeps the image's; a broken copy falls
- * back within the run and re-offers the update; outside the image updates are refused. The real controller, worker
- * dispatcher, internal API and worker processes (`test/fixtures/worker-process.ts`), fake Discord and GitHub, a fake npm
- * registry, and an injected installer whose tree the real updater checks, packs, serves and the worker unpacks.
+ * Phase 8 exit (implementation.md §4, requirements UPD-02 to UPD-05, architecture UPD-06 to UPD-10): approving an omp
+ * update makes the next worker use the new omp while a running worker keeps the image's; a broken copy falls back within
+ * the run and offers the update again; `omp.autoUpdate` installs without an approval and never retries a failed version
+ * by itself; outside the image updates are refused. The real controller, worker dispatcher, internal API and worker
+ * processes (`test/fixtures/worker-process.ts`), fake Discord, a fake npm registry, and an injected installer whose tree
+ * the real updater checks, packs, serves and the worker unpacks. The web approval itself is in `omp.test.ts`.
  */
 
 const WORKER_TOKEN = "upd-worker-token";
 const SCALE_TOKEN = "upd-scale-token";
-const WORK = "work-channel";
 const ASK = "ask-channel";
 const ALICE = "u-alice";
 const IMAGE_OMP = "18.12.1";
@@ -106,6 +101,8 @@ interface Harness {
 	controller: Controller;
 	/** Saves the settings with `omp.autoUpdate` and re-applies the engine, as a settings save does. */
 	setAutoUpdate(on: boolean): Promise<void>;
+	/** Approves `version` as the admin would (UPD-03); throws when refused. */
+	approve(version: string): Promise<InstallResult>;
 	spawnWorker(): Worker;
 }
 
@@ -116,9 +113,7 @@ async function boot(opts: { inImage?: boolean; autoUpdate?: boolean } = {}): Pro
 	cleanups.push(() => setLogSink(undefined));
 	const ompDir = join(stateDir, "omp");
 	await ensureOmpAssetsDir(ompDir);
-	const gh: FakeGitHub = startFakeGitHub();
-	cleanups.push(() => gh.stop());
-	const discord = createFakeDiscord({ guildId: "g1", channels: [{ id: WORK, name: "work" }, { id: ASK, name: "ask" }] });
+	const discord = createFakeDiscord({ guildId: "g1", channels: [{ id: ASK, name: "ask" }] });
 	const registry = { latest: NEW_OMP };
 	const npm = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json({ name: OMP_PACKAGE, version: registry.latest }) });
 	cleanups.push(() => npm.stop(true));
@@ -129,11 +124,10 @@ async function boot(opts: { inImage?: boolean; autoUpdate?: boolean } = {}): Pro
 	const settingsInput = (autoUpdate: boolean) =>
 		parseSettings({
 			config: {
-				discord: { guildId: "g1", allowedUserIds: [ALICE], workChannelId: WORK, askChannelIds: [ASK] },
-				github: { appId: gh.appId, pollIntervalSeconds: 60 },
+				discord: { guildId: "g1", allowedUserIds: [ALICE], askChannelIds: [ASK] },
 				omp: { autoUpdate },
 			},
-			secrets: { discordToken: "discord-token", githubAppPrivateKey: gh.privateKey },
+			secrets: { discordToken: "discord-token" },
 		});
 	vault.writeSettings(settingsInput(opts.autoUpdate ?? false));
 	const settings = () => vault.readSettings();
@@ -148,6 +142,7 @@ async function boot(opts: { inImage?: boolean; autoUpdate?: boolean } = {}): Pro
 		imageAppDir: stateDir,
 		installer: (p => fakeInstaller(install)(p)) satisfies CopyInstaller,
 		registryUrl: npm.url.href,
+		autoUpdate: () => settings()?.config.omp.autoUpdate ?? false,
 	});
 	updater.start();
 	const dispatcher = createWorkerDispatcher({
@@ -155,7 +150,7 @@ async function boot(opts: { inImage?: boolean; autoUpdate?: boolean } = {}): Pro
 		stateDir,
 		// Every worker here connects from 127.0.0.1 (architecture §6 address binding is tested in dispatch.test.ts).
 		bindWorkerAddresses: false,
-		limits: () => ({ maxConcurrentJobs: 2, maxChatSessions: 2, maxConcurrentRuns: 4 }),
+		limits: () => ({ maxChatSessions: 2, maxConcurrentRuns: 4 }),
 		reattachGraceMs: 10_000,
 		spec: {
 			stateDir,
@@ -168,7 +163,6 @@ async function boot(opts: { inImage?: boolean; autoUpdate?: boolean } = {}): Pro
 		credentialRequest: req => signins.handleCredentialRequest(req),
 		leaseMs: 1_500,
 		sweepMs: 50,
-		repos: createRepos({ stateDir }),
 		ompRuntime: updater,
 	});
 	let controller: Controller | undefined;
@@ -189,13 +183,12 @@ async function boot(opts: { inImage?: boolean; autoUpdate?: boolean } = {}): Pro
 	});
 	controller = createController({
 		stateDir,
+		ompDir,
 		db,
 		vault,
 		agentLog: await openAgentLog({ dir: join(stateDir, "logs", "agent") }),
 		dispatcher,
 		connectDiscord: () => discord,
-		connectGitHub: ({ appId, privateKey, labels }) => createGitHub({ appId, privateKey, labels, baseUrl: gh.url, throttle: false }),
-		ompUpdates: updater,
 	});
 	await controller.apply();
 	expect(controller.status()).toMatchObject({ phase: "running" });
@@ -237,6 +230,11 @@ async function boot(opts: { inImage?: boolean; autoUpdate?: boolean } = {}): Pro
 			vault.writeSettings(settingsInput(on));
 			await controller.apply();
 		},
+		approve(version) {
+			const start = updater.install(version, "admin");
+			if (!start.started) throw new Error(start.error);
+			return start.done;
+		},
 		spawnWorker() {
 			const proc = Bun.spawn(["bun", WORKER_PROCESS], {
 				env: { ...process.env, ASKBOT_ORCHESTRATOR_URL: api.url, TEST_WORKER_TOKEN: WORKER_TOKEN },
@@ -262,23 +260,13 @@ async function ask(h: Harness, prompt: string): Promise<string> {
 }
 
 const said = (h: Harness, channelId: string, text: string) => h.discord.messages(channelId).filter(m => m.content.includes(text));
-const approveId = (version: string) => encodeId({ type: "omp", version, action: "approve" });
-/** Work-channel messages that carry an Approve button for `version`. */
-const notices = (h: Harness, version: string) =>
-	h.discord.messages(WORK).filter(m => m.components.some(row => row.components.some(c => "custom_id" in c && c.custom_id === approveId(version))));
-const click = (h: Harness, m: FakeMessage, actor = alice(h)) => h.discord.emitComponent({ message: { channelId: m.channelId, messageId: m.id }, customId: approveId(NEW_OMP), actor });
-const answer = (e: Emitted) => e.responses.findLast(r => r.type === "reply" || r.type === "followUp")?.msg?.content ?? "";
-
-/** The "before" notice of an automatic install: no button, says the install starts by itself. */
-const autoNotices = (h: Harness, version: string) => h.discord.messages(WORK).filter(m => m.content.includes(`**omp ${version}**`) && m.content.includes("is being installed automatically"));
-const autoInstalled = (h: Harness, version: string) => said(h, WORK, `✅ omp ${version} is installed for workers (installed automatically)`);
 
 /** A held `/ask` run on its own worker, `registered` (state `running`). */
 async function heldRun(h: Harness, label: string): Promise<{ threadId: string; runId: string; worker: Worker }> {
 	const threadId = await ask(h, `fixture:chatHeld ${label}`);
 	const worker = h.spawnWorker();
-	await until(() => h.db.currentRun("chat_thread_id", threadId)?.state === "running", `${label} to run`);
-	return { threadId, runId: h.db.currentRun("chat_thread_id", threadId)!.id, worker };
+	await until(() => h.db.currentRun(threadId)?.state === "running", `${label} to run`);
+	return { threadId, runId: h.db.currentRun(threadId)!.id, worker };
 }
 
 async function finish(h: Harness, run: { threadId: string; worker: Worker }): Promise<void> {
@@ -288,80 +276,64 @@ async function finish(h: Harness, run: { threadId: string; worker: Worker }): Pr
 	expect(existsSync(run.worker.root)).toBe(false);
 }
 
-describe("in-place omp updates for workers (phase 10)", () => {
-	test("approve: a running worker keeps the image's omp, the next downloads the copy; members, stale and concurrent approvals", async () => {
+describe("in-place omp updates for workers (phase 8)", () => {
+	test("approve: a running worker keeps the image's omp, the next downloads the copy; stale and concurrent approvals are refused", async () => {
 		const h = await boot();
 		const first = await heldRun(h, "before the update");
 		expect(h.db.getRun(first.runId)?.omp_version).toBe(WORKER_IMAGE_OMP);
 
-		// UPD-02: the check finds a newer omp, and the notice goes to the work channel.
+		// UPD-02: the check finds a newer omp and stores it; nothing is posted and, with autoUpdate off, nothing installs.
+		const messages = h.discord.messages(ASK).length;
 		await h.updater.check();
-		await until(() => notices(h, NEW_OMP).length === 1, "the update notice");
-		const [notice] = notices(h, NEW_OMP);
-		expect(notice!.content).toContain(`**omp ${NEW_OMP}** is available (workers use ${IMAGE_OMP})`);
-
-		// DSC-02: a member who is not allowed is refused.
-		const stranger = await click(h, notice!, h.discord.actor("u-stranger", { username: "mallory" }));
-		expect(answer(stranger)).toBe("Not authorized.");
-		expect(h.updater.status().lastAttempt).toBeUndefined();
-		// Off (the default): nothing installed without a click.
+		expect(h.updater.status()).toMatchObject({ latest: NEW_OMP, available: NEW_OMP, autoUpdate: false });
+		await h.discord.settled();
+		expect(h.discord.messages(ASK)).toHaveLength(messages);
 		expect(h.install.calls).toEqual([]);
 
 		// UPD-03: a second approval while the first installs is refused.
 		const release = Promise.withResolvers<void>();
 		h.install.gate = release.promise;
-		const approving = click(h, notice!);
-		await until(() => h.updater.status().installing !== undefined, "the install to start");
-		const second = await click(h, notice!);
-		expect(answer(second)).toContain(`omp ${NEW_OMP} is already being installed (approved by @alice)`);
+		const approving = h.approve(NEW_OMP);
+		expect(h.updater.status().installing).toMatchObject({ version: NEW_OMP, by: "admin" });
+		expect(h.updater.install(NEW_OMP, "other")).toEqual({ started: false, error: `omp ${NEW_OMP} is already being installed (approved by admin)` });
 		release.resolve();
-		await approving;
-		await until(() => said(h, WORK, `✅ omp ${NEW_OMP} is installed for workers (approved by @alice)`).length === 1, "the installed message");
-		await h.discord.settled();
-		expect(h.discord.message(notice!.id)?.components).toEqual([]);
-		expect(h.discord.message(notice!.id)?.content).toContain(`Approved by @alice: installing omp ${NEW_OMP} for workers`);
+		expect(await approving).toMatchObject({ ok: true });
 		const active = h.updater.status().active!;
-		expect(active).toMatchObject({ version: NEW_OMP, by: "@alice" });
+		expect(active).toMatchObject({ version: NEW_OMP, by: "admin" });
+		expect(h.updater.status().attempt).toMatchObject({ version: NEW_OMP, from: IMAGE_OMP, by: "admin", outcome: "installed" });
 		expect(existsSync(join(h.runtimeDir!, active.copy, "runtime.tar.gz"))).toBe(true);
 		expect(existsSync(join(h.runtimeDir!, active.copy, "app"))).toBe(false);
 		expect(h.updater.status().available).toBeUndefined();
 
 		// A stale approval (the update is installed now) is refused.
-		const stale = await click(h, notice!);
-		expect(answer(stale)).toBe(STALE_UPDATE);
+		expect(h.updater.install(NEW_OMP, "admin")).toEqual({ started: false, error: `omp ${NEW_OMP} is no longer the update on offer` });
 
 		// The running worker already chose; the next one downloads the copy and reports its version (UPD-07).
-		const second2 = await heldRun(h, "after the update");
-		expect(h.db.getRun(second2.runId)?.omp_version).toBe(NEW_OMP);
+		const second = await heldRun(h, "after the update");
+		expect(h.db.getRun(second.runId)?.omp_version).toBe(NEW_OMP);
 		expect(h.db.getRun(first.runId)?.omp_version).toBe(WORKER_IMAGE_OMP);
-		expect(readdirSync(join(second2.worker.root, "omp-runtime"))).toEqual(expect.arrayContaining(["node_modules", "src", "package.json", "bun.lock"]));
+		expect(readdirSync(join(second.worker.root, "omp-runtime"))).toEqual(expect.arrayContaining(["node_modules", "src", "package.json", "bun.lock"]));
 		await finish(h, first);
-		await finish(h, second2);
-		expect(h.db.getRun(second2.runId)).toMatchObject({ state: "finished", outcome: "succeeded", omp_version: NEW_OMP });
+		await finish(h, second);
+		expect(h.db.getRun(second.runId)).toMatchObject({ state: "finished", outcome: "succeeded", omp_version: NEW_OMP });
 	}, 40_000);
 
-	test("a broken copy: the worker falls back to the image's omp in the same run; the copy is failed and the update re-offered (UPD-08)", async () => {
+	test("a broken copy: the worker falls back to the image's omp in the same run; the copy is failed and the update offered again (UPD-08)", async () => {
 		const h = await boot();
 		h.install.copy = "broken";
 		await h.updater.check();
-		await until(() => notices(h, NEW_OMP).length === 1, "the update notice");
-		await click(h, notices(h, NEW_OMP)[0]!);
-		await until(() => h.updater.status().active?.version === NEW_OMP, "the copy to be active");
+		await h.approve(NEW_OMP);
 		const copy = h.updater.status().active!.copy;
 
 		const run = await heldRun(h, "on the canary");
 		// run-info came twice: the copy's version, then the image's after the fallback.
 		expect(h.db.getRun(run.runId)?.omp_version).toBe(WORKER_IMAGE_OMP);
 		expect(h.updater.status().active).toBeUndefined();
-		expect(h.updater.status().lastAttempt).toMatchObject({ version: NEW_OMP, outcome: "failed", copy, by: "@alice" });
-		expect(h.updater.status().lastAttempt?.error).toContain(`the agent host from omp ${NEW_OMP} exited with code 3 before it registered`);
-
-		// The failure is posted with a fresh Approve button; the earlier notice lost its button.
-		await until(() => notices(h, NEW_OMP).some(m => m.content.includes("exited with code 3")), "the failure notice");
-		const failure = notices(h, NEW_OMP).find(m => m.content.includes("exited with code 3"))!;
-		expect(failure.content).toContain(BROKEN_STDERR);
-		expect(notices(h, NEW_OMP)).toHaveLength(1);
-		expect(h.updater.status().lastAttempt?.reported).toBe(true);
+		expect(h.updater.status().attempt).toMatchObject({ version: NEW_OMP, outcome: "failed", copy, by: "admin" });
+		expect(h.updater.status().attempt?.error).toContain(`the agent host from omp ${NEW_OMP} exited with code 3 before it registered`);
+		expect(h.updater.status().attempt?.log).toContain(BROKEN_STDERR);
+		// Offered again for a fresh approval.
+		expect(h.updater.status().available).toBe(NEW_OMP);
 
 		// The run goes on with the image's omp, once (no second fallback).
 		await finish(h, run);
@@ -377,58 +349,26 @@ describe("in-place omp updates for workers (phase 10)", () => {
 		await finish(h, next);
 	}, 40_000);
 
-	test("a newer omp supersedes the older notice, whose button is then stale (UPD-02)", async () => {
-		const h = await boot();
-		await h.updater.check();
-		await until(() => notices(h, NEW_OMP).length === 1, "the first notice");
-		const first = notices(h, NEW_OMP)[0]!;
-		h.registry.latest = "99.2.0";
-		await h.updater.check();
-		await until(() => notices(h, "99.2.0").length === 1, "the newer notice");
-		await h.discord.settled();
-		expect(h.discord.message(first.id)).toMatchObject({ components: [] });
-		expect(h.discord.message(first.id)?.content).toContain("Superseded by omp 99.2.0.");
-		// A repeated check with nothing new posts nothing.
-		await h.updater.check();
-		await h.discord.settled();
-		expect(h.discord.messages(WORK).filter(m => m.content.includes("is available"))).toHaveLength(2);
-		expect(answer(await click(h, first))).toBe(STALE_UPDATE);
-		expect(h.updater.status().lastAttempt).toBeUndefined();
-	}, 20_000);
-
-	test("outside the image updates are refused and no notice is posted (UPD-05)", async () => {
-		const h = await boot({ inImage: false });
+	test("outside the image updates are refused (UPD-05)", async () => {
+		const h = await boot({ inImage: false, autoUpdate: true });
 		const view = await h.updater.check();
 		expect(view).toMatchObject({ supported: false, unsupportedReason: UNSUPPORTED, latest: NEW_OMP, available: NEW_OMP });
-		await h.discord.settled();
-		expect(notices(h, NEW_OMP)).toHaveLength(0);
-		expect(await h.updater.install(NEW_OMP, "@alice")).toEqual({ ok: false, error: UNSUPPORTED, refused: true });
-		// An Approve click (an old notice) is refused the same way.
-		const sent = await h.discord.send(WORK, { content: "old notice" });
-		const e = await h.discord.emitComponent({ message: sent, customId: approveId(NEW_OMP), actor: alice(h) });
-		expect(answer(e)).toBe(UNSUPPORTED);
+		expect(h.updater.install(NEW_OMP, "admin")).toEqual({ started: false, error: UNSUPPORTED });
+		expect(h.updater.status().attempt).toBeUndefined();
+		expect(h.install.calls).toEqual([]);
 		expect(h.updater.forRun("any")).toBeUndefined();
 	}, 20_000);
 
-	test("auto-update on: a notice without a button before, the install without a click, and a message after (UPD-02, UPD-03)", async () => {
+	test("auto-update on: the check installs at once, recorded as auto-update; new workers use the copy (UPD-02, UPD-03)", async () => {
 		const h = await boot({ autoUpdate: true });
 		const first = await heldRun(h, "before the update");
 		expect(h.db.getRun(first.runId)?.omp_version).toBe(WORKER_IMAGE_OMP);
 
 		await h.updater.check();
-		await until(() => autoInstalled(h, NEW_OMP).length === 1, "the installed message");
-		await h.discord.settled();
-
-		expect(autoNotices(h, NEW_OMP)).toHaveLength(1);
-		const before = autoNotices(h, NEW_OMP)[0]!;
-		expect(before.content).toContain(`workers use ${IMAGE_OMP}`);
-		expect(before.components).toEqual([]);
-		const order = h.discord.messages(WORK).map(m => m.id);
-		expect(order.indexOf(before.id)).toBeLessThan(order.indexOf(autoInstalled(h, NEW_OMP)[0]!.id));
-		expect(notices(h, NEW_OMP)).toHaveLength(0);
+		await until(() => h.updater.status().active !== undefined, "the automatic install");
 		expect(h.install.calls).toEqual([NEW_OMP]);
 		expect(h.updater.status().active).toMatchObject({ version: NEW_OMP, by: AUTO_UPDATE_BY });
-		expect(h.updater.status().lastAttempt).toMatchObject({ version: NEW_OMP, outcome: "installed", by: AUTO_UPDATE_BY, reported: true });
+		expect(h.updater.status().attempt).toMatchObject({ version: NEW_OMP, outcome: "installed", by: AUTO_UPDATE_BY });
 		expect(h.updater.status().available).toBeUndefined();
 
 		// New workers use the copy; the running one keeps the image's omp.
@@ -439,132 +379,88 @@ describe("in-place omp updates for workers (phase 10)", () => {
 		await finish(h, next);
 	}, 40_000);
 
-	test("auto-update on, the install fails: the failure is posted with its output and a fresh Approve button, and is not retried automatically (UPD-03)", async () => {
+	test("auto-update on, the install fails: the failure keeps its output, is not retried automatically, and an approval retries it (UPD-03)", async () => {
 		const h = await boot({ autoUpdate: true });
 		h.install.copy = "failing";
 		await h.updater.check();
-		await until(() => notices(h, NEW_OMP).length === 1, "the failure notice");
-		const failure = notices(h, NEW_OMP)[0]!;
-		expect(failure.content).toContain("Updating omp to 99.1.0 failed: bun install failed (exit 1)");
-		expect(failure.content).toContain(`npm ERR! 404 ${OMP_PACKAGE}@${NEW_OMP} not found`);
-		expect(autoNotices(h, NEW_OMP)).toHaveLength(1);
+		await until(() => h.updater.status().attempt?.outcome === "failed", "the failed install");
+		expect(h.updater.status().attempt).toMatchObject({ version: NEW_OMP, by: AUTO_UPDATE_BY, error: "bun install failed (exit 1)" });
+		expect(h.updater.status().attempt?.log).toContain(`npm ERR! 404 ${OMP_PACKAGE}@${NEW_OMP} not found`);
 		expect(h.updater.status().active).toBeUndefined();
-		expect(h.updater.status().lastAttempt).toMatchObject({ outcome: "failed", by: AUTO_UPDATE_BY, reported: true });
 
 		// The same version is not installed again by the next check.
 		await h.updater.check();
-		await h.discord.settled();
 		expect(h.install.calls).toEqual([NEW_OMP]);
-		expect(notices(h, NEW_OMP)).toHaveLength(1);
+		expect(h.updater.status().installing).toBeUndefined();
 
-		// A click is the manual retry.
+		// An approval is the manual retry.
 		h.install.copy = "good";
-		await click(h, failure);
-		await until(() => said(h, WORK, `✅ omp ${NEW_OMP} is installed for workers (approved by @alice)`).length === 1, "the installed message");
+		expect(await h.approve(NEW_OMP)).toMatchObject({ ok: true });
 		expect(h.install.calls).toEqual([NEW_OMP, NEW_OMP]);
-		expect(h.updater.status().active).toMatchObject({ version: NEW_OMP, by: "@alice" });
+		expect(h.updater.status().active).toMatchObject({ version: NEW_OMP, by: "admin" });
 	}, 30_000);
 
-	test("auto-update on, the copy fails its canary run: the failure is posted with an Approve button and the version is not installed again (UPD-08)", async () => {
+	test("auto-update on, the copy fails its canary run: the version is not installed again automatically (UPD-08)", async () => {
 		const h = await boot({ autoUpdate: true });
 		h.install.copy = "broken";
 		await h.updater.check();
-		await until(() => autoInstalled(h, NEW_OMP).length === 1, "the installed message");
+		await until(() => h.updater.status().active !== undefined, "the automatic install");
 		const run = await heldRun(h, "on the canary");
-		await until(() => notices(h, NEW_OMP).some(m => m.content.includes("exited with code 3")), "the failure notice");
-		expect(notices(h, NEW_OMP)[0]!.content).toContain(BROKEN_STDERR);
 		expect(h.updater.status().active).toBeUndefined();
+		expect(h.updater.status().attempt).toMatchObject({ version: NEW_OMP, outcome: "failed", by: AUTO_UPDATE_BY });
 		await h.updater.check();
-		await h.discord.settled();
 		expect(h.install.calls).toEqual([NEW_OMP]);
-		expect(notices(h, NEW_OMP)).toHaveLength(1);
 		await finish(h, run);
 	}, 40_000);
 
-	test("turning auto-update on while an update is on offer closes the old notice's button and installs it", async () => {
+	test("an orchestrator restart during an install records it as failed, and it is not installed again automatically (UPD-03)", async () => {
 		const h = await boot();
-		await h.updater.check();
-		await until(() => notices(h, NEW_OMP).length === 1, "the update notice");
-		const old = notices(h, NEW_OMP)[0]!;
+		h.db.kvSet("omp.update.latest", NEW_OMP);
+		h.db.kvSet("omp.update.attempt", JSON.stringify({ version: NEW_OMP, from: IMAGE_OMP, by: AUTO_UPDATE_BY, outcome: "installing", at: new Date().toISOString() }));
+		const restarted = createOmpUpdater({
+			db: h.db,
+			runtimeDir: join(h.stateDir, "omp-runtime-restarted"),
+			identity: TEST_IDENTITY,
+			imageOmpVersion: IMAGE_OMP,
+			imageAppDir: h.stateDir,
+			installer: (p => fakeInstaller(h.install)(p)) satisfies CopyInstaller,
+			registryUrl: "http://127.0.0.1:1/",
+			autoUpdate: () => true,
+		});
+		cleanups.push(() => restarted.stop());
+		expect(restarted.status().attempt).toMatchObject({ version: NEW_OMP, outcome: "failed", error: "the orchestrator restarted during the install" });
+		await restarted.check();
 		expect(h.install.calls).toEqual([]);
+	}, 20_000);
 
-		await h.setAutoUpdate(true);
-		await until(() => autoInstalled(h, NEW_OMP).length === 1, "the installed message");
-		await h.discord.settled();
-		expect(h.discord.message(old.id)?.components).toEqual([]);
-		expect(h.discord.message(old.id)?.content).toContain(`Installing omp ${NEW_OMP} automatically`);
-		expect(autoNotices(h, NEW_OMP)).toHaveLength(1);
-		expect(notices(h, NEW_OMP)).toHaveLength(0);
-		expect(h.install.calls).toEqual([NEW_OMP]);
-		expect(h.updater.status().active).toMatchObject({ version: NEW_OMP, by: AUTO_UPDATE_BY });
-	}, 30_000);
-
-	test("turning auto-update off mid-install does not cancel it; the new engine posts the result", async () => {
+	test("turning auto-update off mid-install does not cancel it", async () => {
 		const h = await boot({ autoUpdate: true });
 		const release = Promise.withResolvers<void>();
 		h.install.gate = release.promise;
 		await h.updater.check();
-		await until(() => autoNotices(h, NEW_OMP).length === 1, "the before notice");
 		expect(h.updater.status().installing).toMatchObject({ version: NEW_OMP, by: AUTO_UPDATE_BY });
 
 		await h.setAutoUpdate(false);
-		expect(h.updater.status().installing).toBeDefined();
+		expect(h.updater.status()).toMatchObject({ autoUpdate: false, installing: { version: NEW_OMP } });
 		release.resolve();
-		await until(() => autoInstalled(h, NEW_OMP).length === 1, "the installed message");
-		await h.discord.settled();
-		expect(autoInstalled(h, NEW_OMP)).toHaveLength(1);
+		await until(() => h.updater.status().active !== undefined, "the install to finish");
 		expect(h.updater.status().active).toMatchObject({ version: NEW_OMP, by: AUTO_UPDATE_BY });
 		expect(h.install.calls).toEqual([NEW_OMP]);
 	}, 30_000);
 
-	test("several syncs and engines at once start one install and post one notice and one result (UPD-03)", async () => {
+	test("concurrent checks start one install; a newer omp found during it is installed once it finishes", async () => {
 		const h = await boot({ autoUpdate: true });
-		const config = h.vault.readSettings()!.config;
-		const second = createOmpNotices({ config: { ...config, discord: { ...config.discord, workChannelId: WORK } }, discord: h.discord }, h.updater);
-		cleanups.push(() => second.stop());
 		const release = Promise.withResolvers<void>();
 		h.install.gate = release.promise;
-		second.start();
 		await Promise.all([h.updater.check(), h.updater.check()]);
-		await until(() => h.updater.status().installing !== undefined, "the install to start");
-		await h.discord.settled();
-		release.resolve();
-		await until(() => autoInstalled(h, NEW_OMP).length >= 1, "the installed message");
-		await h.discord.settled();
-		expect(h.install.calls).toEqual([NEW_OMP]);
-		expect(autoNotices(h, NEW_OMP)).toHaveLength(1);
-		expect(autoInstalled(h, NEW_OMP)).toHaveLength(1);
-	}, 30_000);
-
-	test("a newer omp found during an install is installed once it finishes, without a double install", async () => {
-		const h = await boot({ autoUpdate: true });
-		const release = Promise.withResolvers<void>();
-		h.install.gate = release.promise;
-		await h.updater.check();
-		await until(() => h.updater.status().installing !== undefined, "the install to start");
+		expect(h.updater.status().installing).toMatchObject({ version: NEW_OMP });
 		h.registry.latest = "99.2.0";
 		await h.updater.check();
-		await h.discord.settled();
-		expect(autoNotices(h, "99.2.0")).toHaveLength(0);
+		expect(h.install.calls).toEqual([NEW_OMP]);
+		h.install.gate = undefined;
 		release.resolve();
-		await until(() => autoInstalled(h, "99.2.0").length === 1, "the second installed message");
-		await h.discord.settled();
-
-		const order = h.discord.messages(WORK).map(m => m.id);
-		const at = (m: FakeMessage | undefined) => order.indexOf(m!.id);
-		expect(at(autoNotices(h, NEW_OMP)[0])).toBeLessThan(at(autoInstalled(h, NEW_OMP)[0]));
-		expect(at(autoInstalled(h, NEW_OMP)[0])).toBeLessThan(at(autoNotices(h, "99.2.0")[0]));
-		expect(at(autoNotices(h, "99.2.0")[0])).toBeLessThan(at(autoInstalled(h, "99.2.0")[0]));
+		await until(() => h.updater.status().active?.version === "99.2.0", "the second install");
 		expect(h.install.calls).toEqual([NEW_OMP, "99.2.0"]);
-		expect(h.updater.status().active).toMatchObject({ version: "99.2.0", by: AUTO_UPDATE_BY });
+		expect(h.updater.status().attempt).toMatchObject({ version: "99.2.0", from: NEW_OMP, outcome: "installed", by: AUTO_UPDATE_BY });
 	}, 30_000);
-
-	test("outside the image auto-update installs nothing and posts nothing (UPD-05)", async () => {
-		const h = await boot({ inImage: false, autoUpdate: true });
-		await h.updater.check();
-		await h.discord.settled();
-		expect(h.discord.messages(WORK).filter(m => m.content.includes("omp "))).toHaveLength(0);
-		expect(h.updater.status().lastAttempt).toBeUndefined();
-		expect(h.install.calls).toEqual([]);
-	}, 20_000);
 });

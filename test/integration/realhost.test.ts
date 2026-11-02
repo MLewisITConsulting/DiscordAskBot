@@ -19,8 +19,8 @@ import {
 } from "../fixtures/real-host";
 
 /**
- * The real agent host (`src/worker/host/host.ts` with omp) against a fake OpenAI-compatible model server: the tools each
- * profile offers the model (AGT-08, AGT-09), the time and cost limits (JOB-07, AGT-14), usage of a resumed session
+ * The real agent host (`src/worker/host/host.ts` with omp) against a fake OpenAI-compatible model server: the tools the
+ * `ask` profile offers the model (AGT-08, AGT-09), the time and cost limits (AGT-14), usage of a resumed session
  * (OBS-05), OOM detection and its steer (AGT-17, AGT-18) and OAuth refresh through `credential_request` (CRED-03).
  */
 
@@ -56,61 +56,49 @@ function transcriptOf(messages: ChildMessage[]): TranscriptEvent[] {
 const ANSWER_SCHEMA = { type: "object", properties: { answer: { type: "string" } }, required: ["answer"], additionalProperties: false };
 const yieldAnswer = (answer: string): ModelTurn => ({ toolCalls: [{ name: "yield", args: { data: { answer } } }] });
 
-/** omp's tools that reach outside a scratch directory: files anywhere, shell, code execution, subagents. */
-const UNCONFINED = ["bash", "edit", "eval", "find", "glob", "grep", "read", "task", "write"];
+/** omp's tools that reach outside a scratch directory: files anywhere, shell, code execution, subagents, questions, to-dos. */
+const UNCONFINED = ["ask", "bash", "edit", "eval", "find", "glob", "grep", "read", "task", "update_todos", "write"];
+/** A tool call that keeps the agent working without touching anything. */
+const listFiles: ModelTurn["toolCalls"] = [{ name: "list_files", args: {} }];
 
-describe("profiles (AGT-08, AGT-09)", () => {
-	const restricted: [profile: "plan" | "chat" | "draft" | "ask", tools: string[], extra?: Partial<HostRunOptions["opts"]>][] = [
-		["plan", ["ask", "bash", "glob", "grep", "read", "update_todos", "web_search", "yield"]],
-		["chat", ["bash", "create_issue", "glob", "grep", "read", "update_todos", "web_search", "yield"], { createIssueRepo: "acme/app" }],
-		["draft", ["bash", "glob", "grep", "read", "update_todos", "web_search", "yield"]],
-		["ask", ["list_files", "read_file", "update_todos", "web_search", "write_file", "yield"]],
-	];
-	for (const [profile, tools, extra] of restricted) {
-		test.concurrent(`${profile} offers the model exactly its tools`, async () => {
-			const { model, dirs } = await setup(() => yieldAnswer("ok"));
-			const { end } = await host({ dirs, opts: { profile, prompt: "hi", outputSchema: ANSWER_SCHEMA, ...extra } });
-			expect(end).toMatchObject({ t: "done", result: { output: { answer: "ok" } } });
-			expect(model.requests[0]!.tools).toEqual(tools);
-		}, 30_000);
-	}
-
-	test.concurrent("ask has none of omp's unconfined file, shell or code tools", async () => {
+describe("the ask profile (AGT-08, AGT-09)", () => {
+	test.concurrent("offers the model exactly its tools", async () => {
 		const { model, dirs } = await setup(() => yieldAnswer("ok"));
-		await host({ dirs, opts: { profile: "ask", prompt: "hi", outputSchema: ANSWER_SCHEMA } });
+		const { end } = await host({ dirs, opts: { prompt: "hi", outputSchema: ANSWER_SCHEMA } });
+		expect(end).toMatchObject({ t: "done", result: { output: { answer: "ok" } } });
+		expect(model.requests[0]!.tools).toEqual(["list_files", "read_file", "web_search", "write_file", "yield"]);
+	}, 30_000);
+
+	test.concurrent("has none of omp's unconfined file, shell, code, question or to-do tools", async () => {
+		const { model, dirs } = await setup(() => yieldAnswer("ok"));
+		await host({ dirs, opts: { prompt: "hi", outputSchema: ANSWER_SCHEMA } });
 		const offered = model.requests[0]!.tools;
 		expect(offered.filter(t => UNCONFINED.includes(t))).toEqual([]);
 		// A model that calls `read` anyway gets no file content: the tool does not exist in the session.
 		const secret = join(dirs.root, "secret.txt");
 		writeFileSync(secret, "worker-secret-content");
 		const second = await setup(n => (n === 0 ? { toolCalls: [{ name: "read", args: { path: secret } }] } : yieldAnswer("done")));
-		const { run } = await host({ dirs: second.dirs, opts: { profile: "ask", prompt: "read it", outputSchema: ANSWER_SCHEMA } });
+		const { run } = await host({ dirs: second.dirs, opts: { prompt: "read it", outputSchema: ANSWER_SCHEMA } });
 		expect(JSON.stringify(second.model.requests.map(r => r.messages))).not.toContain("worker-secret-content");
 		expect(transcriptOf(run.messages).some(e => e.type === "tool_end" && e.tool === "read" && !e.isError)).toBe(false);
 	}, 30_000);
 
-	test.concurrent("implement offers omp's defaults plus ask, update_todos and yield", async () => {
-		const { model, dirs } = await setup(() => yieldAnswer("ok"));
-		const { end } = await host({ dirs, opts: { profile: "implement", prompt: "hi", outputSchema: ANSWER_SCHEMA } });
-		expect(end?.t).toBe("done");
-		expect(model.requests[0]!.tools).toEqual(expect.arrayContaining(["ask", "bash", "edit", "glob", "grep", "read", "update_todos", "web_search", "write", "yield"]));
-	}, 30_000);
 });
 
-describe("limits (JOB-07, AGT-14)", () => {
+describe("limits (AGT-14)", () => {
 	test.concurrent("cost over the limit at the end of a turn aborts the run with `cost`; no further turn is started", async () => {
 		// $1 per token: the first turn costs $10 against a $1 limit, and asks for another turn with a tool call.
-		const { model, dirs } = await setup(() => ({ toolCalls: [{ name: "update_todos", args: { todos: [{ content: "go on", status: "in_progress" }] } }], usage: { input: 6, output: 4 } }), {
+		const { model, dirs } = await setup(() => ({ toolCalls: listFiles, usage: { input: 6, output: 4 } }), {
 			costPerMTok: 1_000_000,
 		});
-		const { end } = await host({ dirs, opts: { profile: "plan", prompt: "spend", limits: { minutes: 10, costUsd: 1 } } });
+		const { end } = await host({ dirs, opts: { prompt: "spend", limits: { minutes: 10, costUsd: 1 } } });
 		expect(end).toMatchObject({ t: "done", result: { aborted: "cost", usage: { costUsd: 10, input: 6, output: 4 } } });
 		expect(model.requests).toHaveLength(1);
 	}, 30_000);
 
 	test.concurrent("a run under its cost limit is not aborted", async () => {
 		const { dirs } = await setup(() => ({ text: "cheap", usage: { input: 6, output: 4 } }), { costPerMTok: 1_000 });
-		const { end } = await host({ dirs, opts: { profile: "plan", prompt: "spend", limits: { minutes: 10, costUsd: 1 } } });
+		const { end } = await host({ dirs, opts: { prompt: "spend", limits: { minutes: 10, costUsd: 1 } } });
 		expect(end).toMatchObject({ t: "done", result: { usage: { costUsd: 0.01 } } });
 		expect(end?.t === "done" && end.result.aborted).toBeFalsy();
 	}, 30_000);
@@ -118,12 +106,12 @@ describe("limits (JOB-07, AGT-14)", () => {
 	test.concurrent("the wall clock check aborts a busy run past its minutes with `time`", async () => {
 		// The model keeps the agent working (a tool call every 100 ms) and would never stop on its own. The session's
 		// 15 s check runs every 200 ms here (`fast-clock.ts` preload, which fails if the 15 s constant changes).
-		const { model, dirs } = await setup(() => ({ toolCalls: [{ name: "update_todos", args: { todos: [{ content: "loop", status: "in_progress" }] } }], delayMs: 100 }));
+		const { model, dirs } = await setup(() => ({ toolCalls: listFiles, delayMs: 100 }));
 		let registeredAt = 0;
 		const { end } = await host({
 			dirs,
 			clockCheckMs: 200,
-			opts: { profile: "plan", prompt: "loop", limits: { minutes: 0.01, costUsd: 100 } },
+			opts: { prompt: "loop", limits: { minutes: 0.01, costUsd: 100 } },
 			onMessage: m => {
 				if (m.t === "registered") registeredAt = Date.now();
 			},
@@ -141,10 +129,10 @@ describe("limits (JOB-07, AGT-14)", () => {
 describe("usage (OBS-05)", () => {
 	test.concurrent("a resumed session reports only the usage of the new run", async () => {
 		const { model, dirs } = await setup(n => (n === 0 ? { text: "first", usage: { input: 100, output: 50 } } : { text: "second", usage: { input: 7, output: 3 } }), { costPerMTok: 1_000_000 });
-		const first = await host({ dirs, opts: { profile: "plan", prompt: "one" } });
+		const first = await host({ dirs, opts: { prompt: "one" } });
 		expect(first.end).toMatchObject({ t: "done", result: { usage: { input: 100, output: 50, costUsd: 150 } } });
 		const sessionFile = first.end?.t === "done" ? first.end.result.sessionFile : "";
-		const second = await host({ dirs, opts: { profile: "plan", prompt: "two", resumeFile: sessionFile } });
+		const second = await host({ dirs, opts: { prompt: "two", resumeFile: sessionFile } });
 		expect(second.end).toMatchObject({ t: "done", result: { usage: { input: 7, output: 3, costUsd: 10 } } });
 		// The resumed run really carried the earlier history to the model.
 		expect(JSON.stringify(model.requests[1]!.messages)).toContain("first");
@@ -154,35 +142,36 @@ describe("usage (OBS-05)", () => {
 });
 
 describe("OOM detection (AGT-17, AGT-18)", () => {
+	/** The `memory.events` file the host reads, inside the scratch copy so `write_file` can play the kernel. */
 	async function memoryEvents(dirs: HostDirs, kills: number): Promise<string> {
-		const file = join(dirs.root, "memory.events");
+		const file = join(dirs.scratch, "memory.events");
 		writeFileSync(file, `low 0\nhigh 0\nmax 0\noom 0\noom_kill ${kills}\noom_group_kill 0\n`);
 		return file;
 	}
 
 	test.concurrent("a rise during a tool call steers the agent once, naming the tool; the result counts the kills", async () => {
-		let events = "";
 		const { model, dirs } = await setup(n => {
-			// The tool's command is what the kernel kills: the counter rises while `bash` runs.
-			if (n === 0) return { toolCalls: [{ name: "bash", args: { command: `printf 'oom 2\\noom_kill 2\\n' > ${events}` } }] };
-			if (n === 1) return { toolCalls: [{ name: "bash", args: { command: "true" } }] };
+			// The counter rises while `write_file` runs.
+			if (n === 0) return { toolCalls: [{ name: "write_file", args: { path: "memory.events", content: "oom 2\noom_kill 2\n" } }] };
+			if (n === 1) return { toolCalls: listFiles };
 			return yieldAnswer("finished");
 		});
-		events = await memoryEvents(dirs, 0);
-		const { run, end } = await host({ dirs, memoryEvents: events, opts: { profile: "implement", prompt: "build it", outputSchema: ANSWER_SCHEMA } });
+		const events = await memoryEvents(dirs, 0);
+		const { run, end } = await host({ dirs, memoryEvents: events, opts: { prompt: "write it", outputSchema: ANSWER_SCHEMA } });
 		expect(end).toMatchObject({ t: "done", result: { oomKills: 2, output: { answer: "finished" } } });
 		const steers = transcriptOf(run.messages).filter(e => e.type === "steer");
 		expect(steers).toHaveLength(1);
 		const text = steers[0]!.type === "steer" ? steers[0]!.text : "";
 		expect(text).toContain("killed 2 process(es)");
-		expect(text).toContain("`bash`");
-		expect(text).toContain("Do not run it again");
+		expect(text).toContain("`write_file`");
+		expect(text).toContain("Do not repeat that action");
+		expect(text).toContain("tell the user");
 		expect(JSON.stringify(model.requests[1]!.messages.filter(m => m.role === "user"))).toContain("lack of memory (OOM)");
 	}, 30_000);
 
 	test.concurrent("no cgroup v2 file: detection is off, nothing is counted", async () => {
 		const { dirs } = await setup(() => yieldAnswer("ok"));
-		const { end } = await host({ dirs, memoryEvents: join(dirs.root, "absent"), opts: { profile: "implement", prompt: "x", outputSchema: ANSWER_SCHEMA } });
+		const { end } = await host({ dirs, memoryEvents: join(dirs.scratch, "absent"), opts: { prompt: "x", outputSchema: ANSWER_SCHEMA } });
 		expect(end).toMatchObject({ t: "done", result: { oomKills: 0 } });
 	}, 30_000);
 
@@ -193,7 +182,7 @@ describe("OOM detection (AGT-17, AGT-18)", () => {
 			return yieldAnswer("done");
 		});
 		events = await memoryEvents(dirs, 0);
-		const { run, end } = await host({ dirs, memoryEvents: events, opts: { profile: "implement", prompt: "x", outputSchema: ANSWER_SCHEMA } });
+		const { run, end } = await host({ dirs, memoryEvents: events, opts: { prompt: "x", outputSchema: ANSWER_SCHEMA } });
 		expect(end).toMatchObject({ t: "done", result: { oomKills: 1, output: { answer: "done" } } });
 		expect(transcriptOf(run.messages).filter(e => e.type === "steer")).toEqual([]);
 		expect(model.requests).toHaveLength(1);
@@ -212,7 +201,7 @@ describe("OOM detection (AGT-17, AGT-18)", () => {
 		const { run, end } = await host({
 			dirs,
 			memoryEvents: events,
-			opts: { profile: "implement", prompt: "x" },
+			opts: { prompt: "x" },
 			onMessage: (m, r) => {
 				if (m.t === "registered") live = r;
 			},
@@ -234,7 +223,7 @@ describe("OAuth refresh (CRED-03, spike S1)", () => {
 		const requests: Extract<ChildMessage, { t: "credential_request" }>[] = [];
 		const { end } = await host({
 			dirs,
-			opts: { profile: "plan", prompt: "ping" },
+			opts: { prompt: "ping" },
 			credential: req => {
 				requests.push(req);
 				return { accessToken: "access-v2", expiresAt: Date.now() + 3_600_000 };
@@ -257,7 +246,7 @@ describe("OAuth refresh (CRED-03, spike S1)", () => {
 	test.concurrent("a refusal containing 'revoked' disables the run's copy; the model is never called", async () => {
 		const { model, dirs } = await setup(() => ({ text: "pong" }), { apiKey: null });
 		await seedCredentials(dirs, [{ id: 7, provider: FAKE_PROVIDER, credential: { type: "oauth", access: "access-v1", refresh: "__remote__", expires: Date.now() - 60_000 } }]);
-		const { end } = await host({ dirs, opts: { profile: "plan", prompt: "ping" }, credential: () => ({ error: "revoked: sign-in was removed" }) });
+		const { end } = await host({ dirs, opts: { prompt: "ping" }, credential: () => ({ error: "revoked: sign-in was removed" }) });
 		expect(end?.t).toBe("failed");
 		expect(model.requests).toEqual([]);
 	}, 30_000);

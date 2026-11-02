@@ -17,7 +17,7 @@ import { createLoginThrottle, type ThrottleLimits } from "../../shared/loginThro
 import type { Dispatcher } from "../dispatch/dispatcher";
 import type { Controller } from "../engine/controller";
 import type { Db } from "../store/db";
-import { issueOverview, latestLoadouts, parseUsageWindow, usageReport } from "../store/stats";
+import { activeThreads, latestLoadout, parseUsageWindow, usageReport } from "../store/stats";
 import { type Vault, VaultLocked } from "../store/vault";
 import type { ChannelCheck } from "./channels";
 import { healthLimits } from "./health";
@@ -46,9 +46,9 @@ export interface AdminApiOptions {
 	webToken: string | undefined;
 	/** One-time setup token (WEB-02); undefined once an admin exists. */
 	setupToken: string | undefined;
-	/** Feature endpoints (repositories, channels, sign-ins, omp, skills, logs), mounted after the built-in ones. */
+	/** Feature endpoints (channels, sign-ins, omp, skills, logs), mounted after the built-in ones. */
 	routes?: AdminRoutes;
-	/** Signed-in model accounts (home page count, §9.3 `/`); omitted, the count and that checklist step read unknown. */
+	/** Signed-in model accounts (home page count, requirements §5.3 `/`); omitted, the count and that checklist step read unknown. */
 	modelAccounts?: () => number;
 	/**
 	 * WEB-24: checks the configured channels against the live guild before a save; `errors` refuse it, `warnings` are
@@ -136,22 +136,20 @@ export function createAdminApi(opts: AdminApiOptions): AdminApi {
 		}
 	}
 
-	/** Counts and getting-started progress for the home page (§9.3 `/`): cheap reads, so `/state` stays fast. */
+	/** Counts and getting-started progress for the home page (requirements §5.3 `/`): cheap reads, so `/state` stays fast. */
 	function homeFacts(): HomeFacts {
 		const unlocked = vault.isInitialized() && vault.isUnlocked();
 		const settings = unlocked ? storedSettings() : undefined;
 		const modelAccounts = countOf("model accounts", opts.modelAccounts);
-		const mcpServers = unlocked
-			? countOf("MCP servers", () => Object.keys((vault.readOmpConfig() as { mcpServers?: object } | undefined)?.mcpServers ?? {}).length)
-			: undefined;
+		const discord = settings?.config.discord;
 		return {
 			...(modelAccounts === undefined ? {} : { modelAccounts }),
-			...(mcpServers === undefined ? {} : { mcpServers }),
 			checklist: {
 				setup: vault.isInitialized(),
-				credentials: !!settings?.secrets.discordToken && !!settings.secrets.githubAppPrivateKey && settings.config.github.appId > 0,
-				workChannel: !!settings?.config.discord.workChannelId,
-				watchedRepo: db.listWatches("watching").length > 0,
+				botToken: !!settings?.secrets.discordToken,
+				guild: !!discord?.guildId,
+				allowedUsers: !!discord && discord.allowedUserIds.length + discord.allowedRoleIds.length > 0,
+				askChannel: !!discord && discord.askChannelIds.length > 0,
 				modelAccess: (modelAccounts ?? 0) > 0 || Object.keys(settings?.secrets.providerKeys ?? {}).length > 0,
 			},
 		};
@@ -259,7 +257,6 @@ export function createAdminApi(opts: AdminApiOptions): AdminApi {
 			config: stored?.config,
 			secrets: {
 				discordToken: !!stored?.secrets.discordToken,
-				githubAppPrivateKey: !!stored?.secrets.githubAppPrivateKey,
 				providerKeys: Object.keys(stored?.secrets.providerKeys ?? {}).sort(),
 			},
 		};
@@ -281,7 +278,6 @@ export function createAdminApi(opts: AdminApiOptions): AdminApi {
 		}
 		const secrets = {
 			discordToken: str(given.discordToken).trim() || previous?.discordToken,
-			githubAppPrivateKey: str(given.githubAppPrivateKey).trim() || previous?.githubAppPrivateKey,
 			providerKeys,
 		};
 		try {
@@ -297,6 +293,7 @@ export function createAdminApi(opts: AdminApiOptions): AdminApi {
 	function status(url: URL): StatusReport {
 		const { limits, warnings } = healthLimits(vault.isUnlocked() ? storedSettings()?.config : undefined, opts.workerCapacity);
 		const window = parseUsageWindow(url.searchParams.get("window"));
+		const loadout = latestLoadout(db);
 		return {
 			state: state(),
 			engine: controller.snapshot(),
@@ -305,9 +302,9 @@ export function createAdminApi(opts: AdminApiOptions): AdminApi {
 			workers: opts.dispatcher.workers(),
 			limits,
 			warnings,
-			issues: issueOverview(db),
+			activeThreads: activeThreads(db),
 			usage: usageReport(db, window),
-			loadouts: latestLoadouts(db),
+			...(loadout ? { loadout } : {}),
 		};
 	}
 

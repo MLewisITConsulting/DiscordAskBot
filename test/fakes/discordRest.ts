@@ -1,10 +1,10 @@
 import { ChannelType, OverwriteType, PermissionFlagsBits } from "discord-api-types/v10";
-import { basePermissions, channelPermissions, type OverwriteData } from "../../src/orchestrator/discord/permissions";
+import type { OverwriteData } from "../../src/orchestrator/discord/permissions";
 
 /**
- * A small fake of Discord's REST API: one guild with roles, channels and the bot's member record, plus the writes
- * watch channels make (create channel, patch channel, post message). Point `createDiscordRest({ api })` (or a route
- * factory's `discordApi`) at `api`. Errors carry Discord's JSON codes, so the client's error mapping is exercised.
+ * A small fake of Discord's REST API: one guild with roles, channels and the bot's member record, plus posting a
+ * message (DSC-07 on the wire). Point `createDiscordRest({ api })` (or a route factory's `discordApi`) at `api`. Errors
+ * carry Discord's JSON codes, so the client's error mapping is exercised.
  */
 
 export interface FakeChannel {
@@ -98,8 +98,6 @@ export function startFakeDiscordRest(opts: { token?: string } = {}): FakeDiscord
 		stop: async () => {},
 	};
 
-	const guildData = () => ({ id: guildId, ownerId: "owner-user", roles: [...roles.values()] });
-	const memberData = () => ({ userId: botUserId, roleIds: fake.botRoles });
 	const channelJson = (c: FakeChannel) => ({ ...c, guild_id: guildId });
 
 	async function handle(req: Request): Promise<Response> {
@@ -123,15 +121,6 @@ export function startFakeDiscordRest(opts: { token?: string } = {}): FakeDiscord
 				if (member[1] !== botUserId && member[1] !== "@me") return error(404, 10007, "Unknown Member");
 				return json({ user: { id: botUserId, username: "askbot" }, roles: fake.botRoles, joined_at: new Date(0).toISOString() });
 			}
-			if (req.method === "POST" && rest === "/channels") {
-				const parentId = typeof body?.parent_id === "string" ? body.parent_id : undefined;
-				const parent = parentId ? fake.channels.get(parentId) : undefined;
-				const permissions = parent ? channelPermissions(guildData(), memberData(), parent.permission_overwrites) : basePermissions(guildData(), memberData());
-				if (!(permissions & PermissionFlagsBits.ManageChannels)) return error(403, 50013, "Missing Permissions");
-				const created = fake.addChannel({ name: String(body?.name), parentId });
-				created.topic = typeof body?.topic === "string" ? body.topic : null;
-				return json(channelJson(created), 201);
-			}
 		}
 
 		if ((m = /^\/channels\/([^/]+)(\/messages)?$/.exec(path))) {
@@ -143,11 +132,6 @@ export function startFakeDiscordRest(opts: { token?: string } = {}): FakeDiscord
 				return json({ id: id(), channel_id: channel.id, content: body?.content });
 			}
 			if (req.method === "GET") return json(channelJson(channel));
-			if (req.method === "PATCH") {
-				if (typeof body?.name === "string") channel.name = body.name;
-				if (typeof body?.topic === "string") channel.topic = body.topic;
-				return json(channelJson(channel));
-			}
 		}
 		return error(404, 0, "404: Not Found");
 	}

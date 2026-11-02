@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { listOmpAssets, MAX_ASSET_BYTES, type OmpAssetKind, parseOmpAsset, removeOmpAsset, saveOmpAsset, skillsBundle } from "../../src/orchestrator/store/ompAssets";
 
-const REVIEWER = "---\nname: reviewer\ndescription: Reviews a diff\n---\nLook closely.\n";
+const REVIEWER = "---\nname: reviewer\ndescription: Researches a question\ntools: web_search\n---\nLook closely.\n";
 
 let dir: string;
 beforeEach(() => {
@@ -36,11 +36,9 @@ describe("omp assets", () => {
 
 	const REJECTIONS: [string, OmpAssetKind, string, string, string][] = [
 		["no frontmatter", "skill", "a.md", "# Title\n", "no YAML frontmatter"],
-		["missing description", "agent", "a.md", "---\nname: a\n---\n", "description"],
+		["missing description", "agent", "a.md", "---\nname: a\ntools: web_search\n---\n", "description"],
 		["traversal name", "skill", "a.md", "---\nname: ../evil\ndescription: x\n---\n", '"../evil"'],
-		["uppercase name", "agent", "a.md", "---\nname: Big\ndescription: x\n---\n", '"Big"'],
-		["reserved agent name main", "agent", "main.md", "---\nname: main\ndescription: x\n---\n", "reserved"],
-		["reserved agent name sub", "agent", "x.md", "---\nname: sub\ndescription: x\n---\n", "reserved"],
+		["uppercase name", "agent", "a.md", "---\nname: Big\ndescription: x\ntools: web_search\n---\n", '"Big"'],
 		["non-markdown file", "skill", "a.txt", "---\nname: a\ndescription: x\n---\n", "a.txt"],
 		["oversized file", "skill", "a.md", "---\nname: a\ndescription: x\n---\n".padEnd(MAX_ASSET_BYTES + 1, "x"), "256 KiB"],
 	];
@@ -57,20 +55,60 @@ describe("omp assets", () => {
 		expect(parseOmpAsset("skill", "SKILL.md", "---\nname: main\ndescription: x\n---\n").name).toBe("main");
 	});
 
-	test("listing reports entries omp would skip", async () => {
+	test("listing shows broken entries with the reason (AGT-25)", async () => {
 		await saveOmpAsset(dir, "skill", "SKILL.md", "---\nname: good\ndescription: Fine\n---\n");
+		await saveOmpAsset(dir, "agent", "reviewer.md", REVIEWER);
 		mkdirSync(join(dir, "skills", "empty"));
-		mkdirSync(join(dir, "agents"), { recursive: true });
 		writeFileSync(join(dir, "agents", "broken.md"), "no frontmatter here\n");
+		writeFileSync(join(dir, "agents", "shell.md"), "---\nname: shell\ndescription: Runs commands\ntools: bash\n---\n");
 		writeFileSync(join(dir, "agents", "readme.txt"), "ignored");
 		expect(await listOmpAssets(dir)).toEqual({
 			skills: [{ name: "empty", problem: "No SKILL.md in this folder." }, { name: "good", description: "Fine" }],
-			agents: [{ name: "broken", problem: 'Missing "name" or "description" in frontmatter.' }],
+			agents: [
+				{ name: "broken", problem: 'frontmatter needs a string "name" and a non-empty "description".' },
+				{ name: "reviewer", description: "Researches a question" },
+				{ name: "shell", description: "Runs commands", problem: '"tools" may not include bash (allowed: web_search).' },
+			],
 		});
 	});
 
 	test("listing a missing directory is empty", async () => {
 		expect(await listOmpAssets(join(dir, "nope"))).toEqual({ skills: [], agents: [] });
+	});
+});
+
+describe("agent uploads (AGT-25)", () => {
+	const agent = (fields: string) => `---\nname: helper\ndescription: Helps\n${fields}---\nBody.\n`;
+	const REFUSED: [string, string, string, number][] = [
+		["a tool outside the allowlist", agent("tools: bash\n"), '"tools" may not include bash (allowed: web_search)', 4],
+		["an allowed tool next to a refused one", agent("tools: [web_search, read]\n"), '"tools" may not include read', 4],
+		["task in tools", agent("tools: web_search, task\n"), '"task" is not allowed in "tools"', 4],
+		["any spawns value", agent("tools: web_search\nspawns: researcher\n"), '"spawns" is not allowed', 5],
+		["spawns: *", agent('tools: web_search\nspawns: "*"\n'), '"spawns" is not allowed', 5],
+		["advisor", agent("tools: web_search\nadvisor: true\n"), '"advisor" is not allowed', 5],
+		["prewalk", agent("tools: web_search\nprewalk: some/model\n"), '"prewalk" is not allowed', 5],
+		["missing tools", agent(""), '"tools" is required', 1],
+		["empty tools", agent("tools: []\n"), '"tools" must name at least one tool', 4],
+		["reserved name main", "---\nname: main\ndescription: x\ntools: web_search\n---\n", "reserved", 2],
+		["reserved name sub", "---\nname: sub\ndescription: x\ntools: web_search\n---\n", "reserved", 2],
+	];
+	for (const [what, content, message, line] of REFUSED) {
+		test(`refuses ${what}, stores nothing and points at the line`, async () => {
+			const refusal = await saveOmpAsset(dir, "agent", "helper.md", content).catch(err => err as Error & { line?: number });
+			expect(refusal).toBeInstanceOf(Error);
+			expect((refusal as Error).message).toContain(message);
+			expect((refusal as { line?: number }).line).toBe(line);
+			expect(readdirSync(dir)).toEqual([]);
+		});
+	}
+
+	test("tools may be a YAML list or a comma-separated string of allowed tools", async () => {
+		expect((await saveOmpAsset(dir, "agent", "a.md", agent("tools:\n  - web_search\n"))).name).toBe("helper");
+		expect((await saveOmpAsset(dir, "agent", "a.md", agent("tools: Web_Search\n"))).replaced).toBe(true);
+	});
+
+	test("skills need no tools", () => {
+		expect(parseOmpAsset("skill", "SKILL.md", "---\nname: s\ndescription: x\n---\n").name).toBe("s");
 	});
 });
 
@@ -120,7 +158,7 @@ describe("skillsBundle", () => {
 		await populate(dir);
 		const first = await skillsBundle(dir);
 		expect(await skillsBundle(dir)).toBe(first);
-		await saveOmpAsset(dir, "agent", "other.md", "---\nname: other\ndescription: Another\n---\n");
+		await saveOmpAsset(dir, "agent", "other.md", "---\nname: other\ndescription: Another\ntools: web_search\n---\n");
 		const second = await skillsBundle(dir);
 		expect(second.hash).not.toBe(first.hash);
 		expect(Object.keys(await extract(second.tar))).toContain("agents/other.md");

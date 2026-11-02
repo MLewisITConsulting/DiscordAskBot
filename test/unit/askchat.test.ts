@@ -3,9 +3,11 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Actor, InAttachment } from "../../src/orchestrator/discord/surface";
 import { createFakeDispatcher, type FakeDispatcher, type FakeRunScript } from "../../src/orchestrator/dispatch/fake";
-import { ANSWER_TRUNCATED, type AskChat, createAskChat, deliveryMessages, SWEPT_NOTE, truncateUtf8 } from "../../src/orchestrator/engine/chat";
+import { OOM_WARNING } from "../../src/orchestrator/discord/render";
+import { ANSWER_TRUNCATED, type AskChat, createAskChat, deliveryMessages, NOTHING_RUNNING, SWEPT_NOTE, truncateUtf8 } from "../../src/orchestrator/engine/chat";
 import { runUiKey } from "../../src/orchestrator/store/runUi";
 import { MAX_INPUT_BYTES, scratchPaths } from "../../src/orchestrator/store/scratch";
+import { latestLoadout } from "../../src/orchestrator/store/stats";
 import type { FakeMessage } from "../fakes/discord";
 import { ALLOWED_USER, createEngineHarness, type EngineHarness } from "../fakes/engine";
 
@@ -15,6 +17,8 @@ interface Ask {
 	dispatcher: FakeDispatcher;
 	askChannel: string;
 	scratchRoot: string;
+	/** The admin's skills and agents (AGT-24). */
+	ompDir: string;
 	allowed: Actor;
 	stranger: Actor;
 	/** Downloadable attachment bodies by URL. */
@@ -27,7 +31,7 @@ let current: Ask | undefined;
 
 afterEach(async () => {
 	if (!current) return;
-	await current.chat.stop();
+	await current.chat.detach();
 	await current.h.stop();
 	current = undefined;
 });
@@ -35,12 +39,13 @@ afterEach(async () => {
 async function setup(opts: { limits?: Record<string, unknown> } = {}): Promise<Ask> {
 	const dispatcher = createFakeDispatcher();
 	const h = await createEngineHarness({ dispatcher, config: opts.limits ? { limits: opts.limits } : {} });
-	const ask = h.discord.addChannel({ name: "ask", guildId: "g1" });
 	const files = new Map<string, string>();
 	const scratchRoot = join(h.stateDir, "scratch");
+	const ompDir = join(h.stateDir, "omp");
 	const make = () =>
 		createAskChat(h.deps, {
 			scratchRoot,
+			ompDir,
 			fetch: async url => (files.has(url) ? new Response(files.get(url)) : new Response("missing", { status: 404 })),
 		});
 	let chat = make();
@@ -53,8 +58,9 @@ async function setup(opts: { limits?: Record<string, unknown> } = {}): Promise<A
 		h,
 		chat,
 		dispatcher,
-		askChannel: ask.id,
+		askChannel: h.askChannelId,
 		scratchRoot,
+		ompDir,
 		allowed: h.discord.actor(ALLOWED_USER, { username: "alice" }),
 		stranger: h.discord.actor("u-stranger", { username: "mallory" }),
 		files,
@@ -144,7 +150,7 @@ describe("/ask (CHAT-07, CHAT-08)", () => {
 		const a = await setup();
 		a.files.set("u1", "alpha");
 		a.files.set("u2", "beta");
-		a.dispatcher.once({ kind: "ask" }, { output: { answer: "# Hi" } });
+		a.dispatcher.once({ profile: "ask" }, { output: { answer: "# Hi" } });
 		const { threadId, emitted } = await ask(a, "What is in these?", {
 			actor: a.stranger,
 			attachments: [
@@ -169,14 +175,12 @@ describe("/ask (CHAT-07, CHAT-08)", () => {
 
 		const run = a.dispatcher.runs[0]!;
 		expect(run.req).toMatchObject({
-			owner: { kind: "chat", threadId: id },
-			kind: "ask",
+			threadId: id,
 			profile: "ask",
 			session: `chat-${id}`,
 			resume: false,
-			threadId: id,
 			scratchDir: paths.root,
-			limits: { minutes: 20, costUsd: a.h.deps.config.limits.maxCostUsdPerJob },
+			limits: { minutes: 20, costUsd: a.h.deps.config.limits.maxCostUsdPerTurn },
 		});
 		expect(run.req.prompt).toContain("What is in these?");
 		expect(run.req.prompt).toContain("- inputs/a.txt\n- inputs/we ird_.txt");
@@ -185,7 +189,7 @@ describe("/ask (CHAT-07, CHAT-08)", () => {
 
 	test("delivers answer.md and the produced files, then Done with ✅ on the top message", async () => {
 		const a = await setup();
-		a.dispatcher.once({ kind: "ask" }, { output: { answer: "Here you go" }, outputFiles: { "report.csv": "a,b\n1,2" }, steps: [{ todos: [{ content: "Write it", status: "in_progress" }] }] });
+		a.dispatcher.once({ profile: "ask" }, { output: { answer: "Here you go" }, outputFiles: { "report.csv": "a,b\n1,2" } });
 		const { threadId } = await ask(a, "Make a CSV");
 		await done(a, threadId!);
 		const answer = posted(a, threadId!, "📄 **Answer attached:**")!;
@@ -193,61 +197,71 @@ describe("/ask (CHAT-07, CHAT-08)", () => {
 		expect(decode(answer.files[0]!.data)).toBe("Here you go");
 		const file = posted(a, threadId!, "📎")!;
 		expect(file.files.map(f => [f.name, decode(f.data)])).toEqual([["report.csv", "a,b\n1,2"]]);
-		expect(posted(a, threadId!, "📝")?.content).toContain("✅ Write it");
 		expect(topIcon(a, threadId!)).toBe("✅");
-		expect(a.h.db.getChat(threadId!)?.session_file).toBe(`chat-${threadId}`);
-		expect(a.h.db.kvGet(runUiKey({ kind: "chat", threadId: threadId! }))).toBeUndefined();
+		expect(a.h.db.getAskChat(threadId!)?.session_file).toBe(`chat-${threadId}`);
+		expect(a.h.db.kvGet(runUiKey(threadId!))).toBeUndefined();
 	});
 
 	test("produced files are delivered when the run fails or stops at a limit (CHAT-05, CHAT-10)", async () => {
 		const a = await setup();
-		a.dispatcher.once({ kind: "ask" }, { error: "model exploded", outputFiles: { "partial.txt": "half" } });
+		a.dispatcher.once({ profile: "ask" }, { error: "model exploded", outputFiles: { "partial.txt": "half" } });
 		const failed = (await ask(a, "Try")).threadId!;
 		await until(() => !!posted(a, failed, "❌ **Failed:**"), "the failure message");
 		expect(posted(a, failed, "❌ **Failed:**")!.content).toContain("model exploded");
 		expect(posted(a, failed, "📎")!.files.map(f => f.name)).toEqual(["partial.txt"]);
 		expect(topIcon(a, failed)).toBe("❌");
 
-		a.dispatcher.once({ kind: "ask" }, { aborted: "time", outputFiles: { "draft.md": "wip" } });
+		a.dispatcher.once({ profile: "ask" }, { aborted: "time", outputFiles: { "draft.md": "wip" } });
 		const limited = (await ask(a, "Long one")).threadId!;
 		await until(() => !!posted(a, limited, "⚠️ **Stopped at the 20 minute time limit**"), "the limit message");
 		expect(posted(a, limited, "📎")!.files.map(f => f.name)).toEqual(["draft.md"]);
 		expect(posted(a, limited, "📄")).toBeUndefined();
 		await until(() => topIcon(a, limited) === "⚠️", "⚠️ top icon");
 	});
+
+	test("the prompt names `task` only when a valid agent is installed; skills are always mentioned (AGT-13, AGT-31)", async () => {
+		const a = await setup({ limits: { maxChatSessions: 5 } });
+		const agent = (name: string, tools: string) =>
+			Bun.write(join(a.ompDir, "agents", `${name}.md`), `---\nname: ${name}\ndescription: Looks things up\ntools: ${tools}\n---\nYou research.\n`);
+		const promptOf = async (question: string) => {
+			const id = (await ask(a, question)).threadId!;
+			await done(a, id);
+			return a.dispatcher.runs.find(r => r.req.threadId === id)!.req.prompt;
+		};
+
+		const none = await promptOf("No agents");
+		expect(none).toContain("skill://<name>");
+		expect(none).not.toContain("`task`");
+
+		// An agent the worker would skip (AGT-25: tools outside the allowlist) does not count.
+		await agent("shell", "bash");
+		expect(await promptOf("Invalid agent only")).not.toContain("`task`");
+
+		await agent("researcher", "web_search");
+		const valid = await promptOf("A valid agent");
+		expect(valid).toContain("`task`");
+		expect(valid).toContain("skill://<name>");
+	});
 });
 
 describe("admission (CHAT-04, DSC-06)", () => {
 	test("capacity: maxChatSessions active chats refuse a new /ask", async () => {
 		const a = await setup({ limits: { maxChatSessions: 1 } });
-		a.dispatcher.script({ kind: "ask" }, { hold: true });
+		a.dispatcher.script({ profile: "ask" }, { hold: true });
 		const first = await ask(a, "One");
 		await until(() => a.dispatcher.runs.length === 1, "first run");
 		const second = await ask(a, "Two", { actor: a.h.discord.actor("u-other", { username: "bob" }) });
 		expect(second.emitted.responses.at(-1)?.msg?.content).toBe("Chat capacity reached; try again shortly.");
 		expect(second.threadId).toBeUndefined();
-		a.dispatcher.run({ kind: "chat", threadId: first.threadId! })!.finish();
+		a.dispatcher.run(first.threadId!)!.finish();
 		await done(a, first.threadId!);
-	});
-
-	test("capacity is shared: a slot held by another feature refuses /ask before any thread exists", async () => {
-		const a = await setup({ limits: { maxChatSessions: 1 } });
-		const gate = Promise.withResolvers<void>();
-		void a.h.deps.chatSlots.track("plan:t-1", gate.promise);
-		const refused = await ask(a, "One");
-		expect(refused.emitted.responses.at(-1)?.msg?.content).toBe("Chat capacity reached; try again shortly.");
-		expect(refused.threadId).toBeUndefined();
-		gate.resolve();
-		await gate.promise;
-		const accepted = (await ask(a, "Two")).threadId!;
-		await done(a, accepted);
 	});
 
 	test("a non-allowed user has one live run across threads; allowed members are not limited", async () => {
 		const a = await setup({ limits: { maxChatSessions: 5 } });
-		a.dispatcher.script({ kind: "ask" }, { hold: true });
+		a.dispatcher.script({ profile: "ask" }, { hold: true });
 		const mine = (await ask(a, "First", { actor: a.stranger })).threadId!;
-		await until(() => a.dispatcher.hasUnfinishedRun({ kind: "chat", threadId: mine }), "the stranger's run");
+		await until(() => a.dispatcher.hasUnfinishedRun(mine), "the stranger's run");
 		const refused = await ask(a, "Second", { actor: a.stranger });
 		expect(refused.emitted.responses.at(-1)?.msg?.content).toBe(`You already have a request running in <#${mine}>; wait for it to finish.`);
 		await ask(a, "Mine", { actor: a.allowed });
@@ -257,7 +271,7 @@ describe("admission (CHAT-04, DSC-06)", () => {
 
 	test("a follow-up while the run is still starting is refused", async () => {
 		const a = await setup();
-		a.dispatcher.once({ kind: "ask" }, { hold: true, registerAt: null });
+		a.dispatcher.once({ profile: "ask" }, { hold: true, registerAt: null });
 		const id = (await ask(a, "Slow start")).threadId!;
 		await until(() => a.dispatcher.runs.length === 1, "run");
 		await a.h.discord.emitMessage({ channelId: id, content: "hello?", actor: a.allowed });
@@ -269,7 +283,7 @@ describe("admission (CHAT-04, DSC-06)", () => {
 describe("follow-ups (CHAT-03, DSC-06)", () => {
 	test("steer the live run (👀), ignore strangers, then resume the session in a new run", async () => {
 		const a = await setup();
-		a.dispatcher.once({ kind: "ask" }, { hold: true });
+		a.dispatcher.once({ profile: "ask" }, { hold: true });
 		const id = (await ask(a, "Start")).threadId!;
 		await until(() => a.dispatcher.runs[0]?.registered === true, "registered run");
 		const run = a.dispatcher.runs[0]!;
@@ -291,14 +305,14 @@ describe("follow-ups (CHAT-03, DSC-06)", () => {
 		await a.h.discord.emitMessage({ channelId: id, content: "and now?", actor: a.allowed });
 		await until(() => a.dispatcher.runs.length === 2, "the resumed run");
 		const next = a.dispatcher.runs[1]!;
-		expect(next.req).toMatchObject({ session: `chat-${id}`, resume: true, owner: { kind: "chat", threadId: id } });
+		expect(next.req).toMatchObject({ threadId: id, session: `chat-${id}`, resume: true });
 		expect(next.req.prompt).toContain("and now?");
 		expect(next.req.prompt).not.toContain(SWEPT_NOTE);
 	});
 
 	test("a non-allowed starter may follow up in their own thread; a stranger's attachment is ignored (DSC-06)", async () => {
 		const a = await setup();
-		a.dispatcher.once({ kind: "ask" }, { hold: true });
+		a.dispatcher.once({ profile: "ask" }, { hold: true });
 		const id = (await ask(a, "Start", { actor: a.stranger })).threadId!;
 		await until(() => a.dispatcher.runs[0]?.registered === true, "registered run");
 		const run = a.dispatcher.runs[0]!;
@@ -318,7 +332,7 @@ describe("follow-ups (CHAT-03, DSC-06)", () => {
 
 	test("a steer the run ends before reading gets ⏳, then Not delivered", async () => {
 		const a = await setup();
-		a.dispatcher.once({ kind: "ask" }, { hold: true, steerResult: "queued" });
+		a.dispatcher.once({ profile: "ask" }, { hold: true, steerResult: "queued" });
 		const id = (await ask(a, "Start")).threadId!;
 		await until(() => a.dispatcher.runs[0]?.registered === true, "registered run");
 		const e = await a.h.discord.emitMessage({ channelId: id, content: "wait", actor: a.allowed });
@@ -329,23 +343,94 @@ describe("follow-ups (CHAT-03, DSC-06)", () => {
 	});
 });
 
-describe("/work cancel (requirements §20 item 2)", () => {
-	test("stops the live run, which posts Stopped; with nothing running it says so", async () => {
+describe("/stop (DSC-39, CHAT-05)", () => {
+	test("stops the live run, which posts Stopped; with nothing running it changes nothing", async () => {
 		const a = await setup();
-		a.dispatcher.once({ kind: "ask" }, { hold: true });
+		a.dispatcher.once({ profile: "ask" }, { hold: true });
 		const id = (await ask(a, "Stop me")).threadId!;
 		await until(() => a.dispatcher.runs[0]?.registered === true, "registered run");
-		expect(await a.chat.cancel(id, "@alice")).toBe("Stopping the current run (requested by @alice)…");
+		expect(await a.chat.stop(id, "@alice")).toBe("Stopping…");
+		// A double click finds the same run stopping (NFR-05).
+		expect(await a.chat.stop(id, "@alice")).toBe("Stopping…");
 		await until(() => !!posted(a, id, "⏹️ **Stopped.**"), "Stopped message");
 		expect(a.dispatcher.runs[0]!.aborted).toBe("user");
-		expect(await a.chat.cancel(id, "@alice")).toBe("Nothing is running in this chat.");
+		expect(topIcon(a, id)).toBe("⏹️");
+		const before = thread(a, id).length;
+		expect(await a.chat.stop(id, "@alice")).toBe(NOTHING_RUNNING);
+		await a.h.discord.settled();
+		expect(thread(a, id)).toHaveLength(before);
+		expect(a.dispatcher.runs).toHaveLength(1);
 	});
 
-	test("undefined outside ask threads", async () => {
+	test("a stop before the run registered aborts it as soon as it does", async () => {
 		const a = await setup();
-		expect(await a.chat.cancel("nope", "@alice")).toBeUndefined();
-		a.h.db.insertChat("repo-thread", "o/r");
-		expect(await a.chat.cancel("repo-thread", "@alice")).toBeUndefined();
+		const gate = Promise.withResolvers<void>();
+		a.dispatcher.once({ profile: "ask" }, { registerAt: 1, steps: [{ until: gate.promise }], hold: true });
+		const id = (await ask(a, "Slow")).threadId!;
+		await until(() => a.dispatcher.runs.length === 1, "run");
+		expect(await a.chat.stop(id, "@alice")).toBe("Stopping…");
+		gate.resolve();
+		await until(() => !!posted(a, id, "⏹️ **Stopped.**"), "Stopped message");
+		expect(a.dispatcher.runs[0]!.aborted).toBe("user");
+	});
+
+	test("ownerOf names the starter of ask threads only", async () => {
+		const a = await setup();
+		const id = (await ask(a, "Hi", { actor: a.stranger })).threadId!;
+		await done(a, id);
+		expect(a.chat.ownerOf(id)).toBe("u-stranger");
+		expect(a.chat.ownerOf(a.askChannel)).toBeUndefined();
+	});
+});
+
+describe("usage (OBS-05, OBS-06, AGT-19)", () => {
+	const rows = (a: Ask) =>
+		a.h.db.raw
+			.query<{ thread_id: string; channel_id: string; user_id: string; outcome: string; oom_kills: number; cost_usd: number }, []>(
+				"SELECT thread_id, channel_id, user_id, outcome, oom_kills, cost_usd FROM agent_runs ORDER BY id",
+			)
+			.all();
+
+	test("every turn records its usage with the ask channel, the user and how it ended", async () => {
+		const a = await setup({ limits: { maxChatSessions: 5 } });
+		a.dispatcher.once({ profile: "ask" }, { usage: { costUsd: 0.5 } });
+		const finished = (await ask(a, "One")).threadId!;
+		await done(a, finished);
+		a.dispatcher.once({ profile: "ask" }, { aborted: "cost" });
+		const limited = (await ask(a, "Two")).threadId!;
+		await until(() => !!posted(a, limited, "⚠️ **Stopped at the $15 cost limit**"), "limit message");
+		a.dispatcher.once({ profile: "ask" }, { error: "boom" });
+		const failed = (await ask(a, "Three", { actor: a.stranger })).threadId!;
+		await until(() => !!posted(a, failed, "❌ **Failed:**"), "failure");
+		await until(() => rows(a).length === 3, "three usage rows");
+		expect(rows(a)).toEqual([
+			{ thread_id: finished, channel_id: a.askChannel, user_id: ALLOWED_USER, outcome: "finished", oom_kills: 0, cost_usd: 0.5 },
+			expect.objectContaining({ thread_id: limited, outcome: "limit" }),
+			expect.objectContaining({ thread_id: failed, user_id: "u-stranger", outcome: "failed" }),
+		]);
+	});
+
+	test("an out-of-memory turn says so in its answer message and records the count", async () => {
+		const a = await setup();
+		a.dispatcher.once({ profile: "ask" }, { oomKills: 2, output: { answer: "Partial" } });
+		const id = (await ask(a, "Big")).threadId!;
+		await done(a, id);
+		expect(posted(a, id, "📄")!.content).toBe(`📄 **Answer attached:** \`answer.md\`\n${OOM_WARNING}`);
+		expect(rows(a)[0]).toMatchObject({ outcome: "finished", oom_kills: 2 });
+	});
+
+	test("the loadout is stored for the status page (AGT-27)", async () => {
+		const a = await setup();
+		const loadout = { capturedAt: "2026-01-01T00:00:00.000Z", profile: "ask" as const, tools: ["web_search", "yield"], skills: [], agents: [] };
+		// The worker reports the loadout once the session exists (AGT-27); the fake dispatcher has no such step.
+		const runAgent = a.dispatcher.runAgent.bind(a.dispatcher);
+		a.dispatcher.runAgent = (req, hooks, signal) => {
+			hooks.onLoadout?.(loadout);
+			return runAgent(req, hooks, signal);
+		};
+		const id = (await ask(a, "Hi")).threadId!;
+		await done(a, id);
+		expect(latestLoadout(a.h.db)).toEqual(loadout);
 	});
 });
 
@@ -360,10 +445,10 @@ describe("idle sweep (CHAT-06, CHAT-11)", () => {
 
 		await a.chat.sweepIdle();
 		expect(existsSync(root)).toBe(true);
-		a.h.db.updateChat(id, { last_active_at: "2000-01-01T00:00:00.000Z" });
+		a.h.db.updateAskChat(id, { last_active_at: "2000-01-01T00:00:00.000Z" });
 		await a.chat.sweepIdle();
 		expect(existsSync(root)).toBe(false);
-		expect(a.h.db.getChat(id)).toMatchObject({ worktree: null, session_file: `chat-${id}` });
+		expect(a.h.db.getAskChat(id)).toMatchObject({ scratch_dir: null, session_file: `chat-${id}` });
 
 		await a.h.discord.emitMessage({ channelId: id, content: "again", actor: a.allowed });
 		await until(() => a.dispatcher.runs.length === 2, "the follow-up run");
@@ -374,33 +459,31 @@ describe("idle sweep (CHAT-06, CHAT-11)", () => {
 
 	test("never removes a chat with a live run", async () => {
 		const a = await setup();
-		a.dispatcher.once({ kind: "ask" }, { hold: true });
+		a.dispatcher.once({ profile: "ask" }, { hold: true });
 		const id = (await ask(a, "Busy")).threadId!;
 		await until(() => a.dispatcher.runs.length === 1, "run");
-		a.h.db.updateChat(id, { last_active_at: "2000-01-01T00:00:00.000Z" });
+		a.h.db.updateAskChat(id, { last_active_at: "2000-01-01T00:00:00.000Z" });
 		await a.chat.sweepIdle();
 		expect(existsSync(scratchPaths(a.scratchRoot, id).root)).toBe(true);
 	});
 });
 
 describe("restart (RUN-14)", () => {
-	test("a re-attached chat keeps editing the same status and to-do messages", async () => {
+	test("a re-attached chat keeps editing the same status message", async () => {
 		const a = await setup();
 		const gate = Promise.withResolvers<void>();
-		const todos: FakeRunScript["steps"] = [{ todos: [{ content: "Look it up", status: "in_progress" }] }, { progress: { tool: "web_search", intent: "Searching" } }, { until: gate.promise }];
-		a.dispatcher.once({ kind: "ask" }, { steps: todos, output: { answer: "Found it" } });
+		const steps: FakeRunScript["steps"] = [{ progress: { tool: "web_search", intent: "Searching" } }, { until: gate.promise }];
+		a.dispatcher.once({ profile: "ask" }, { steps, output: { answer: "Found it" } });
 		const id = (await ask(a, "Find it")).threadId!;
-		await until(() => !!posted(a, id, "📝"), "the to-do message");
+		await until(() => !!posted(a, id, "🛠️ **Answering**") && a.dispatcher.runs[0]?.registered === true, "the status message");
 		await a.h.discord.settled();
 		const status = posted(a, id, "🛠️ **Answering**")!;
-		const todo = posted(a, id, "📝")!;
-		const owner = { kind: "chat" as const, threadId: id };
-		await until(() => a.h.db.kvGet(runUiKey(owner))?.includes(todo.id) === true, "stored run UI state");
+		await until(() => a.h.db.kvGet(runUiKey(id))?.includes(status.id) === true, "stored run UI state");
 
 		// Engine restart: the old instance detaches (the run keeps going), a new one re-attaches.
-		await a.chat.stop();
-		expect(a.dispatcher.hasUnfinishedRun(owner)).toBe(true);
-		const restarted = createAskChat(a.h.deps, { scratchRoot: a.scratchRoot });
+		await a.chat.detach();
+		expect(a.dispatcher.hasUnfinishedRun(id)).toBe(true);
+		const restarted = createAskChat(a.h.deps, { scratchRoot: a.scratchRoot, ompDir: a.ompDir });
 		a.use(restarted);
 		restarted.start();
 		await until(() => restarted.active.has(id), "re-attached chat");
@@ -410,29 +493,25 @@ describe("restart (RUN-14)", () => {
 		const statuses = thread(a, id).filter(m => m.content.includes("**Answering**"));
 		expect(statuses.map(m => m.id)).toEqual([status.id]);
 		expect(statuses[0]!.content).toStartWith("✅ **Answering**");
-		const lists = thread(a, id).filter(m => m.content.startsWith("📝"));
-		expect(lists.map(m => m.id)).toEqual([todo.id]);
-		expect(lists[0]!.content).toContain("✅ Look it up");
 		expect(a.dispatcher.calls.filter(c => c.attached)).toHaveLength(1);
-		expect(a.h.db.kvGet(runUiKey(owner))).toBeUndefined();
+		expect(a.h.db.kvGet(runUiKey(id))).toBeUndefined();
 	});
 
 	test("a deleted status message is posted anew and its id stored", async () => {
 		const a = await setup();
 		const gate = Promise.withResolvers<void>();
-		a.dispatcher.once({ kind: "ask" }, { steps: [{ until: gate.promise }] });
+		a.dispatcher.once({ profile: "ask" }, { steps: [{ until: gate.promise }] });
 		const id = (await ask(a, "Hold on")).threadId!;
 		// The run must exist before the engine stops, or the turn never started.
 		await until(() => a.dispatcher.runs[0]?.registered === true && !!posted(a, id, "🛠️ **Answering**"), "status message and run");
 		const status = posted(a, id, "🛠️ **Answering**")!;
-		await a.chat.stop();
+		await a.chat.detach();
 		a.h.discord.deleteMessage({ channelId: id, messageId: status.id });
-		const restarted = createAskChat(a.h.deps, { scratchRoot: a.scratchRoot });
+		const restarted = createAskChat(a.h.deps, { scratchRoot: a.scratchRoot, ompDir: a.ompDir });
 		a.use(restarted);
 		restarted.start();
-		const owner = { kind: "chat" as const, threadId: id };
 		await until(() => {
-			const stored = a.h.db.kvGet(runUiKey(owner));
+			const stored = a.h.db.kvGet(runUiKey(id));
 			return !!stored && !stored.includes(status.id);
 		}, "the new status id stored");
 		gate.resolve();

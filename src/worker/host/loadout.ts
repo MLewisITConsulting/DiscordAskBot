@@ -1,13 +1,14 @@
-import { homedir } from "node:os";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent";
-import { discoverAgents } from "@oh-my-pi/pi-coding-agent/task/discovery";
 import type { AgentProfile, Loadout } from "../../shared/agent";
-import type { McpConnection } from "../../shared/ompconfig";
+import type { ValidAgent } from "./agents";
 
-/** What one agent session actually had loaded when it started (AGT-27). */
+/**
+ * What one agent session actually had loaded when it started (AGT-27). The agents are the session's `spawns` allowlist
+ * (the worker's valid agents, AGT-31), not omp's discovery, which also lists its bundled agents (spike A2).
+ */
 export async function captureLoadout(
-	session: AgentSession,
-	opts: { cwd: string; ompDir: string; profile: AgentProfile; mcp?: McpConnection; disabledAgents?: readonly string[] },
+	session: Pick<AgentSession, "getActiveToolNames" | "skills">,
+	opts: { agents: readonly ValidAgent[]; profile: AgentProfile; disabledAgents?: readonly string[] },
 ): Promise<Loadout> {
 	const tools = session.getActiveToolNames().sort();
 	const skills = session.skills
@@ -17,39 +18,11 @@ export async function captureLoadout(
 	let agents: Loadout["agents"] = [];
 	if (tools.includes("task")) {
 		const disabled = opts.disabledAgents ?? [];
-		// Sessions run with extension discovery off and the downloaded skills dir as the only explicit root (AGT-24);
-		// agent discovery mirrors that. `homedir()` is the run-local HOME the supervisor set.
-		const { agents: found } = await discoverAgents(opts.cwd, homedir(), {
-			explicit: [opts.ompDir],
-			mode: "explicit-only",
-			configured: [],
-			configuredLevel: "user",
-		});
-		agents = found
+		agents = opts.agents
 			.filter(agent => !disabled.includes(agent.name))
-			.map(agent => ({ name: agent.name, source: agent.source, description: agent.description }))
+			.map(agent => ({ name: agent.name, source: "askbot:user", description: agent.description }))
 			.sort((a, b) => a.name.localeCompare(b.name));
 	}
 
-	const mcp: Loadout["mcp"] = [];
-	if (opts.mcp) {
-		const { manager, errors } = opts.mcp;
-		const toolsByServer: Record<string, string[]> = {};
-		for (const tool of manager.getTools()) {
-			// MCP bridge tools carry their server name (`MCPTool`/`DeferredMCPTool.mcpServerName`).
-			const server = "mcpServerName" in tool && typeof tool.mcpServerName === "string" ? tool.mcpServerName : "?";
-			(toolsByServer[server] ??= []).push(tool.name);
-		}
-		for (const server of manager.getAllServerNames().sort()) {
-			const status = manager.getConnectionStatus(server);
-			mcp.push({
-				server,
-				status: status === "connected" ? "connected" : status === "connecting" ? "pending" : "failed",
-				...(errors[server] ? { error: errors[server] } : {}),
-				tools: (toolsByServer[server] ?? []).sort(),
-			});
-		}
-	}
-
-	return { capturedAt: new Date().toISOString(), profile: opts.profile, tools, skills, agents, mcp };
+	return { capturedAt: new Date().toISOString(), profile: opts.profile, tools, skills, agents };
 }

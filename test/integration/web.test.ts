@@ -2,13 +2,12 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { Server } from "bun";
 import type { AdminState, EnginePhase, HomeFacts, SettingsSaveResponse, StatusReport, UsageWindow } from "../../src/shared/adminApi";
 import type { Loadout } from "../../src/shared/agent";
-import { parseRepoConfig } from "../../src/orchestrator/dispatch/checkouts";
 import { ConfigError, parseSettings, type Settings } from "../../src/shared/config";
 import { parseOmpConfig } from "../../src/shared/ompconfig";
 import { versionInfo } from "../../src/shared/version";
 import { createAdminClient } from "../../src/web/adminClient";
 import { CONFIG_FIELDS } from "../../src/web/forms";
-import { SAMPLE_OMP, SAMPLE_REPO_CONFIG, SAMPLE_SETTINGS } from "../../src/web/homePage";
+import { SAMPLE_OMP, SAMPLE_SETTINGS } from "../../src/web/homePage";
 import { formatCount, formatDuration, formatUsd, liveView } from "../../src/web/live";
 import { createLoginThrottle, WEB_LOGIN_LIMITS } from "../../src/shared/loginThrottle";
 import { createSessionStore } from "../../src/web/sessions";
@@ -20,7 +19,6 @@ const SETUP_TOKEN = "setup-token-0123456789";
 const USERNAME = "admin";
 const PASSWORD = "correct horse battery";
 const DISCORD_TOKEN = "discord-secret-token-xyz";
-const PRIVATE_KEY = "-----BEGIN RSA PRIVATE KEY-----\nPEMBODYsecretvalue123\n-----END RSA PRIVATE KEY-----";
 const OPENAI_KEY = "sk-openai-secret-value";
 const ORCHESTRATOR_VERSION = "9.9.9-orchestrator";
 const HOUR = 3_600_000;
@@ -68,17 +66,16 @@ function emptyReport(): StatusReport {
 		workers: [],
 		limits: null,
 		warnings: [],
-		issues: { counts: {}, open: [] },
+		activeThreads: [],
 		usage: {
 			window: "7d",
 			totals: { runs: 0, costUsd: 0, tokensIn: 0, tokensOut: 0, cacheRead: 0, cacheWrite: 0 },
-			byKind: [],
-			byRepo: [],
-			jobs: [],
+			byChannel: [],
+			byUser: [],
+			outcomes: { finished: 0, failed: 0, stopped: 0, limit: 0, avgDurationMs: null },
 			daily: [],
-			setup: [],
+			setup: null,
 		},
-		loadouts: [],
 	};
 }
 
@@ -90,7 +87,7 @@ function startStub(): Stub {
 		phase: "setup",
 		report: emptyReport(),
 		failStatus: false,
-		home: { checklist: { setup: false, credentials: false, workChannel: false, watchedRepo: false, modelAccess: false } },
+		home: { checklist: { setup: false, botToken: false, guild: false, allowedUsers: false, askChannel: false, modelAccess: false } },
 		calls: [],
 		stop: async () => {},
 	};
@@ -118,10 +115,10 @@ function startStub(): Stub {
 					version: ORCHESTRATOR_VERSION,
 					phase: stub.phase,
 					runs: { pending: 0, running: 0 },
-					limits: stub.settings ? { maxConcurrentJobs: 2, maxChatSessions: 2, maxConcurrentRuns: 4, workerCapacity: 4, effectiveConcurrency: 4 } : null,
+					limits: stub.settings ? { maxChatSessions: 2, maxConcurrentRuns: 4, workerCapacity: 4, effectiveConcurrency: 2 } : null,
 					warnings: [],
 					// Not part of the health body; must never be relayed.
-					error: "secret failure detail acme/private-repo",
+					error: "secret failure detail guild-1",
 				});
 			}
 			if (req.headers.get("authorization") !== `Bearer ${WEB_TOKEN}`) return fail(401, "unauthorized");
@@ -160,7 +157,7 @@ function startStub(): Stub {
 					const secrets = stub.settings?.secrets;
 					return Response.json({
 						config: stub.settings?.config,
-						secrets: { discordToken: !!secrets?.discordToken, githubAppPrivateKey: !!secrets?.githubAppPrivateKey, providerKeys: Object.keys(secrets?.providerKeys ?? {}) },
+						secrets: { discordToken: !!secrets?.discordToken, providerKeys: Object.keys(secrets?.providerKeys ?? {}) },
 					});
 				}
 				case "PUT /settings": {
@@ -179,7 +176,6 @@ function startStub(): Stub {
 							config: save.config,
 							secrets: {
 								discordToken: save.secrets.discordToken ?? previous?.discordToken,
-								githubAppPrivateKey: save.secrets.githubAppPrivateKey ?? previous?.githubAppPrivateKey,
 								providerKeys,
 							},
 						});
@@ -308,16 +304,14 @@ function pageScript(page: string): string {
 
 const VALID_FORM: Record<string, string> = {
 	"secrets.discordToken": DISCORD_TOKEN,
-	"secrets.githubAppPrivateKey": PRIVATE_KEY,
 	"provider.0.name": "openai",
 	"provider.0.key": OPENAI_KEY,
 	"discord.guildId": "guild-1",
 	"discord.allowedUserIds": "111, 222\n333",
 	"discord.allowedRoleIds": "",
-	"discord.workChannelId": "work-1",
-	"github.appId": "42",
-	"github.pollIntervalSeconds": "",
-	"limits.maxConcurrentJobs": "3",
+	"discord.askChannelIds": "ask-1",
+	"limits.maxChatSessions": "3",
+	"limits.chatIdleMinutes": "",
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -627,7 +621,7 @@ describe("settings (/admin)", () => {
 		const h = start();
 		await setUp(h);
 		const before = await (await h.get("/admin")).text();
-		expect(before.match(/<span class="hint">not set<\/span>/g)?.length).toBe(2);
+		expect(before.match(/<span class="hint">not set<\/span>/g)?.length).toBe(1);
 
 		const save = await h.post("/admin/settings", VALID_FORM);
 		expect(save.status).toBe(303);
@@ -635,19 +629,18 @@ describe("settings (/admin)", () => {
 		expect(h.stub.calls.find(c => c.method === "PUT" && c.path === "/settings")?.admin).toBe(USERNAME);
 
 		const settings = h.stub.settings!;
-		expect(settings.secrets).toEqual({ discordToken: DISCORD_TOKEN, githubAppPrivateKey: PRIVATE_KEY, providerKeys: { openai: OPENAI_KEY } });
+		expect(settings.secrets).toEqual({ discordToken: DISCORD_TOKEN, providerKeys: { openai: OPENAI_KEY } });
 		expect(settings.config.discord.allowedUserIds).toEqual(["111", "222", "333"]);
-		expect(settings.config.discord.workChannelId).toBe("work-1");
-		expect(settings.config.github).toEqual({ appId: 42, pollIntervalSeconds: 60, mentionKeyword: "/askbot" });
-		expect(settings.config.limits.maxConcurrentJobs).toBe(3);
+		expect(settings.config.discord.askChannelIds).toEqual(["ask-1"]);
+		expect(settings.config.limits).toEqual({ maxChatSessions: 3, maxCostUsdPerTurn: 15, chatIdleMinutes: 30 });
 
 		const page = await (await h.get("/admin")).text();
 		expect(page).toContain("Settings saved. Engine is running.");
-		expect(page).toContain('name="discord.workChannelId" value="work-1"');
+		expect(page).toContain('name="discord.askChannelIds" value="ask-1"');
 		expect(page).toContain('name="discord.allowedUserIds" value="111, 222, 333"');
 		expect(page).toContain('value="openai"');
-		expect(page.match(/<span class="hint">set<\/span>/g)?.length).toBe(3);
-		for (const secret of [DISCORD_TOKEN, "PEMBODYsecretvalue123", OPENAI_KEY]) expect(page).not.toContain(secret);
+		expect(page.match(/<span class="hint">set<\/span>/g)?.length).toBe(2);
+		for (const secret of [DISCORD_TOKEN, OPENAI_KEY]) expect(page).not.toContain(secret);
 		// The flash is shown once.
 		expect(await (await h.get("/admin")).text()).not.toContain("Settings saved.");
 	});
@@ -658,8 +651,7 @@ describe("settings (/admin)", () => {
 		await h.post("/admin/settings", VALID_FORM);
 		const res = await h.post("/admin/settings", {
 			...VALID_FORM,
-			"secrets.discordToken": "",
-			"secrets.githubAppPrivateKey": "  ",
+			"secrets.discordToken": "  ",
 			"provider.0.key": "",
 			"provider.1.name": "anthropic",
 			"provider.1.key": "sk-ant",
@@ -668,7 +660,7 @@ describe("settings (/admin)", () => {
 		});
 		expect(res.status).toBe(303);
 		expect(h.stub.lastSave!.secrets).toEqual({ providerKeys: { anthropic: "sk-ant" } });
-		expect(h.stub.settings!.secrets).toEqual({ discordToken: DISCORD_TOKEN, githubAppPrivateKey: PRIVATE_KEY, providerKeys: { openai: OPENAI_KEY, anthropic: "sk-ant" } });
+		expect(h.stub.settings!.secrets).toEqual({ discordToken: DISCORD_TOKEN, providerKeys: { openai: OPENAI_KEY, anthropic: "sk-ant" } });
 
 		await h.post("/admin/settings", { ...VALID_FORM, "secrets.discordToken": "", "provider.0.name": "openai", "provider.0.remove": "on" });
 		expect(h.stub.lastSave!.secrets.providerKeys).toEqual({ openai: "" });
@@ -678,36 +670,36 @@ describe("settings (/admin)", () => {
 	test("optional channel and list fields round-trip", async () => {
 		const h = start();
 		await setUp(h);
-		const form = { ...VALID_FORM, "discord.askChannelIds": "ask-1, ask-2", "discord.watchCategoryId": "cat-1", "logs.maxGiB": "1.5", "workers.maxConcurrentRuns": "" };
+		const form = { ...VALID_FORM, "discord.askChannelIds": "ask-1, ask-2", "models.ask": "anthropic/x", "logs.maxGiB": "1.5", "workers.maxConcurrentRuns": "" };
 		expect((await h.post("/admin/settings", form)).status).toBe(303);
 		const { config } = h.stub.settings!;
 		expect(config.discord.askChannelIds).toEqual(["ask-1", "ask-2"]);
-		expect(config.discord.watchCategoryId).toBe("cat-1");
+		expect(config.models.ask).toBe("anthropic/x");
 		expect(config.logs.maxGiB).toBe(1.5);
 		expect(config.workers.maxConcurrentRuns).toBeUndefined();
 		const page = await (await h.get("/admin")).text();
 		expect(page).toContain('name="discord.askChannelIds" value="ask-1, ask-2"');
-		expect(page).toContain('name="discord.watchCategoryId" value="cat-1"');
+		expect(page).toContain('name="models.ask" value="anthropic/x"');
 		expect(page).toContain('name="logs.maxGiB" value="1.5"');
 	});
 
 	test("a rejected save re-renders the submission with the orchestrator's error and without secrets", async () => {
 		const h = start();
 		await setUp(h);
-		const res = await h.post("/admin/settings", { ...VALID_FORM, "limits.maxConcurrentJobs": "abc", "discord.guildId": "<b>guild" });
+		const res = await h.post("/admin/settings", { ...VALID_FORM, "limits.maxChatSessions": "abc", "discord.guildId": "<b>guild" });
 		expect(res.status).toBe(400);
 		const page = await res.text();
-		expect(page).toContain("Invalid config: limits.maxConcurrentJobs:");
-		expect(page).toContain('name="limits.maxConcurrentJobs" value="abc"');
+		expect(page).toContain("Invalid config: limits.maxChatSessions:");
+		expect(page).toContain('name="limits.maxChatSessions" value="abc"');
 		expect(page).toContain("&lt;b&gt;guild");
 		expect(page).not.toContain("<b>guild");
 		expect(page).toContain('value="openai"');
-		for (const secret of [DISCORD_TOKEN, "PEMBODYsecretvalue123", OPENAI_KEY]) expect(page).not.toContain(secret);
+		for (const secret of [DISCORD_TOKEN, OPENAI_KEY]) expect(page).not.toContain(secret);
 		expect(h.stub.settings).toBeUndefined();
 
-		const clash = await h.post("/admin/settings", { ...VALID_FORM, "discord.askChannelIds": "work-1" });
-		expect(clash.status).toBe(400);
-		expect(await clash.text()).toContain("is already the work channel");
+		const dup = await h.post("/admin/settings", { ...VALID_FORM, "discord.askChannelIds": "ask-1 ask-1" });
+		expect(dup.status).toBe(400);
+		expect(await dup.text()).toContain("duplicate channel ask-1");
 	});
 
 	test("omp.autoUpdate is a checkbox that round-trips, and a rejected save keeps it as submitted", async () => {
@@ -724,7 +716,7 @@ describe("settings (/admin)", () => {
 		expect(h.stub.settings!.config.omp.autoUpdate).toBe(true);
 		expect(box(await (await h.get("/admin")).text())?.[1]).toBe(" checked");
 
-		const rejected = await h.post("/admin/settings", { ...VALID_FORM, "omp.autoUpdate": "true", "limits.maxConcurrentJobs": "abc" });
+		const rejected = await h.post("/admin/settings", { ...VALID_FORM, "omp.autoUpdate": "true", "limits.maxChatSessions": "abc" });
 		expect(rejected.status).toBe(400);
 		expect(box(await rejected.text())?.[1]).toBe(" checked");
 
@@ -737,10 +729,10 @@ describe("settings (/admin)", () => {
 	test("a startup error and warnings are reported with the save", async () => {
 		const h = start();
 		await setUp(h);
-		h.stub.nextSave = { phase: "error", error: "Discord login failed: invalid token", warnings: ["channel work-1 lacks Add Reactions"] };
+		h.stub.nextSave = { phase: "error", error: "Discord login failed: invalid token", warnings: ["channel ask-1 lacks Add Reactions"] };
 		expect((await h.post("/admin/settings", VALID_FORM)).status).toBe(303);
 		const page = await (await h.get("/admin")).text();
-		expect(page).toContain('<div class="error" role="status">Settings saved. Engine is error: Discord login failed: invalid token.<ul><li>channel work-1 lacks Add Reactions</li></ul></div>');
+		expect(page).toContain('<div class="error" role="status">Settings saved. Engine is error: Discord login failed: invalid token.<ul><li>channel ask-1 lacks Add Reactions</li></ul></div>');
 		expect(page).toContain('<span id="status-phase">error</span>');
 	});
 
@@ -768,13 +760,13 @@ describe("settings (/admin)", () => {
 			const tip = new RegExp(`<span class="info" aria-hidden="true">i<span class="tip" id="help-${re(def.name)}" role="tooltip">([^]*?)</span></span>`).exec(page);
 			expect([def.name, tip?.[1]]).toEqual([def.name, expect.stringContaining(`Example: <code>${esc(def.example)}</code>`)]);
 		}
-		expect(page).toMatch(/id="help-github\.pollIntervalSeconds" role="tooltip">[^<]*<span class="tip-line">Example: <code>30<\/code><\/span><span class="tip-line">Default: <code>60<\/code>/);
-		expect(page).toMatch(/id="help-labels\.states\.planning" role="tooltip">[^<]*<span class="tip-line">Example: <code>ai:planning<\/code><\/span><span class="tip-line">Default: <code>&lt;trigger&gt;:planning<\/code>/);
-		for (const name of ["discord.guildId", "discord.workChannelId", "github.appId"]) {
+		expect(page).toMatch(/id="help-limits\.chatIdleMinutes" role="tooltip">[^<]*<span class="tip-line">Example: <code>60<\/code><\/span><span class="tip-line">Default: <code>30<\/code>/);
+		expect(page).toMatch(/id="help-workers\.maxConcurrentRuns" role="tooltip">[^<]*<span class="tip-line">Example: <code>8<\/code><\/span><span class="tip-line">Default: <code>worker capacity<\/code>/);
+		for (const name of ["discord.guildId", "discord.allowedUserIds"]) {
 			const tip = new RegExp(`id="help-${re(name)}" role="tooltip">([^]*?)</span></span>`).exec(page);
 			expect([name, tip?.[1]]).toEqual([name, expect.not.stringContaining("Default:")]);
 		}
-		for (const id of ["help-secrets.discordToken", "help-secrets.githubAppPrivateKey", "help-provider-name", "help-provider-key", "help-currentPassword", "help-password"]) {
+		for (const id of ["help-secrets.discordToken", "help-provider-name", "help-provider-key", "help-currentPassword", "help-password"]) {
 			expect(page).toContain(`aria-describedby="${id}"`);
 			expect(page).toContain(`id="${id}" role="tooltip"`);
 		}
@@ -782,9 +774,9 @@ describe("settings (/admin)", () => {
 		const form: Record<string, string> = { ...VALID_FORM };
 		for (const def of CONFIG_FIELDS) form[def.name] = def.example;
 		expect((await h.post("/admin/settings", form)).status).toBe(303);
-		expect(h.stub.settings!.config.limits.maxCostUsdPerJob).toBe(7.5);
+		expect(h.stub.settings!.config.limits.maxCostUsdPerTurn).toBe(7.5);
 		expect(h.stub.settings!.config.omp.autoUpdate).toBe(true);
-		expect(h.stub.settings!.config.labels.states.inReview).toBe("ai:in-review");
+		expect(h.stub.settings!.config.models.ask).toBe("anthropic/claude-sonnet-4-5");
 	});
 });
 
@@ -794,17 +786,13 @@ const ZERO_USAGE = { costUsd: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 
 
 const LOADOUT: Loadout = {
 	capturedAt: "2026-10-29T08:00:00.000Z",
-	profile: "plan",
-	tools: ["read", "grep"],
-	skills: [{ name: "review", source: "user", description: "Reviews code" }],
-	agents: [],
-	mcp: [
-		{ server: "github", status: "connected", tools: ["a", "b"] },
-		{ server: "docs", status: "failed", error: "timeout <x>", tools: [] },
-	],
+	profile: "ask",
+	tools: ["web_search", "read_file"],
+	skills: [{ name: "glossary", source: "user", description: "Defines terms" }],
+	agents: [{ name: "researcher", source: "user", description: "Looks things up <deep>" }],
 };
 
-function liveReport(title: string): StatusReport {
+function liveReport(owner: string): StatusReport {
 	const now = Date.now();
 	return {
 		...emptyReport(),
@@ -812,60 +800,51 @@ function liveReport(title: string): StatusReport {
 			// 1h 5m 30s before now; the web's clock was frozen a little earlier, so the page shows 1h 5m.
 			startedAt: new Date(now - 3_930_000).toISOString(),
 			discord: { ready: true, user: "AskBot#0001", pingMs: 42, nicknameWarning: "missing Change Nickname" },
-			githubApp: "askbot-app",
 			discordQueue: { length: 7, oldestAgeMs: 12_000 },
-			watches: [
-				{ repo: "acme/widgets", channelId: "chan-9", state: "watching", lastPollAt: new Date(now).toISOString(), lastError: "rate limited <b>" },
-				{ repo: "acme/gone", channelId: null, state: "suspended", lastError: "App not installed" },
-			],
-			queuedJobs: 3,
 		},
 		runs: { pending: 2, running: 1, oldestPendingMs: 95_000 },
 		activeRuns: [
-			{ id: "run-0", kind: "implement", state: "pending", repo: "acme/widgets", owner: "job:j0", createdAt: new Date(now - 9_030_000).toISOString(), usage: ZERO_USAGE },
+			{ id: "run-0", state: "pending", threadId: "thread-0", createdAt: new Date(now - 9_030_000).toISOString(), usage: ZERO_USAGE },
 			{
 				id: "run-1",
-				kind: "plan",
 				state: "running",
-				repo: "acme/widgets",
-				owner: "job:j1",
 				threadId: "thread-9",
 				workerId: "askbot-worker-x7k2p",
 				createdAt: new Date(now - 4_200_000).toISOString(),
 				claimedAt: new Date(now - 3_930_000 - 192_000).toISOString(),
 				startedAt: new Date(now - 3_930_000).toISOString(),
 				setupMs: 192_000,
-				lastTool: "grep",
+				lastTool: "web_search",
 				usage: { costUsd: 1.5, input: 12_345, output: 678, cacheRead: 0, cacheWrite: 0 },
 				loadout: LOADOUT,
 			},
-			{ id: "run-2", kind: "ask", state: "assigned", owner: "chat:t2", workerId: "askbot-worker-q", createdAt: new Date(now - 60_000).toISOString(), claimedAt: new Date(now - 45_500).toISOString(), usage: ZERO_USAGE },
+			{ id: "run-2", state: "assigned", threadId: "thread-2", workerId: "askbot-worker-q", createdAt: new Date(now - 60_000).toISOString(), claimedAt: new Date(now - 45_500).toISOString(), usage: ZERO_USAGE },
 		],
 		workers: [
 			{ id: "askbot-worker-x7k2p", address: "10.0.0.7", version: "0.4.12", ompVersion: "18.12.1", runId: "run-1", phase: "running", connectedAt: new Date(now - 125_000).toISOString() },
 		],
-		limits: { maxConcurrentJobs: 2, maxChatSessions: 2, maxConcurrentRuns: 10, workerCapacity: 10, effectiveConcurrency: 4 },
-		warnings: ["maxConcurrentJobs + maxChatSessions (4) is below worker capacity (10): at most 4 workers will be used"],
-		issues: {
-			counts: { planning: 1, queued: 2 },
-			open: [{ repo: "acme/widgets", number: 8, title, state: "planning", job: "plan", threadId: "thread-9" }],
-		},
+		limits: { maxChatSessions: 2, maxConcurrentRuns: 10, workerCapacity: 10, effectiveConcurrency: 2 },
+		warnings: ["maxChatSessions (2) is below worker capacity (10): at most 2 workers will be used"],
+		activeThreads: [
+			{ threadId: "thread-0", channelId: "ask-1", ownerId: owner },
+			{ threadId: "thread-9", channelId: "ask-1", ownerId: "u-9" },
+		],
 		usage: {
 			window: "7d",
-			totals: { runs: 2, costUsd: 0.005, tokensIn: 1_234_567, tokensOut: 89, cacheRead: 0, cacheWrite: 0 },
-			byKind: [{ kind: "plan", runs: 2, costUsd: 0.005 }],
-			byRepo: [{ repo: "acme/widgets", runs: 2, costUsd: 0.005 }],
-			jobs: [{ kind: "plan", succeeded: 1, failed: 1, cancelled: 0, avgDurationMs: 192_000 }],
+			totals: { runs: 5, costUsd: 0.005, tokensIn: 1_234_567, tokensOut: 89, cacheRead: 0, cacheWrite: 0 },
+			byChannel: [
+				{ id: "ask-1", runs: 4, costUsd: 0.004, tokensIn: 1_000_000, tokensOut: 80 },
+				{ id: "ask-2", runs: 1, costUsd: 0.001, tokensIn: 234_567, tokensOut: 9 },
+			],
+			byUser: [{ id: "u-9", runs: 5, costUsd: 0.005, tokensIn: 1_234_567, tokensOut: 89 }],
+			outcomes: { finished: 2, failed: 1, stopped: 1, limit: 1, avgDurationMs: 192_000 },
 			daily: [
 				{ day: "2026-10-28", costUsd: 0.001 },
 				{ day: "2026-10-29", costUsd: 0.004 },
 			],
-			setup: [
-				{ repo: "acme/slow", runs: 3, avgMs: 600_000, maxMs: 900_000 },
-				{ repo: "acme/widgets", runs: 2, avgMs: 30_000, maxMs: 45_000 },
-			],
+			setup: { runs: 3, avgMs: 600_000, maxMs: 900_000 },
 		},
-		loadouts: [LOADOUT],
+		loadout: LOADOUT,
 	};
 }
 
@@ -881,10 +860,10 @@ describe("status", () => {
 	test("status.json relays the orchestrator's report and its window (default 7d)", async () => {
 		const h = start();
 		await setUp(h);
-		h.stub.report = liveReport("Fix the widget");
+		h.stub.report = liveReport("u-1");
 		const week = (await (await h.get("/status.json")).json()) as StatusReport;
 		expect(week.usage.window).toBe("7d");
-		expect(week.engine?.watches.map(w => w.repo)).toEqual(["acme/widgets", "acme/gone"]);
+		expect(week.activeThreads.map(t => t.threadId)).toEqual(["thread-0", "thread-9"]);
 		expect(week.state.phase).toBe("unconfigured");
 		expect(week.runs.oldestPendingMs).toBe(95_000);
 
@@ -893,7 +872,7 @@ describe("status", () => {
 		expect(h.stub.calls.filter(c => c.path === "/status").length).toBe(3);
 	});
 
-	test("the page renders every phase 2 section, escapes text, links threads, and its script parses", async () => {
+	test("the page renders every section, escapes text, links threads and channels, and its script parses", async () => {
 		const h = start();
 		await setUp(h);
 		await h.post("/admin/settings", VALID_FORM);
@@ -906,42 +885,46 @@ describe("status", () => {
 		expect(page).toContain('<a href="/status" aria-current="page">Status</a>');
 		expect(page).toContain("&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;");
 		expect(page).not.toContain("<script>alert(");
-		expect(page).toContain("rate limited &lt;b&gt;");
 		expect(page).toContain("<td>Uptime</td><td>1h 5m</td>");
 		expect(page).toContain("ready · as AskBot#0001 · ping 42 ms");
 		expect(page).toContain("missing Change Nickname");
+		// DSC-32: the Discord write queue.
 		expect(page).toContain("<td>Discord write queue</td><td>7 queued · oldest 12s</td>");
-		expect(page).toContain("<td>Queued jobs</td><td>3</td>");
 		expect(page).toContain("<td>Runs</td><td>2 pending (oldest 1m 35s) · 1 running</td>");
-		expect(page).toContain("<td>suspended</td>");
-		expect(page).toContain("App not installed");
+		// RUN-10 to RUN-12: limits, capacity and warnings.
+		expect(page).toContain("<td>Max chat sessions</td><td>2</td>");
 		expect(page).toContain("<td>Worker capacity</td><td>10</td>");
-		expect(page).toContain("at most 4 workers will be used");
+		expect(page).toContain("<td>Effective concurrency</td><td>2</td>");
+		expect(page).toContain("at most 2 workers will be used");
 		// The web's clock was frozen a little before the report was built.
 		expect(page).toMatch(/<td>askbot-worker-x7k2p<\/td><td>10\.0\.0\.7<\/td><td>run-1<\/td><td>running<\/td><td>18\.12\.1<\/td><td>2m \d+s<\/td>/);
-		expect(page).toContain('href="https://github.com/acme/widgets/issues/8"');
-		expect(page).toContain('href="https://discord.com/channels/guild-1/thread-9"');
-		expect(page).toContain('href="https://discord.com/channels/guild-1/chan-9"');
 		expect(page).toContain("$0.0050");
 		expect(page).toContain("1,234,567");
 		expect(page).toContain('<strong aria-current="page">24 hours</strong>');
 		expect(page).toMatch(/class="bar" style="height:100\.0%"/);
-		expect(h.stub.calls.findLast(c => c.path === "/status")).toBeDefined();
-		for (const secret of [DISCORD_TOKEN, "PEMBODYsecretvalue123", OPENAI_KEY]) expect(page).not.toContain(secret);
+		for (const secret of [DISCORD_TOKEN, OPENAI_KEY]) expect(page).not.toContain(secret);
 
-		// Runs (§9.3, NFR-06): pending with its age; in progress with worker, elapsed, setup time, last tool, cost, tokens, loadout.
-		expect(page).toMatch(/<tr><td>implement<\/td><td><a href="https:\/\/github\.com\/acme\/widgets">acme\/widgets<\/a><\/td><td>2h 30m<\/td><\/tr>/);
+		// Runs (NFR-06): pending with its age; in progress with worker, elapsed, setup time, last tool, cost, tokens, loadout.
+		expect(page).toMatch(/<tr><td><a href="https:\/\/discord\.com\/channels\/guild-1\/thread-0">thread-0<\/a><\/td><td>2h 30m<\/td><\/tr>/);
 		expect(page).toContain(
-			'<tr><td><a href="https://discord.com/channels/guild-1/thread-9">plan</a></td><td><a href="https://github.com/acme/widgets">acme/widgets</a></td>' +
-				"<td>askbot-worker-x7k2p</td><td>running</td><td>1h 5m</td><td>3m 12s</td><td>grep</td><td>$1.50</td><td>12,345 in · 678 out</td>" +
-				"<td>2 tools · 1 skills · 0 agents · MCP github ✓, docs ✗</td></tr>",
+			'<tr><td><a href="https://discord.com/channels/guild-1/thread-9">thread-9</a></td>' +
+				"<td>askbot-worker-x7k2p</td><td>running</td><td>1h 5m</td><td>3m 12s</td><td>web_search</td><td>$1.50</td><td>12,345 in · 678 out</td>" +
+				"<td>2 tools · 1 skills · 1 agents</td></tr>",
 		);
-		expect(page).toMatch(/<tr><td>ask<\/td><td>—<\/td><td>askbot-worker-q<\/td><td>assigned<\/td><td>—<\/td><td>4[45]s so far<\/td>/);
-		// Setup time per repository, slowest first, and the latest loadout per profile.
-		expect(page).toContain("<tr><td>acme/slow</td><td>3</td><td>10m 0s</td><td>15m 0s</td></tr>");
+		expect(page).toMatch(/<tr><td><a href="https:\/\/discord\.com\/channels\/guild-1\/thread-2">thread-2<\/a><\/td><td>askbot-worker-q<\/td><td>assigned<\/td><td>—<\/td><td>4[45]s so far<\/td>/);
+		// Active ask threads.
 		expect(page).toContain(
-			"<tr><td>plan</td><td>2026-10-29 08:00:00 UTC</td><td>read, grep</td><td>review</td><td>—</td><td>github (connected, 2 tools); docs (failed, 0 tools: timeout &lt;x&gt;)</td></tr>",
+			'<tr><td><a href="https://discord.com/channels/guild-1/thread-9">thread-9</a></td><td><a href="https://discord.com/channels/guild-1/ask-1">#ask-1</a></td><td>u-9</td></tr>',
 		);
+		// OBS-06: by ask channel and by user, outcomes with the average duration, daily cost, and the setup time.
+		expect(page).toContain('<tr><td><a href="https://discord.com/channels/guild-1/ask-1">#ask-1</a></td><td>4</td><td>$0.0040</td><td>1,000,000</td><td>80</td></tr>');
+		expect(page).toContain("<tr><td>u-9</td><td>5</td><td>$0.0050</td><td>1,234,567</td><td>89</td></tr>");
+		expect(page).toContain("<tr><td>2</td><td>1</td><td>1</td><td>1</td><td>3m 12s</td></tr>");
+		expect(page).toContain("<tr><td>3</td><td>10m 0s</td><td>15m 0s</td></tr>");
+		// The latest loadout (AGT-27).
+		expect(page).toContain("<tr><td>Tools</td><td>web_search, read_file</td></tr>");
+		expect(page).toContain("<tr><td>Skills</td><td>glossary</td></tr>");
+		expect(page).toContain("<tr><td>Agents</td><td>researcher</td></tr>");
 
 		const script = pageScript(page);
 		expect(() => new Function(script)).not.toThrow();
@@ -958,9 +941,9 @@ describe("status", () => {
 		await setUp(h);
 		const page = await (await h.get("/status")).text();
 		expect(page).toContain("<td>Engine</td><td>unconfigured</td>");
-		expect(page).toContain("No watched repositories.");
 		expect(page).toContain("Limits are shown once the settings are saved and unlocked.");
-		expect(page).toContain("No open issues.");
+		expect(page).toContain("No active ask threads.");
+		expect(page).toContain("No runs in this window.");
 		expect(page).toContain("No pending runs.");
 		expect(page).toContain("No runs in progress.");
 		expect(page).toContain("No runs started in this window.");
@@ -980,7 +963,7 @@ describe("healthz", () => {
 		await setUp(h);
 		await h.post("/admin/settings", VALID_FORM);
 		h.stub.phase = "error";
-		h.stub.error = "GitHub App is not installed on acme/private-repo";
+		h.stub.error = "Discord login failed for guild guild-1";
 		h.cookie = "";
 		const failed = await h.get("/healthz");
 		expect(failed.status).toBe(200);
@@ -988,9 +971,9 @@ describe("healthz", () => {
 		expect(JSON.parse(body)).toEqual({
 			status: "ok",
 			version,
-			orchestrator: { reachable: true, phase: "error", limits: { maxConcurrentJobs: 2, maxChatSessions: 2, maxConcurrentRuns: 4, workerCapacity: 4, effectiveConcurrency: 4 } },
+			orchestrator: { reachable: true, phase: "error", limits: { maxChatSessions: 2, maxConcurrentRuns: 4, workerCapacity: 4, effectiveConcurrency: 2 } },
 		});
-		expect(body).not.toContain("private-repo");
+		expect(body).not.toContain("guild-1");
 
 		await h.stub.stop();
 		const down = await h.get("/healthz");
@@ -1047,12 +1030,10 @@ describe("home and navigation (WEB-10, WEB-11)", () => {
 		const page = await res.text();
 		expect(page).toContain('<span class="badge ok">running</span>');
 		const cards = [...page.matchAll(/<h3><a href="([^"]+)">/g)].map(m => m[1]);
-		expect(cards).toEqual(expect.arrayContaining(["/status", "/logs", "/admin", "/admin/repos", "/admin/models", "/admin/omp", "/admin/skills"]));
+		expect(cards).toEqual(["/status", "/logs", "/admin", "/admin/models", "/admin/omp", "/admin/skills", "/status.json", "/healthz"]);
 		const menu = [...page.matchAll(/<li><a href="([^"]+)"/g)].map(m => m[1]);
 		expect(menu).toEqual(["/", ...cards]);
 		expect(page).toContain('<a href="/" aria-current="page">Home</a>');
-		// This server runs without VS Code (ASKBOT_WEB_VSCODE=off), so neither the cards nor the menu list it.
-		expect(page).not.toContain('href="/admin/vscode');
 
 		const info = await versionInfo();
 		expect(page).toContain(`<td>AskBot (web)</td><td>${info.askbot}</td>`);
@@ -1068,7 +1049,7 @@ describe("home and navigation (WEB-10, WEB-11)", () => {
 		expect(failed).toContain("Discord &lt;login&gt; failed");
 	});
 
-	test("home shows the model account and MCP server counts, the getting-started checklist with links, and valid sample configs", async () => {
+	test("home shows the model account count, the getting-started checklist with links, and valid sample configs", async () => {
 		const h = start();
 		await setUp(h);
 		const steps = (page: string) =>
@@ -1076,24 +1057,23 @@ describe("home and navigation (WEB-10, WEB-11)", () => {
 
 		const fresh = await (await h.get("/")).text();
 		expect(fresh).toContain('Model accounts: <strong id="model-accounts">—</strong>');
-		expect(fresh).toContain('MCP servers: <strong id="mcp-servers">—</strong>');
-		expect(steps(fresh)).toEqual({ setup: "todo", credentials: "todo", workChannel: "todo", watchedRepo: "todo", modelAccess: "todo" });
+		expect(fresh).not.toContain("MCP");
+		const todo = { setup: "todo", botToken: "todo", guild: "todo", allowedUsers: "todo", askChannel: "todo", modelAccess: "todo" };
+		expect(steps(fresh)).toEqual(todo);
 
-		h.stub.home = { modelAccounts: 2, mcpServers: 3, checklist: { setup: true, credentials: true, workChannel: true, watchedRepo: false, modelAccess: true } };
+		h.stub.home = { modelAccounts: 2, checklist: { setup: true, botToken: true, guild: true, allowedUsers: true, askChannel: false, modelAccess: true } };
 		const page = await (await h.get("/")).text();
 		expect(page).toContain('Model accounts: <strong id="model-accounts">2</strong>');
-		expect(page).toContain('MCP servers: <strong id="mcp-servers">3</strong>');
-		expect(steps(page)).toEqual({ setup: "done", credentials: "done", workChannel: "done", watchedRepo: "todo", modelAccess: "done" });
+		expect(steps(page)).toEqual({ setup: "done", botToken: "done", guild: "done", allowedUsers: "done", askChannel: "todo", modelAccess: "done" });
 		// Each step links to where it is done.
-		expect(page).toMatch(/<li data-step="watchedRepo" class="todo">.*<a href="\/admin\/repos">/);
+		expect(page).toMatch(/<li data-step="askChannel" class="todo">.*<a href="\/admin">/);
 		expect(page).toMatch(/<li data-step="modelAccess" class="done">.*<a href="\/admin\/models">/);
-		expect(page).toMatch(/<li data-step="workChannel" class="done">.*<a href="\/admin">/);
+		expect(page).toMatch(/<li data-step="botToken" class="done">.*<a href="\/admin">/);
 
 		// Sample configs are valid against the real schemas and show no stored secret.
 		expect(page).toContain("Sample configs");
 		expect(() => parseSettings(SAMPLE_SETTINGS)).not.toThrow();
 		expect(() => parseOmpConfig(SAMPLE_OMP)).not.toThrow();
-		expect(parseRepoConfig(SAMPLE_REPO_CONFIG)).toEqual({ baseBranch: "develop", setupCommand: "bun install" });
 		for (const script of scripts(page)) expect(() => new Function(script)).not.toThrow();
 	});
 

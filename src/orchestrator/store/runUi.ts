@@ -1,25 +1,25 @@
-import { ownerKey, type RunOwner, type RunUiState } from "../dispatch/dispatcher";
+import type { RunUiState } from "../dispatch/dispatcher";
 import type { Db } from "./db";
 
 /**
- * RUN-14: the Discord state of a run's live messages (status and to-do message ids, latest progress and to-do list),
- * stored per run owner in the key-value store as `runui:<ownerKey>`. A job or chat re-executed after an orchestrator
- * restart reads it to keep editing the same messages; the engine clears it once it is done with the run.
+ * RUN-14: the Discord state of a run's live messages (status message id, latest progress snapshot), stored per ask
+ * thread in the key-value store as `runui:<threadId>`, so a follow-up turn finds it before its new run exists. A turn
+ * re-attached after an orchestrator restart reads it to keep editing the same message; the engine clears it once done.
  */
 
-export const runUiKey = (owner: RunOwner): string => `runui:${ownerKey(owner)}`;
+export const runUiKey = (threadId: string): string => `runui:${threadId}`;
 
 export interface RunUiStore {
-	get(owner: RunOwner): RunUiState | undefined;
-	set(owner: RunOwner, state: RunUiState): void;
-	clear(owner: RunOwner): void;
+	get(threadId: string): RunUiState | undefined;
+	set(threadId: string, state: RunUiState): void;
+	clear(threadId: string): void;
 }
 
 export function createRunUiStore(db: Db): RunUiStore {
 	const remove = db.raw.query<null, [string]>("DELETE FROM kv WHERE key = ?");
 	return {
-		get(owner) {
-			const raw = db.kvGet(runUiKey(owner));
+		get(threadId) {
+			const raw = db.kvGet(runUiKey(threadId));
 			if (!raw) return undefined;
 			try {
 				return JSON.parse(raw) as RunUiState;
@@ -27,7 +27,7 @@ export function createRunUiStore(db: Db): RunUiStore {
 				return undefined;
 			}
 		},
-		set: (owner, state) => db.kvSet(runUiKey(owner), JSON.stringify(state)),
-		clear: owner => void remove.run(runUiKey(owner)),
+		set: (threadId, state) => db.kvSet(runUiKey(threadId), JSON.stringify(state)),
+		clear: threadId => void remove.run(runUiKey(threadId)),
 	};
 }

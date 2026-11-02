@@ -1,15 +1,21 @@
 import { describe, expect, test } from "bun:test";
 import { claimNextRun, holdsLease, sameToken } from "../../src/orchestrator/dispatch/leases";
-import { openDb } from "../../src/orchestrator/store/db";
+import { type Db, type NewRun, openDb, type RunRow } from "../../src/orchestrator/store/db";
 
 const LEASE_MS = 45_000;
 const later = (ms: number) => new Date(Date.now() + ms);
 
+/** A pending run of a new ask thread `threadId` (runs belong to an ask chat, DB-02). */
+function pending(db: Db, threadId: string, extra: Omit<NewRun, "threadId"> = {}): RunRow {
+	db.insertAskChat(threadId, "c1", "u1");
+	return db.insertRun({ threadId, ...extra });
+}
+
 describe("leases (RUN-02, RUN-07, architecture §6)", () => {
 	test("a worker claims the oldest pending run with a live lease", () => {
 		const db = openDb(":memory:");
-		const first = db.insertRun({ kind: "draft", draftId: "d1" });
-		db.insertRun({ kind: "draft", draftId: "d2" });
+		const first = pending(db, "d1");
+		pending(db, "d2");
 		const row = claimNextRun(db, "w1", LEASE_MS)!;
 		expect(row.id).toBe(first.id);
 		expect(row.state).toBe("assigned");
@@ -21,29 +27,29 @@ describe("leases (RUN-02, RUN-07, architecture §6)", () => {
 
 	test("one claim per worker id, ever, even after its run ended", () => {
 		const db = openDb(":memory:");
-		const run = db.insertRun({ kind: "draft", draftId: "d1" });
-		db.insertRun({ kind: "draft", draftId: "d2" });
+		const run = pending(db, "d1");
+		pending(db, "d2");
 		expect(claimNextRun(db, "w1", LEASE_MS)?.id).toBe(run.id);
 		expect(claimNextRun(db, "w1", LEASE_MS)).toBeNull();
 		db.transitionRun(run.id, ["assigned"], "finished", { outcome: "succeeded" });
 		expect(claimNextRun(db, "w1", LEASE_MS)).toBeNull();
 		expect(db.workerClaim("w1")).toBe(run.id);
 		// The refused claim left the other run pending for another worker.
-		expect(claimNextRun(db, "w2", LEASE_MS)?.draft_id).toBe("d2");
+		expect(claimNextRun(db, "w2", LEASE_MS)?.thread_id).toBe("d2");
 	});
 
 	test("a claim with nothing pending records nothing", () => {
 		const db = openDb(":memory:");
 		expect(claimNextRun(db, "w1", LEASE_MS)).toBeNull();
-		db.insertRun({ kind: "draft", draftId: "d1" });
-		expect(claimNextRun(db, "w1", LEASE_MS)?.draft_id).toBe("d1");
+		pending(db, "d1");
+		expect(claimNextRun(db, "w1", LEASE_MS)?.thread_id).toBe("d1");
 	});
 
 	test("expired leases: an unstarted run goes back to pending, a running one is lost; heartbeats keep them", () => {
 		const db = openDb(":memory:");
-		const a = db.insertRun({ kind: "draft", draftId: "a" });
-		const b = db.insertRun({ kind: "draft", draftId: "b" });
-		const c = db.insertRun({ kind: "draft", draftId: "c" });
+		const a = pending(db, "a");
+		const b = pending(db, "b");
+		const c = pending(db, "c");
 		const leaseA = claimNextRun(db, "wa", 1000)!;
 		const leaseB = claimNextRun(db, "wb", 1000)!;
 		const leaseC = claimNextRun(db, "wc", 1000)!;
@@ -65,7 +71,7 @@ describe("leases (RUN-02, RUN-07, architecture §6)", () => {
 
 	test("after a restart, the grace period keeps leases alive until it ends (RUN-07)", () => {
 		const db = openDb(":memory:");
-		db.insertRun({ kind: "draft", draftId: "a" });
+		pending(db, "a");
 		const run = claimNextRun(db, "w1", 1)!;
 		db.transitionRun(run.id, ["assigned"], "running");
 		db.graceLeases(90_000);

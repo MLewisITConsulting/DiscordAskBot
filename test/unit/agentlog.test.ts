@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { type AgentLogRun, openAgentLog } from "../../src/orchestrator/store/agentlog";
 import { TRANSCRIPT_LIMITS, truncate, truncateEvent } from "../../src/shared/transcript";
 
-const RUN: AgentLogRun = { run: "job-1", kind: "plan", repo: "acme/widgets", issue: 7, thread: "t1" };
+const RUN: AgentLogRun = { run: "ask-t1", kind: "ask", thread: "t1", channel: "c1", user: "u1" };
 const dirs: string[] = [];
 
 function tempDir(): string {
@@ -48,8 +48,8 @@ describe("agent log", () => {
 	test("reopening continues sequence numbers, refills the tail, and skips a torn last line", async () => {
 		const dir = tempDir();
 		const first = await openAgentLog({ dir, maxBytes: 1_000_000, segmentBytes: 100_000 });
-		first.append(RUN, { type: "prompt", text: "plan it" });
-		first.append(RUN, { type: "tool_start", tool: "read", intent: "Reading README", args: '{"path":"README.md"}' });
+		first.append(RUN, { type: "prompt", text: "answer it" });
+		first.append(RUN, { type: "tool_start", tool: "read_file", intent: "Reading the input", args: '{"path":"inputs/a.md"}' });
 		const [segment] = first.segments();
 		writeFileSync(join(dir, segment!.name), '{"seq":3,"ts":"2026', { flag: "a" });
 
@@ -59,7 +59,7 @@ describe("agent log", () => {
 			[2, "tool_start"],
 		]);
 		second.append(RUN, { type: "assistant", text: "done" });
-		expect(second.recent(1)[0]).toMatchObject({ seq: 3, type: "assistant", run: "job-1", repo: "acme/widgets", issue: 7 });
+		expect(second.recent(1)[0]).toMatchObject({ seq: 3, type: "assistant", run: "ask-t1", kind: "ask", thread: "t1", channel: "c1", user: "u1" });
 		expect(second.recent(10, 1).map(e => e.seq)).toEqual([2, 3]);
 	});
 
@@ -67,7 +67,7 @@ describe("agent log", () => {
 		const log = await openAgentLog({ dir: tempDir(), maxBytes: 10_000_000, segmentBytes: 1_000_000 });
 		const seen: number[] = [];
 		const unsubscribe = log.subscribe(e => seen.push(e.seq));
-		log.append(RUN, { type: "tool_end", tool: "bash", isError: false, text: "y".repeat(20_000) });
+		log.append(RUN, { type: "tool_end", tool: "read_file", isError: false, text: "y".repeat(20_000) });
 		unsubscribe();
 		log.append(RUN, { type: "steer", text: "ignored by the unsubscribed listener" });
 		expect(seen).toEqual([1]);

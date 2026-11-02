@@ -11,7 +11,7 @@ import { join } from "node:path";
 export const OMP_PACKAGE = "@oh-my-pi/pi-coding-agent";
 /** Released in lockstep with the SDK and pinned to the same version. */
 export const PINNED_PACKAGES = [OMP_PACKAGE, "@oh-my-pi/pi-utils"] as const;
-/** Plain `major.minor.patch[-prerelease]`; also the guard for versions that end up in paths, pins and Discord custom ids. */
+/** Plain `major.minor.patch[-prerelease]`; also the guard for versions that end up in paths and pins. */
 export const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?$/;
 /** The app's entry modules that load omp (image build): Bun fails at link time on a missing export. The web role has no omp. */
 export const APP_SMOKE_SCRIPT =

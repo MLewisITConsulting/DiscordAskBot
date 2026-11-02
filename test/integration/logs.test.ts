@@ -5,7 +5,7 @@ import type { LogEntry, LogsOverview } from "../../src/shared/adminLogs";
 import { logsPages } from "../../src/web/logsPage";
 import { type AdminStack, startAdminStack } from "../fixtures/adminStack";
 
-const RUN: AgentLogRun = { run: "job-1", kind: "implement", repo: "acme/app", issue: 7 };
+const RUN: AgentLogRun = { run: "ask-t7", kind: "ask", thread: "t7", channel: "c1", user: "u1" };
 const PING_MS = 50;
 
 let stack: AdminStack | undefined;
@@ -72,15 +72,15 @@ function events(text: string): LogEntry[] {
 describe("/logs", () => {
 	test("the page shows the newest entries and both logs' files", async () => {
 		const { s } = await start();
-		s.agentLog.append(RUN, { type: "prompt", text: "Implement <the> feature" });
-		s.agentLog.append(RUN, { type: "tool_end", tool: "bash", isError: true, text: "exit 1" });
+		s.agentLog.append(RUN, { type: "prompt", text: "Explain <the> feature" });
+		s.agentLog.append(RUN, { type: "tool_end", tool: "read_file", isError: true, text: "not found" });
 		s.processLog.append(JSON.stringify({ msg: "hello" }));
 		const res = await s.get("/logs");
 		expect(res.status).toBe(200);
 		const html = await res.text();
-		expect(html).toContain("Implement &lt;the&gt; feature");
+		expect(html).toContain("Explain &lt;the&gt; feature");
 		expect(html).toContain('data-after="2"');
-		expect(html).toContain("implement acme/app#7");
+		expect(html).toContain("ask t7");
 		const [agentFile] = s.agentLog.segments();
 		const [processFile] = s.processLog.segments();
 		expect(html).toContain(`href="/logs/files/${agentFile!.name}"`);

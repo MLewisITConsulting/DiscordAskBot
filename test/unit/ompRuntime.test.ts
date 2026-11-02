@@ -145,7 +145,7 @@ describe("omp update checks (UPD-02)", () => {
 			port: 0,
 			fetch: () => {
 				const answer = answers[Math.min(calls++, answers.length - 1)]!();
-				if (calls === 3) checked.resolve();
+				if (calls === 5) checked.resolve();
 				return answer;
 			},
 		});
@@ -154,13 +154,15 @@ describe("omp update checks (UPD-02)", () => {
 		closers.push(() => db.close());
 		const updater = createOmpUpdater({ db, identity: IDENTITY, imageOmpVersion: "18.12.1", imageAppDir: tempDir(), registryUrl: npm.url.href, checkDelayMs: 1, checkIntervalMs: 1 });
 		const views: (string | undefined)[] = [];
-		updater.subscribe(() => views.push(updater.status().checkError));
+		for (let i = 0; i < 3; i++) views.push((await updater.check()).checkError);
+		expect(views).toEqual([undefined, "the npm registry answered 503", "the npm registry returned no valid version"]);
+		// The timers check too: after the start delay, then on the interval.
 		updater.start();
 		closers.push(() => updater.stop());
 		await checked.promise;
-		await updater.check();
 		updater.stop();
-		expect(views.slice(0, 3)).toEqual([undefined, "the npm registry answered 503", "the npm registry returned no valid version"]);
+		// The timer's check in flight stores its answer before the database closes.
+		await Bun.sleep(50);
 		// The last good answer stays; the update is offered against the image's omp.
 		expect(updater.status()).toMatchObject({ latest: "18.13.0", available: "18.13.0", checkError: "the npm registry returned no valid version", supported: false });
 	});

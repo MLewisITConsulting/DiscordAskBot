@@ -21,7 +21,7 @@ export type TranscriptEvent =
 	| { type: "tool_end"; tool: string; isError: boolean; text: string }
 	| { type: "run_end"; usage: RunUsage; aborted?: string; error?: string };
 
-/** Field caps in characters: prompts embed whole issues; tool output can be megabytes. */
+/** Field caps in characters: prompts carry the user's whole message; tool output can be megabytes. */
 export const TRANSCRIPT_LIMITS: Readonly<Record<TranscriptEvent["type"], number>> = Object.freeze({
 	prompt: 64 * 1024,
 	steer: 16 * 1024,

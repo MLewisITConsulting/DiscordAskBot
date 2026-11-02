@@ -28,7 +28,7 @@ export interface AppIdentity {
 /** Repository (or image `/app`) root. */
 export const APP_ROOT = join(import.meta.dir, "..", "..");
 export const IDENTITY_FILE = "/app/IDENTITY";
-const DEPENDENCIES = ["@oh-my-pi/pi-coding-agent", "discord.js", "octokit", "zod"] as const;
+const DEPENDENCIES = ["@oh-my-pi/pi-coding-agent", "discord.js", "zod"] as const;
 const startedAt = new Date().toISOString();
 
 async function packageVersion(dir: string): Promise<string> {

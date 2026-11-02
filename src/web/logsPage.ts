@@ -8,7 +8,7 @@ import { type LogEntryView, logEntryView } from "./logview";
 import { cellHtml, esc, layout, nav, notFoundPage, table } from "./views";
 
 /**
- * `/logs` (OBS-03, OBS-04, §9.3): a live tail of the agent transcripts and the agent and orchestrator log files. The
+ * `/logs` (OBS-03, OBS-04, requirements §5.3): a live tail of the agent transcripts and the agent and orchestrator log files. The
  * event stream and the downloads are proxied from the orchestrator's admin API; web never reads log files itself.
  */
 
@@ -182,7 +182,6 @@ export interface LogsPageOptions {
 	agent: LogFiles;
 	process: LogFiles;
 	guildId?: string;
-	vscode: boolean;
 }
 
 export function logsPage(opts: LogsPageOptions): string {
@@ -191,7 +190,7 @@ export function logsPage(opts: LogsPageOptions): string {
 	return layout(
 		"Logs",
 		`${LOGS_STYLE}
-${nav("logs", opts.vscode)}
+${nav("logs")}
 <main id="logs-root" data-guild="${esc(opts.guildId ?? "")}" data-after="${after}">
 <h1>Agent log</h1>
 <div class="toolbar">
@@ -229,9 +228,9 @@ async function guildId(admin: AdminClient): Promise<string | undefined> {
 
 export const logsPages: PageRoutes = {
 	"GET /logs": {
-		async handle(_req, _url, { admin, vscode }) {
+		async handle(_req, _url, { admin }) {
 			const [overview, guild] = await Promise.all([admin.call<LogsOverview>("GET", `/logs?limit=${LOGS_PAGE_ENTRIES}`), guildId(admin)]);
-			return html(logsPage({ ...overview, guildId: guild, vscode }));
+			return html(logsPage({ ...overview, guildId: guild }));
 		},
 	},
 	/** Proxies the orchestrator's event stream; it ends when the browser goes away (`req.signal`). */

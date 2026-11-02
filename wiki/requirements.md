@@ -69,15 +69,16 @@ AskBot is a long-running service that uses omp (`@oh-my-pi/pi-coding-agent`) to 
 
 ### 2.5 omp configuration
 
-- **AGT-20** The admin MUST be able to override any registered omp setting, validated by omp's own parser. These settings MUST be pinned and not overridable: `tools.approvalMode = yolo`, `ask.timeout = 0`, `async.enabled = false`. The pinned values MUST be applied last. Spike A2 (implementation.md §3) adds a pin here only if its outcome needs one.
+- **AGT-20** The admin MUST be able to override any registered omp setting, validated by omp's own parser. These settings MUST be pinned and not overridable: `tools.approvalMode = yolo`, `ask.timeout = 0`, `async.enabled = false`, `skillful = true` (spike A1: `false` empties the skill list, AGT-30) and `task.maxRecursionDepth = 1` (spike A2: subagents never get `task`, AGT-31). The pinned values MUST be applied last.
 - **AGT-23** Changes to omp settings MUST apply to runs that start afterwards, without an engine restart. Runs already in progress keep their configuration.
 
 ### 2.6 Skills and agents
 
-- **AGT-24** The system MUST ship no skills or task agents. The admin's skills and agents live in the orchestrator (`<state>/omp`). Each worker downloads a copy at start and loads it as the session's only extension root. Skills are at `skills/<name>/SKILL.md` and agents at `agents/<name>.md`.
+- **AGT-24** The system MUST ship no skills or task agents. The admin's skills and agents live in the orchestrator (`<state>/omp`). Each worker downloads a copy at start and loads it as the session's only extension root. Skills are at `skills/<name>/SKILL.md` and agents at `agents/<name>.md`. The worker MUST pass the skills to omp explicitly, so that omp's own skill discovery (agent dir, `$HOME`, working directory) is off (spike A1). The session's working directory MUST be a run directory outside the scratch directory, with no `.omp` in it or above it, so that files the agent writes cannot add skills or agents (spikes A1, A2).
 - **AGT-25** An agent is uploaded as a single `.md` file of at most 256 KiB. A skill is uploaded either as its `SKILL.md` alone or as a `.zip` of the skill folder (at most 5 MiB unpacked, `SKILL.md` at the top, no symlinks, no paths outside the folder). The YAML frontmatter MUST have a `name` matching `^[a-z0-9][a-z0-9-]{0,63}$` and a non-empty `description`. The agent names `main` and `sub` are reserved. The frontmatter name, not the file name, decides where the file is stored. Writes MUST be atomic, and uploading an existing name replaces it. Removing a skill deletes its folder. An agent's frontmatter MUST also satisfy these rules:
   - `tools` is required, and MUST be a non-empty subset of the subagent allowlist, which is `web_search` only;
-  - `task` in `tools`, and any `spawns` value, MUST be refused.
+  - `task` in `tools`, and any `spawns` value, MUST be refused;
+  - the keys `advisor` and `prewalk` MUST be refused, because they attach another model loop with its own tools to the subagent (spike A2).
 
   A refused upload MUST store nothing and return the reason. The listing MUST show broken entries with the reason.
 - **AGT-26** Skill and agent changes MUST apply to sessions that start afterwards.
@@ -87,11 +88,11 @@ AskBot is a long-running service that uses omp (`@oh-my-pi/pi-coding-agent`) to 
   - `write_file` MUST refuse `skill://` paths with "skills are read-only".
   - `read_file` MUST declare itself to omp as a tool that reads skill URIs, so that omp lists the installed skills in the system prompt.
 - **AGT-31** Task agents in `/ask`:
-  - `task` MUST spawn only the admin's agents (AGT-24). omp's bundled agents, and agents found anywhere else, MUST NOT be spawnable.
+  - `task` MUST spawn only the admin's agents (AGT-24). omp's bundled agents, agents found anywhere else, and user-tagged model agents (`^provider/model`) MUST NOT be spawnable. The session MUST name the valid agents as its only spawnable agents (omp's `spawns` allowlist, spike A2).
   - A subagent MUST get only the tools its frontmatter names, within the allowlist (AGT-25), plus only what omp itself needs to return the subagent's result.
-  - The worker MUST check every downloaded agent against AGT-25 and leave out invalid ones, logging `agent skipped` with the name and reason.
+  - The worker MUST check every downloaded agent against AGT-25 and delete invalid ones (and files not named `<frontmatter name>.md`) before the session starts, logging `agent skipped` with the name and reason. Deleting, not only leaving out, matters because omp keeps the first file of a name (spike A2).
   - Subagents MUST NOT spawn subagents.
-- **AGT-32** Subagent usage MUST count toward the turn's usage (OBS-05) and its cost limit. Subagent time counts toward the turn's time limit (AGT-14). Aborting the turn MUST abort its subagents.
+- **AGT-32** Subagent usage MUST count toward the turn's usage (OBS-05) and its cost limit; the cost limit MUST also be checked while a subagent runs, from its live usage (spike A2). Subagent time counts toward the turn's time limit (AGT-14). Aborting the turn MUST abort its subagents.
 
 ### 2.7 Loadout
 
@@ -481,4 +482,4 @@ The settings are validated as a whole on save. Errors read `Invalid config: <pat
 
 ## 16. Open questions
 
-None. Spikes A1 and A2 ([implementation.md](implementation.md) §3) may change AGT-30 and AGT-31; the spike note then says so here.
+None. Spikes A1 and A2 ([implementation.md](implementation.md) §3) both passed, with no fallback ([spikes/A1.md](spikes/A1.md), [spikes/A2.md](spikes/A2.md)). Their conditions are written into AGT-20, AGT-24, AGT-25, AGT-31 and AGT-32.

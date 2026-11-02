@@ -17,7 +17,6 @@ const WORKER_TOKEN = "worker-token-for-tests";
 const LEASE = "lease-token-for-tests";
 const RUN_ID = "run-1";
 const FIXTURE_HOST = join(import.meta.dir, "..", "fixtures", "agent-host.ts");
-const ECHO_MCP = join(import.meta.dir, "..", "fixtures", "echo-mcp.ts");
 
 const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {
@@ -149,7 +148,6 @@ class StubOrchestrator {
 				break;
 			}
 			case "gone":
-			case "mcp-test-result":
 				this.send({ t: "lease-invalid", runId: msg.runId });
 				break;
 		}
@@ -249,7 +247,6 @@ class TcpProxy {
 function askSpec(prompt: string, extra: Partial<RunSpec> = {}): RunSpec {
 	return {
 		runId: RUN_ID,
-		kind: "ask",
 		profile: "ask",
 		prompt,
 		thinking: "low",
@@ -272,7 +269,7 @@ interface Started {
 	result: Promise<WorkerOutcome>;
 }
 
-/** Checkout and run-local roots in separate temp dirs, as in the image (container storage and the run-local tmpfs). */
+/** Worker and run-local roots in separate temp dirs, as in the image (container storage and the run-local tmpfs). */
 function startWorker(stub: StubOrchestrator, overrides: Partial<WorkerOptions> = {}): Started {
 	const root = workerRoot(tempDir("askbot-worker-test-"));
 	const runBase = tempDir("askbot-worker-run-test-");
@@ -322,7 +319,6 @@ describe("worker run", () => {
 		const types = stub.relays.map(r => r.msg.t);
 		expect(types).toContain("registered");
 		expect(types).toContain("progress");
-		expect(types).toContain("todos");
 		expect(types).toContain("loadout");
 		expect(types.at(-1)).toBe("done");
 		expect(stub.relays.map(r => r.seq)).toEqual(stub.relays.map((_, i) => i + 1));
@@ -332,11 +328,16 @@ describe("worker run", () => {
 		expect(stub.events.indexOf("put scratch/outputs/answer.md")).toBeLessThan(stub.events.indexOf("relay done"));
 		expect(stub.uploads.get("scratch/outputs/answer.md")).toBe("fixture answer\n");
 		expect(stub.uploads.get("session")).toContain(RUN_ID);
+		// Every session upload is announced (RUN-18): at `session_file` and before the result.
+		expect(stub.controls("session-upload")).toEqual([
+			{ t: "session-upload", runId: RUN_ID },
+			{ t: "session-upload", runId: RUN_ID },
+		]);
 
 		const done = stub.relayed("done")[0]!;
 		const output = done.result.output as { runtime: { agentDir: string; ompDir: string; providerKeys: Record<string, string> }; data: Record<string, unknown> };
 		expect(output.runtime).toEqual({ agentDir: join(runLocal, "auth"), ompDir: join(root, "omp"), providerKeys: { fixture: "key" } });
-		expect(output.data).toMatchObject({ runId: RUN_ID, cwd: join(root, "scratch"), scratchRoot: join(root, "scratch"), resumeFile: join(root, "sessions", "resume.jsonl"), profile: "ask", prompt: "happy" });
+		expect(output.data).toMatchObject({ runId: RUN_ID, cwd: join(root, "work"), scratchRoot: join(root, "scratch"), resumeFile: join(root, "sessions", "resume.jsonl"), profile: "ask", prompt: "happy" });
 		expect(done.result.oomKills).toBe(2);
 	});
 
@@ -350,7 +351,7 @@ describe("worker run", () => {
 
 		expect(readFileSync(join(root, "omp", "skills", "probe", "SKILL.md"), "utf8")).toBe("skill");
 		expect(readFileSync(join(root, "omp", "agents", "helper.md"), "utf8")).toBe("agent");
-		// The credentials and the status file are run-local; nothing of them on the checkout root (CRED-02).
+		// The credentials and the status file are run-local; nothing of them on the worker root (CRED-02).
 		expect(statSync(join(runLocal, "auth")).mode & 0o777).toBe(0o700);
 		expect(existsSync(join(runLocal, "auth", "agent.db"))).toBe(true);
 		expect(existsSync(join(runLocal, "status.json"))).toBe(true);
@@ -520,18 +521,19 @@ describe("worker run", () => {
 		expect(stub.relayed("done")[0]!.result.output).toEqual({ value: { accessToken: "new", expiresAt: 123 } });
 	});
 
-	test("uploads session checkpoints while running and at SIGTERM, then stops without reporting (RUN-18)", async () => {
+	test("uploads the session while running and at SIGTERM, announcing each upload, then stops without reporting (RUN-18)", async () => {
 		const stub = new StubOrchestrator();
 		stub.assignment = assign(askSpec("steerable"));
 		const sigterm = new AbortController();
-		const { root, result } = startWorker(stub, { signal: sigterm.signal, timing: { heartbeatMs: 100, checkpointMs: 100, disconnectWaitMs: 200, retryMinMs: 20, retryMaxMs: 100 } });
-		await waitFor(() => stub.controls("checkpoint").length > 0);
-		const checkpoints = stub.controls("checkpoint").length;
+		const { root, result } = startWorker(stub, { signal: sigterm.signal, timing: { heartbeatMs: 100, sessionUploadMs: 100, disconnectWaitMs: 200, retryMinMs: 20, retryMaxMs: 100 } });
+		// The first upload is at `session_file`; the timer's follow.
+		await waitFor(() => stub.controls("session-upload").length > 1);
+		const announced = stub.controls("session-upload").length;
 		const sessionPuts = stub.events.filter(e => e === "put session").length;
 		sigterm.abort();
 		expect(await result).toBe("run");
 		expect(stub.events.filter(e => e === "put session").length).toBeGreaterThan(sessionPuts);
-		expect(stub.controls("checkpoint").length).toBeGreaterThan(checkpoints);
+		expect(stub.controls("session-upload").length).toBeGreaterThan(announced);
 		expect(stub.relayed("done")).toHaveLength(0);
 		expect(existsSync(root)).toBe(false);
 	});
@@ -547,18 +549,21 @@ describe("worker run", () => {
 		expect(existsSync(root)).toBe(false);
 	});
 
-	test("runs an mcp-test and reports its tools", async () => {
+	test("a scratch copy over its disk limit tells the agent, stops the host and fails the run (STO-06)", async () => {
 		const stub = new StubOrchestrator();
-		stub.assignment = {
-			t: "assign",
-			runId: RUN_ID,
-			token: LEASE,
-			kind: "mcp-test",
-			mcp: { name: "echo", server: { type: "stdio", command: process.execPath, args: [ECHO_MCP] } as never, timeoutMs: 10_000 },
-		};
-		const { result } = startWorker(stub);
-		expect(await result).toBe("mcp-test");
-		expect(stub.controls("mcp-test-result")).toEqual([{ t: "mcp-test-result", runId: RUN_ID, ok: true, tools: [expect.stringContaining("echo")] as never }]);
+		stub.assignment = assign(askSpec("fillDisk"));
+		const { root, result } = startWorker(stub, {
+			diskLimitBytes: 1024 * 1024,
+			timing: { heartbeatMs: 100, diskCheckMs: 50, abortKillMs: 300, disconnectWaitMs: 200, endAckTimeoutMs: 5_000, retryMinMs: 20, retryMaxMs: 100 },
+		});
+		expect(await result).toBe("run");
+		const failed = stub.relayed("failed")[0]!;
+		expect(failed.message).toStartWith("the run ran out of disk space: its scratch files used");
+		expect(failed.message).toContain("over the 1.0 MiB limit");
+		expect(stub.relayed("transcript").at(-1)!.event).toMatchObject({ type: "run_end", error: failed.message });
+		// The outputs written so far still go back (CHAT-10).
+		expect(stub.uploads.has("scratch/outputs/big.txt")).toBe(true);
+		expect(existsSync(root)).toBe(false);
 	});
 });
 
@@ -583,18 +588,17 @@ describe("worker claim", () => {
 describe("relay buffer (RUN-06)", () => {
 	const entry = (seq: number, type: ChildMessage["t"], bytes = 10): OutboxEntry => ({ seq, type, text: "", bytes });
 
-	test("drops the oldest progress, transcript and log first, then all but the newest todos, never anything else", () => {
+	test("drops the oldest progress, transcript and log first, never anything else", () => {
 		const outbox = new RelayOutbox(4, 1_000_000);
-		outbox.push(entry(1, "ui"));
+		outbox.push(entry(1, "registered"));
 		outbox.push(entry(2, "progress"));
-		outbox.push(entry(3, "todos"));
+		outbox.push(entry(3, "loadout"));
 		outbox.push(entry(4, "transcript"));
-		expect(outbox.push(entry(5, "todos"))).toEqual([2]);
+		expect(outbox.push(entry(5, "usage"))).toEqual([2]);
 		expect(outbox.push(entry(6, "log"))).toEqual([4]);
 		expect(outbox.push(entry(7, "session_file"))).toEqual([6]);
-		expect(outbox.push(entry(8, "reply"))).toEqual([3]);
-		expect(outbox.entries().map(e => e.seq)).toEqual([1, 5, 7, 8]);
-		expect(outbox.push(entry(9, "done"))).toEqual([]);
+		expect(outbox.push(entry(8, "reply"))).toEqual([]);
+		expect(outbox.entries().map(e => e.seq)).toEqual([1, 3, 5, 7, 8]);
 		expect(outbox.length).toBe(5);
 	});
 

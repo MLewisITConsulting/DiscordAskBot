@@ -4,35 +4,29 @@ import {
 	type AuthStorage,
 	type AuthStorageOptions,
 	type CreateAgentSessionOptions,
-	type CreateAgentSessionResult,
 	createAgentSession,
 	discoverAuthStorage,
-	ensureTheme,
 	ModelRegistry,
 	REMOTE_REFRESH_SENTINEL,
 	SessionManager,
 	type YieldDetails,
 } from "@oh-my-pi/pi-coding-agent";
+import { loadSkillsFromDir } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
+import { type SubagentEventPayload, TASK_SUBAGENT_EVENT_CHANNEL } from "@oh-my-pi/pi-coding-agent/task/types";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import type { AgentProfile } from "../../shared/agent";
 import { errorMessage, log } from "../../shared/log";
-import {
-	connectMcp,
-	emptyOmpConfig,
-	enabledMcpServers,
-	initRunSettings,
-	MCP_STARTUP_TIMEOUT_MS,
-	type McpConnection,
-} from "../../shared/ompconfig";
+import { initRunSettings } from "../../shared/ompconfig";
 import type { HostResult, HostRuntime } from "../../shared/protocol";
 import type { TranscriptEvent } from "../../shared/transcript";
+import { validateAgents } from "./agents";
 import { captureLoadout } from "./loadout";
 import { readOomKills } from "./oom";
 import { createScratchTools } from "./scratchTools";
 import { type AbortReason, type CredentialRequester, NoStructuredOutput, type SessionOptions } from "./serve";
-import { createTodoTool, TODO_TOOL } from "./todos";
-import { createIssueTool } from "./tools";
 import { createUsageMeter } from "./usage";
 
 /**
@@ -82,8 +76,9 @@ export async function openSessionRuntime(runtime: HostRuntime, requestCredential
 	return { agentDir, ompDir, authStorage, modelRegistry };
 }
 
+/** AGT-18: names the tool, tells the agent not to repeat it, and asks it to tell the user the step was cut short. */
 function oomSteer(kills: number, tool: string): string {
-	return `The kernel killed ${kills} process(es) on this machine for lack of memory (OOM) while your last \`${tool}\` call ran. A killed command exits with code 137 or prints \`Killed\`; typical culprits are \`tsc\` and test runners. This machine does not have enough memory for that command. Do not run it again: it will be killed again and stall the machine. Continue without it, and state in your final output which checks did not complete because of memory.`;
+	return `The kernel killed ${kills} process(es) on this machine for lack of memory (OOM) while your last \`${tool}\` call ran, so that step was cut short. This machine does not have enough memory for it. Do not repeat that action: it will run out of memory again. Continue without it, and tell the user in your answer that this step was cut short because memory ran out.`;
 }
 
 type ThinkingLevel = NonNullable<CreateAgentSessionOptions["thinkingLevel"]>;
@@ -101,18 +96,26 @@ const THINKING_LEVELS: Record<ThinkingLevel, true> = {
 };
 
 /**
- * Restricted tool sets (AGT-08); `undefined` = unrestricted defaults (`ask` comes from `interactivePrompts`).
- * `find` is omitted: in omp 18.12.1 it is still gated by the `find.enabled` setting (auto = native judge model) and was inactive.
+ * The tools of each profile (AGT-08, AGT-09): only the scratch-confined file tools, no omp file or shell tools. `task`
+ * is added when at least one valid agent is installed.
  */
-const PROFILE_TOOLS: Record<AgentProfile, string[] | undefined> = {
-	plan: ["read", "grep", "glob", "bash", "web_search", "ask", "yield", TODO_TOOL],
-	chat: ["read", "grep", "glob", "bash", "web_search", "yield", "create_issue", TODO_TOOL],
-	// `/work issue` drafting: read the repository, no questions (nobody to answer), no filing (the orchestrator files it).
-	draft: ["read", "grep", "glob", "bash", "web_search", "yield", TODO_TOOL],
-	// Public `/ask` (AGT-09): no omp file or shell tools, only the scratch-confined ones.
-	ask: ["web_search", "yield", "list_files", "read_file", "write_file", TODO_TOOL],
-	implement: undefined,
+const PROFILE_TOOLS: Record<AgentProfile, string[]> = {
+	ask: ["web_search", "list_files", "read_file", "write_file", "yield"],
 };
+
+/**
+ * AGT-24: omp looks up project skills and agents in `.omp` from the cwd up to `/` (spikes A1, A2), so the session's cwd
+ * must be outside the scratch dir the agent writes, and no `.omp` may exist in it or above it.
+ */
+export function checkSessionCwd(cwd: string, scratchRoot: string): void {
+	const abs = resolve(cwd);
+	const rel = relative(resolve(scratchRoot), abs);
+	if (!rel.startsWith("..") && !rel.startsWith("/")) throw new Error(`The session's working directory ${abs} must be outside the scratch directory`);
+	for (let dir = abs; ; dir = dirname(dir)) {
+		if (existsSync(join(dir, ".omp"))) throw new Error(`The session's working directory ${abs} has an .omp directory in or above it (${dir})`);
+		if (dirname(dir) === dir) return;
+	}
+}
 
 /** AGT-14. */
 const WALL_CLOCK_CHECK_MS = 15_000;
@@ -122,64 +125,52 @@ export async function runSession(runtime: SessionRuntime, opts: SessionOptions):
 	const run = opts.runId;
 	if (!Object.hasOwn(THINKING_LEVELS, opts.thinking)) throw new Error(`Unknown thinking level "${opts.thinking}"`);
 	const thinkingLevel = opts.thinking as ThinkingLevel;
-	if (opts.profile === "ask" && !opts.scratchRoot) throw new Error("The ask profile needs a scratch root (StartOptions.scratchRoot)");
-	const toolNames = PROFILE_TOOLS[opts.profile];
-	// The ask tool formats labels with the process-global TUI theme, which only the omp CLI initializes.
-	await ensureTheme();
+	checkSessionCwd(opts.cwd, opts.scratchRoot);
+	// AGT-31: invalid agents are deleted before omp can see them; the valid ones are the only spawnable agents.
+	const agents = await validateAgents(runtime.ompDir, run);
+	const toolNames = [...PROFILE_TOOLS[opts.profile], ...(agents.length > 0 ? ["task"] : [])];
+	// AGT-24: the omp dir is the only skill source; an explicit list turns omp's skill discovery off (spike A1).
+	const skillsDir = join(runtime.ompDir, "skills");
+	const { skills } = await loadSkillsFromDir({ dir: skillsDir, source: "askbot:user" });
+	// Live events of task subagents (AGT-32).
+	const subagentEvents = new EventBus();
 	const sessionManager = opts.resumeFile
 		? await SessionManager.open(opts.resumeFile, opts.sessionDir, undefined, { initialCwd: opts.cwd })
 		: SessionManager.create(opts.cwd, opts.sessionDir);
 
-	const omp = opts.omp ?? emptyOmpConfig();
-	// omp disables MCP for restricted tool sets, so only unrestricted (implement) runs connect servers (AGT-22).
-	const mcpServers = toolNames ? {} : enabledMcpServers(omp);
-	let mcp: McpConnection | undefined;
-	let created: CreateAgentSessionResult;
-	try {
-		if (Object.keys(mcpServers).length > 0) {
-			// Headless runs wait for servers to finish starting (AGT-22; omp's interactive default is 250 ms).
-			mcp = await connectMcp(opts.cwd, mcpServers, MCP_STARTUP_TIMEOUT_MS);
-			// The session only mounts tools present at creation (a supplied manager gets no change listener).
-			const startup = await mcp.manager.waitForStartup(MCP_STARTUP_TIMEOUT_MS);
-			for (const { name, error } of startup.failed) log("warn", "MCP server failed to start", { run, server: name, error });
-			if (startup.pending.length > 0) log("warn", "MCP servers still starting; their tools are skipped", { run, servers: startup.pending });
-		}
-		// Admin overrides with the pinned headless values on top; also the process-global settings web_search and bash read (AGT-11).
-		const settings = await initRunSettings(omp, runtime.agentDir);
-		created = await createAgentSession({
-			cwd: opts.cwd,
-			agentDir: runtime.agentDir,
-			// Always both: omp code paths without a store open their own, without the refresh hook (S1, CRED-03).
-			authStorage: runtime.authStorage,
-			modelRegistry: runtime.modelRegistry,
-			sessionManager,
-			settings,
-			agentRegistry: new AgentRegistry(),
-			hasUI: false,
-			interactivePrompts: true,
-			...(mcp ? { enableMCP: true, mcpManager: mcp.manager, mcpTools: mcp.manager.getTools() } : { enableMCP: false }),
-			disableExtensionDiscovery: true,
-			// The only extension root: the downloaded skills and agents (AGT-24).
-			additionalExtensionPaths: [runtime.ompDir],
-			modelPattern: opts.modelPattern,
-			thinkingLevel,
-			outputSchema: opts.outputSchema,
-			outputSchemaMode: "strict",
-			requireYieldTool: !!opts.outputSchema,
-			// Every run keeps a todo list the Discord thread mirrors (AGT-16).
-			customTools: [
-				createTodoTool(todos => opts.onTodos(todos)),
-				...(opts.createIssue ? [createIssueTool(opts.createIssue)] : []),
-				...(opts.profile === "ask" ? createScratchTools(opts.scratchRoot!) : []),
-			],
-			allowRestrictedCustomTools: true,
-			...(toolNames ? { toolNames, restrictToolNames: true } : {}),
-		});
-	} catch (err) {
-		await mcp?.close().catch(() => {});
-		throw err;
-	}
-	const { session, setToolUIContext } = created;
+	const omp = opts.omp;
+	// Admin overrides with the pinned headless values on top; also the process-global settings web_search reads (AGT-11).
+	const settings = await initRunSettings(omp, runtime.agentDir);
+	const { session } = await createAgentSession({
+		cwd: opts.cwd,
+		agentDir: runtime.agentDir,
+		// Always both: omp code paths without a store open their own, without the refresh hook (S1, CRED-03).
+		authStorage: runtime.authStorage,
+		modelRegistry: runtime.modelRegistry,
+		sessionManager,
+		settings,
+		agentRegistry: new AgentRegistry(),
+		hasUI: false,
+		interactivePrompts: false,
+		enableMCP: false,
+		disableExtensionDiscovery: true,
+		// The only extension root: the downloaded skills and agents (AGT-24).
+		additionalExtensionPaths: [runtime.ompDir],
+		skills,
+		// AGT-31: the only spawnable agents (task description and preflight); "" disables spawning (spike A2).
+		spawns: agents.map(agent => agent.name).join(","),
+		subagentEventBus: subagentEvents,
+		modelPattern: opts.modelPattern,
+		thinkingLevel,
+		outputSchema: opts.outputSchema,
+		outputSchemaMode: "strict",
+		requireYieldTool: !!opts.outputSchema,
+		// The scratch-confined file tools (AGT-28, AGT-29).
+		customTools: createScratchTools({ scratch: opts.scratchRoot, skills: skillsDir }),
+		allowRestrictedCustomTools: true,
+		toolNames,
+		restrictToolNames: true,
+	});
 
 	const start = Date.now();
 	let output: unknown;
@@ -194,8 +185,7 @@ export async function runSession(runtime: SessionRuntime, opts: SessionOptions):
 		log("warn", "agent aborted", { run, reason, cost: meter.total.costUsd });
 		session.abort().catch(err => log("warn", "agent abort failed", { run, error: errorMessage(err) }));
 	};
-	// Time spent waiting on a person does not count (AGT-14).
-	const elapsedMs = () => Date.now() - start - opts.ui.pausedMs();
+	const elapsedMs = () => Date.now() - start;
 
 	const transcript = (event: TranscriptEvent) => {
 		try {
@@ -222,6 +212,16 @@ export async function runSession(runtime: SessionRuntime, opts: SessionOptions):
 		transcript({ type: "steer", text });
 		session.steer(text).catch(err => log("warn", "oom steer failed", { run, error: errorMessage(err) }));
 	};
+
+	// AGT-32: a running subagent's cost counts against the limit as it accrues. The parent's stats include it once the
+	// `task` call has returned, so the turn's end resets this.
+	let childCost = 0;
+	const unsubscribeSubagents = subagentEvents.on(TASK_SUBAGENT_EVENT_CHANNEL, data => {
+		const { event } = data as SubagentEventPayload;
+		if (event.type !== "message_end" || !("role" in event.message) || event.message.role !== "assistant") return;
+		childCost += event.message.usage?.cost?.total ?? 0;
+		if (meter.total.costUsd + childCost > opts.limits.costUsd) abortWith("cost");
+	});
 
 	const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
 		switch (event.type) {
@@ -261,6 +261,7 @@ export async function runSession(runtime: SessionRuntime, opts: SessionOptions):
 			case "turn_end": {
 				// Cost is checked at the end of every turn (AGT-14).
 				const usage = { ...meter.update() };
+				childCost = 0;
 				opts.onProgress({ ...lastTool, usage, elapsedMs: elapsedMs() });
 				if (usage.costUsd > opts.limits.costUsd) abortWith("cost");
 				break;
@@ -273,22 +274,17 @@ export async function runSession(runtime: SessionRuntime, opts: SessionOptions):
 
 	let runError: string | undefined;
 	try {
-		setToolUIContext(opts.ui, true);
 		const sessionFile = session.sessionFile;
 		if (!sessionFile) throw new Error("Agent session has no session file");
-		if (toolNames) {
-			const active = session.getActiveToolNames();
-			const missing = toolNames.filter(name => !active.includes(name));
-			if (missing.length > 0) log("warn", "profile tools unavailable", { run, profile: opts.profile, missing });
-		}
+		const active = session.getActiveToolNames();
+		const missing = toolNames.filter(name => !active.includes(name));
+		if (missing.length > 0) log("warn", "profile tools unavailable", { run, profile: opts.profile, missing });
 		await opts.onSessionFile(sessionFile);
 		if (opts.onLoadout) {
 			const disabledAgents = omp.settings["task.disabledAgents"];
 			await captureLoadout(session, {
-				cwd: opts.cwd,
-				ompDir: runtime.ompDir,
+				agents,
 				profile: opts.profile,
-				mcp,
 				disabledAgents: Array.isArray(disabledAgents) ? disabledAgents.filter(a => typeof a === "string") : [],
 			})
 				.then(opts.onLoadout)
@@ -315,7 +311,6 @@ export async function runSession(runtime: SessionRuntime, opts: SessionOptions):
 				if (!aborted && output === undefined) throw err;
 			}
 		};
-		// The orchestrator's prompt already carries the to-do instruction (`runPrompt`).
 		await prompt(opts.prompt);
 		if (opts.outputSchema && output === undefined && !aborted) {
 			// One nudge (AGT-12). The session is idle here, so it must start a new turn: prompt, not a queued followUp.
@@ -331,11 +326,11 @@ export async function runSession(runtime: SessionRuntime, opts: SessionOptions):
 	} finally {
 		clearInterval(clock);
 		unsubscribe();
+		unsubscribeSubagents();
 		const usage = { ...meter.update() };
 		opts.onUsage(usage);
 		transcript({ type: "run_end", usage, ...(aborted ? { aborted } : {}), ...(runError ? { error: runError } : {}) });
 		await session.dispose();
-		await mcp?.close().catch(err => log("warn", "MCP disconnect failed", { run, error: errorMessage(err) }));
 	}
 }
 

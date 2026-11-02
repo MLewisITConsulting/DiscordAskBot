@@ -1,53 +1,44 @@
 /**
- * OPS-06, ported from DevForge: one planning run against a local repository, without GitHub or Discord.
+ * OPS-06: one `ask` run on this machine, without Discord.
  *
- *   bun run dry-run --repo <git repo> --issue <issue.md> [--ref HEAD] [--model <pattern>] [--thinking <level>] [--agent-dir <dir>]
+ *   bun run dry-run --prompt <text> [--file <path>]… [--omp-dir <dir>] [--model <id>] [--thinking <level>] [--agent-dir <dir>]
  *
- * Does what a worker does for a plan run (architecture §2.3): makes the run directories, seeds a run-private auth store,
- * makes a shallow checkout of the start commit (RUN-17, so the AGT-13 no-history rule holds), and spawns the agent host
- * with the `plan` profile, prompt and output schema of the engine's plan job. The issue file's first line is the title
- * (a leading `#` is dropped), the rest its body. Sign-ins come from the developer's own omp agent dir (`--agent-dir`,
- * else `PI_CODING_AGENT_DIR`, else `~/.omp/agent`), which also refreshes them for the run like the orchestrator does
- * (CRED-03); provider API keys in the environment reach omp unchanged. Questions are asked on the console, progress goes
- * to stderr, and the plan (JSON) and usage to stdout. The temporary directory is always removed, also on Ctrl-C.
+ * Does what a worker does for an ask run (architecture §2.3): makes the run directories in a temporary directory, copies
+ * the given files into the scratch copy's `inputs/` (named as CHAT-09 names attachments), seeds a run-private auth store,
+ * and spawns the agent host with the `ask` profile, the engine's prompt, output schema and limits. `--omp-dir` supplies
+ * the skills and agents (AGT-24; `skills/<name>/SKILL.md`, `agents/<name>.md`). Sign-ins come from the developer's own
+ * omp agent dir (`--agent-dir`, else `PI_CODING_AGENT_DIR`, else `~/.omp/agent`), which also refreshes them for the run
+ * like the orchestrator does (CRED-03); provider API keys in the environment reach omp unchanged. Progress goes to
+ * stderr; the answer (JSON), the files produced in `outputs/` and the usage go to stdout. The temporary directory is
+ * always removed, also on Ctrl-C.
  */
 import type { Subprocess } from "bun";
 import { existsSync } from "node:fs";
-import { copyFile, mkdtemp, rm, stat } from "node:fs/promises";
+import { copyFile, cp, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
-import { createInterface, type Interface } from "node:readline";
+import { join, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import type {
-	ExtensionAskDialogQuestion,
-	ExtensionAskDialogResultItem,
-	ExtensionAskDialogSubmitResult,
-	ExtensionUIDialogOptions,
-} from "@oh-my-pi/pi-coding-agent";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent";
 import { parseModelPattern } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { postmortem } from "@oh-my-pi/pi-utils";
-import { PLAN_SCHEMA, planPrompt, runPrompt } from "../src/orchestrator/engine/prompts";
-import type { GhIssue } from "../src/orchestrator/github/types";
+import { ASK_MINUTES, askPrompt, CHAT_SCHEMA } from "../src/orchestrator/engine/prompts";
+import { listOmpAssets } from "../src/orchestrator/store/ompAssets";
+import { safeFileName } from "../src/orchestrator/store/scratch";
 import { openSigninStore, type Signins } from "../src/orchestrator/store/signins";
 import { type Config, parseConfig } from "../src/shared/config";
-import { gitRun } from "../src/shared/git";
 import { errorMessage } from "../src/shared/log";
 import { emptyOmpConfig } from "../src/shared/ompconfig";
 import type { ChildMessage, HostResult, ParentMessage, Reply, StartOptions } from "../src/shared/protocol";
-import { abortError, callUi, type HeadlessUI, headlessUIBase, selectViaAskDialog } from "../src/shared/ui";
-import { runBranch } from "../src/shared/wire";
 import { seedAuthStore } from "../src/worker/auth";
-import { makeCheckout } from "../src/worker/checkout";
 import { killMarkedProcesses } from "../src/worker/host/reap";
-import { DEFAULT_TIMING, HOST_ENTRY, hostEnv, makeRunDirs } from "../src/worker/runner";
+import { DEFAULT_TIMING, HOST_ENTRY, hostEnv, listOutputFiles, makeRunDirs } from "../src/worker/runner";
 
 export interface DryRunOptions {
-	repo: string;
-	/** Markdown or text: the first line is the title, the rest the body. */
-	issueFile: string;
-	/** The start commit, as any git revision (default `HEAD`). */
-	ref?: string;
+	prompt: string;
+	/** Files copied into `inputs/`. */
+	files?: readonly string[];
+	/** Skills and agents root (AGT-24). */
+	ompDir?: string;
 	model?: string;
 	thinking?: string;
 	/** The omp agent dir whose sign-ins the run uses. */
@@ -56,11 +47,9 @@ export interface DryRunOptions {
 	tmpDir?: string;
 	/** The agent host entry; tests use the fixture host. */
 	hostEntry?: string;
-	/** Answers to the agent's questions, one per line. */
-	input: NodeJS.ReadableStream;
-	/** The plan and usage. */
+	/** The answer, the produced files and the usage. */
 	out: NodeJS.WritableStream;
-	/** Questions, progress and warnings. */
+	/** Progress and warnings. */
 	err: NodeJS.WritableStream;
 	/** Ctrl-C: the run is aborted (as by a user), then cleaned up. */
 	signal?: AbortSignal;
@@ -72,138 +61,11 @@ export class DryRunError extends Error {
 }
 
 const USAGE =
-	"usage: bun run dry-run --repo <git repo> --issue <issue.md> [--ref HEAD] [--model <pattern>] [--thinking <level>] [--agent-dir <omp agent dir>]";
+	"usage: bun run dry-run --prompt <text> [--file <path>]… [--omp-dir <dir>] [--model <id>] [--thinking <level>] [--agent-dir <omp agent dir>]";
 
 /** The developer's omp agent dir: `PI_CODING_AGENT_DIR`, else `~/.omp/agent`. */
 export function defaultAgentDir(): string {
 	return process.env.PI_CODING_AGENT_DIR || join(homedir(), ".omp", "agent");
-}
-
-/** The issue file as an issue: first line (without a leading `#`) the title, the rest the body. */
-export function issueFromFile(path: string, text: string): GhIssue {
-	const lines = text.replace(/^\s+/, "").split("\n");
-	const title = (lines[0] ?? "").replace(/^#+\s*/, "").trim();
-	if (!title) throw new DryRunError(`--issue ${path}: the file is empty; its first line must be the issue title`);
-	return {
-		number: 1,
-		title,
-		body: lines.slice(1).join("\n").trim(),
-		state: "open",
-		labels: [],
-		html_url: `file://${path}`,
-		updated_at: new Date().toISOString(),
-		author: "dry-run",
-		isPullRequest: false,
-	};
-}
-
-/** Answers read from the console, one per line. */
-interface LineReader {
-	next(signal?: AbortSignal): Promise<string>;
-	close(): void;
-}
-
-/** Lines of `input`, queued so an answer typed (or piped) before its question is not lost. */
-function lineReader(input: NodeJS.ReadableStream): LineReader {
-	let rl: Interface | undefined;
-	let closed = false;
-	const lines: string[] = [];
-	const waiters: { resolve(line: string): void; reject(err: unknown): void }[] = [];
-	function open(): void {
-		// Not a terminal interface: the TTY stays in cooked mode, so Ctrl-C remains a real SIGINT.
-		rl = createInterface({ input, terminal: false });
-		rl.on("line", line => {
-			const waiter = waiters.shift();
-			if (waiter) waiter.resolve(line);
-			else lines.push(line);
-		});
-		rl.on("close", () => {
-			closed = true;
-			for (const waiter of waiters.splice(0)) waiter.reject(new Error("stdin closed before the question was answered"));
-		});
-	}
-	return {
-		next(signal) {
-			if (signal?.aborted) return Promise.reject(abortError());
-			const queued = lines.shift();
-			if (queued !== undefined) return Promise.resolve(queued);
-			if (closed) return Promise.reject(new Error("stdin closed before the question was answered"));
-			if (!rl) open();
-			const { promise, resolve, reject } = Promise.withResolvers<string>();
-			const waiter = { resolve, reject };
-			waiters.push(waiter);
-			signal?.addEventListener(
-				"abort",
-				() => {
-					const index = waiters.indexOf(waiter);
-					if (index >= 0) waiters.splice(index, 1);
-					reject(abortError());
-				},
-				{ once: true },
-			);
-			return promise;
-		},
-		close() {
-			rl?.close();
-		},
-	};
-}
-
-/** Questions on the console (DevForge `console-ui.ts`): numbered options, a number or a custom answer per line. */
-function consoleUI(reader: LineReader, err: NodeJS.WritableStream): HeadlessUI {
-	async function readLine(prompt: string, signal: AbortSignal | undefined): Promise<string> {
-		err.write(prompt);
-		return (await reader.next(signal)).trim();
-	}
-
-	async function askQuestion(q: ExtensionAskDialogQuestion, signal: AbortSignal | undefined): Promise<ExtensionAskDialogResultItem> {
-		const labels = q.options.map(o => o.label);
-		const lines = ["", ...(q.header ? [`== ${q.header} ==`] : []), q.question];
-		q.options.forEach((option, index) => {
-			const marker = q.recommended === index ? " (recommended)" : "";
-			lines.push(`  ${index + 1}. ${option.label}${marker}${option.description ? ` - ${option.description}` : ""}`);
-		});
-		lines.push(q.multi ? "Enter numbers separated by commas, or type a custom answer:" : "Enter a number, or type a custom answer:");
-		const answer = await readLine(`${lines.join("\n")}\n> `, signal);
-		const base = { id: q.id, question: q.question, options: labels, multi: !!q.multi };
-		const indices = answer.split(",").map(part => Number(part.trim()));
-		if (answer !== "" && indices.every(n => Number.isInteger(n) && n >= 1 && n <= labels.length)) {
-			const selected = indices.map(n => labels[n - 1] as string);
-			return { ...base, selectedOptions: q.multi ? selected : selected.slice(0, 1) };
-		}
-		if (answer === "") {
-			const fallback = labels[q.recommended ?? 0];
-			return { ...base, selectedOptions: fallback === undefined ? [] : [fallback] };
-		}
-		return { ...base, selectedOptions: [], customInput: answer };
-	}
-
-	async function askDialog(questions: ExtensionAskDialogQuestion[], dialogOptions?: ExtensionUIDialogOptions): Promise<ExtensionAskDialogSubmitResult> {
-		const results: ExtensionAskDialogResultItem[] = [];
-		for (const q of questions) results.push(await askQuestion(q, dialogOptions?.signal));
-		return { kind: "submit", results };
-	}
-
-	return {
-		...headlessUIBase(),
-		askDialog,
-		select: (title, options, dialogOptions) => selectViaAskDialog(askDialog, title, options, dialogOptions),
-		input: async (title, _placeholder, dialogOptions) => (await readLine(`\n${title}\n> `, dialogOptions?.signal)) || undefined,
-		editor: async (title, prefill, dialogOptions) => (await readLine(`\n${title}\n> `, dialogOptions?.signal)) || prefill,
-		confirm: async (title, message, dialogOptions) => /^y(es)?$/i.test(await readLine(`\n${title}\n${message}\n[y/N] > `, dialogOptions?.signal)),
-		notify: (message, type) => err.write(`${type === "error" ? "error" : type === "warning" ? "warning" : "note"}: ${message}\n`),
-	};
-}
-
-/** The repository's top level and the start commit `ref` names in it. */
-async function resolveStart(repoArg: string, ref: string): Promise<{ repo: string; commit: string }> {
-	const path = resolve(repoArg);
-	if (!(await stat(path).catch(() => undefined))?.isDirectory()) throw new DryRunError(`--repo ${path}: no such directory`);
-	const top = await gitRun(["rev-parse", "--show-toplevel"], { cwd: path });
-	if (top.exitCode !== 0) throw new DryRunError(`--repo ${path}: not a git repository`);
-	const commit = await gitRun(["rev-parse", "--verify", "--quiet", "--end-of-options", `${ref}^{commit}`], { cwd: path });
-	if (commit.exitCode !== 0) throw new DryRunError(`--ref ${ref}: no such commit in ${top.stdout.trim()}`);
-	return { repo: top.stdout.trim(), commit: commit.stdout.trim() };
 }
 
 /** Opens the developer's sign-in store and checks that some model can be used with it or with the environment's keys. */
@@ -229,6 +91,24 @@ async function openCredentials(agentDir: string, model: string | undefined): Pro
 	}
 }
 
+/** The `--file` paths, checked, with the collision-free CHAT-09 names they get in `inputs/`. */
+async function inputFiles(paths: readonly string[]): Promise<{ path: string; name: string }[]> {
+	const taken = new Set<string>();
+	const files: { path: string; name: string }[] = [];
+	for (const raw of paths) {
+		const path = resolve(raw);
+		if (!(await stat(path).catch(() => undefined))?.isFile()) throw new DryRunError(`--file ${path}: no such file`);
+		const base = safeFileName(path);
+		const dot = base.lastIndexOf(".");
+		const [stem, ext] = dot > 0 ? [base.slice(0, dot), base.slice(dot)] : [base, ""];
+		let name = base;
+		for (let n = 2; taken.has(name); n++) name = `${stem}-${n}${ext}`;
+		taken.add(name);
+		files.push({ path, name });
+	}
+	return files;
+}
+
 function usageLine(result: HostResult): string {
 	const { usage } = result;
 	const parts = [
@@ -240,27 +120,25 @@ function usageLine(result: HostResult): string {
 	return parts.join(" · ");
 }
 
-/** Runs the plan; prints the plan and usage to `out`, and returns the host's result. Throws `DryRunError` for bad options. */
+/** Runs one ask turn; prints the answer, the produced files and the usage to `out`. Throws `DryRunError` for bad options. */
 export async function dryRun(opts: DryRunOptions): Promise<HostResult> {
-	const ref = opts.ref ?? "HEAD";
-	const issuePath = resolve(opts.issueFile);
-	if (!existsSync(issuePath)) throw new DryRunError(`--issue ${issuePath}: no such file`);
-	const issue = issueFromFile(issuePath, await Bun.file(issuePath).text());
+	if (!opts.prompt.trim()) throw new DryRunError("--prompt is empty");
 	let config: Config;
 	try {
-		// The engine's defaults for agent name, thinking and limits; --model and --thinking validated like the config.
+		// The engine's defaults for agent name, thinking and limits; --model and --thinking validated like the settings.
 		config = parseConfig({
 			discord: { guildId: "dry-run", allowedUserIds: ["dry-run"] },
-			github: { appId: 1 },
-			models: { ...(opts.model ? { plan: opts.model } : {}), ...(opts.thinking ? { thinking: opts.thinking } : {}) },
+			models: { ...(opts.model ? { ask: opts.model } : {}), ...(opts.thinking ? { thinking: opts.thinking } : {}) },
 		});
 	} catch (err) {
-		throw new DryRunError(errorMessage(err).replace("Invalid config: models.thinking", "--thinking").replace("Invalid config: models.plan", "--model"));
+		throw new DryRunError(errorMessage(err).replace("Invalid config: models.thinking", "--thinking").replace("Invalid config: models.ask", "--model"));
 	}
-	const start = await resolveStart(opts.repo, ref);
-	const signins = await openCredentials(opts.agentDir, config.models.plan);
-	const reader = lineReader(opts.input);
-	const ui = consoleUI(reader, opts.err);
+	const ompDir = opts.ompDir ? resolve(opts.ompDir) : undefined;
+	if (ompDir && !(await stat(ompDir).catch(() => undefined))?.isDirectory()) throw new DryRunError(`--omp-dir ${ompDir}: no such directory`);
+	const files = await inputFiles(opts.files ?? []);
+	// The prompt names `task` only when the run will have it: at least one valid agent installed (AGT-13, AGT-25).
+	const hasAgents = ompDir ? (await listOmpAssets(ompDir)).agents.some(agent => !agent.problem) : false;
+	const signins = await openCredentials(opts.agentDir, config.models.ask);
 	const runId = crypto.randomUUID();
 	const marker = crypto.randomUUID();
 	const root = await mkdtemp(join(opts.tmpDir ?? tmpdir(), "askbot-dry-run-"));
@@ -275,11 +153,6 @@ export async function dryRun(opts: DryRunOptions): Promise<HostResult> {
 			proc.kill("SIGKILL");
 		}
 	};
-	const onAbort = () => {
-		opts.err.write("\ninterrupted: aborting the run…\n");
-		send({ t: "abort", id: -1, reason: "user" });
-		killTimer ??= setTimeout(killGroup, DEFAULT_TIMING.abortKillMs);
-	};
 	const send = (msg: ParentMessage) => {
 		if (!proc || exited) return;
 		try {
@@ -288,44 +161,42 @@ export async function dryRun(opts: DryRunOptions): Promise<HostResult> {
 			opts.err.write(`warning: agent host send failed: ${errorMessage(err)}\n`);
 		}
 	};
+	const onAbort = () => {
+		opts.err.write("\ninterrupted: aborting the run…\n");
+		send({ t: "abort", id: -1, reason: "user" });
+		killTimer ??= setTimeout(killGroup, DEFAULT_TIMING.abortKillMs);
+	};
 	const reply = (id: number, result: { ok: true; value?: unknown } | { ok: false; error: string }) => send({ t: "reply", id, ...result } as Reply);
 	try {
-		const dirs = await makeRunDirs(root, root, false);
+		const dirs = await makeRunDirs(root, root);
+		// The worker's copy of the skills and agents: the host deletes invalid agents (AGT-31), never in the developer's dir.
+		if (ompDir) await cp(ompDir, dirs.omp, { recursive: true, verbatimSymlinks: true });
 		const credentialIds = await seedAuthStore(dirs.auth, await signins.snapshotForRun());
 		// The developer's custom models and providers, which the credentials check above counted.
 		const models = join(opts.agentDir, "models.yml");
 		if (existsSync(models)) await copyFile(models, join(dirs.auth, "models.yml"));
-		const checkout = join(root, "checkout");
-		await makeCheckout(
-			checkout,
-			{
-				repo: basename(start.repo),
-				startRef: ref,
-				startCommit: start.commit,
-				branch: runBranch(runId),
-				writesCode: false,
-				restore: false,
-				identity: { name: `${config.agent.name} dry run`, email: "dry-run@askbot.invalid" },
-			},
-			{ url: start.repo, env: {} },
-		);
-		opts.err.write(`dry run: planning "${issue.title}" on ${start.commit.slice(0, 12)} (${ref}) of ${start.repo}\n`);
+		const inputs: string[] = [];
+		for (const file of files) {
+			await copyFile(file.path, join(dirs.scratch, "inputs", file.name));
+			inputs.push(`inputs/${file.name}`);
+		}
+		opts.err.write(`dry run: asking${inputs.length > 0 ? ` with ${inputs.join(", ")}` : ""}${ompDir ? `, skills and agents from ${ompDir}` : ""}\n`);
 
 		const startOpts: StartOptions = {
 			runId,
-			cwd: checkout,
+			cwd: dirs.work,
 			sessionDir: dirs.sessions,
-			profile: "plan",
-			...(config.models.plan ? { modelPattern: config.models.plan } : {}),
+			profile: "ask",
+			...(config.models.ask ? { modelPattern: config.models.ask } : {}),
 			thinking: config.models.thinking,
-			prompt: runPrompt(config.agent.name, planPrompt(issue, [])),
-			outputSchema: PLAN_SCHEMA,
-			limits: { minutes: config.limits.planMinutes, costUsd: config.limits.maxCostUsdPerJob },
+			prompt: askPrompt(config.agent.name, opts.prompt, inputs, hasAgents),
+			outputSchema: CHAT_SCHEMA,
+			limits: { minutes: ASK_MINUTES, costUsd: config.limits.maxCostUsdPerTurn },
 			omp: emptyOmpConfig(),
-			wantLoadout: false,
+			wantLoadout: true,
+			scratchRoot: dirs.scratch,
 		};
 		const outcome = Promise.withResolvers<HostResult>();
-		const questions = new Map<number, AbortController>();
 		const startedAt = Date.now();
 		let lastLine = "";
 		const fromHost = (msg: ChildMessage) => {
@@ -338,36 +209,8 @@ export async function dryRun(opts: DryRunOptions): Promise<HostResult> {
 					opts.err.write(`[${Math.round((Date.now() - startedAt) / 1000)}s] ${line}\n`);
 					return;
 				}
-				case "todos":
-					opts.err.write(`${msg.todos.map(todo => `  [${todo.status}] ${todo.content}`).join("\n")}\n`);
-					return;
 				case "session_file":
 					reply(msg.id, { ok: true });
-					return;
-				case "ui": {
-					if (msg.method === "notify") {
-						const a = msg.args as never[];
-						ui.notify(a[0], a[1]);
-						return;
-					}
-					const controller = new AbortController();
-					questions.set(msg.id, controller);
-					callUi(ui, msg.method, msg.args, { ...msg.dialog, signal: controller.signal }).then(
-						value => {
-							if (questions.delete(msg.id)) reply(msg.id, { ok: true, value });
-						},
-						err => {
-							if (questions.delete(msg.id)) reply(msg.id, { ok: false, error: errorMessage(err) });
-						},
-					);
-					return;
-				}
-				case "ui_cancel":
-					questions.get(msg.id)?.abort();
-					questions.delete(msg.id);
-					return;
-				case "tool_call":
-					reply(msg.id, { ok: false, error: `${msg.name} is not available in a dry run` });
 					return;
 				case "credential_request": {
 					const credentialId = credentialIds.get(msg.credentialId);
@@ -384,11 +227,23 @@ export async function dryRun(opts: DryRunOptions): Promise<HostResult> {
 				}
 				case "log": {
 					// The host's own log lines, at warning level and up.
-					let entry: { level?: string; msg?: string } = {};
+					let entry: { level?: string } = {};
 					try {
 						entry = JSON.parse(msg.line);
 					} catch {}
 					if (entry.level === "warn" || entry.level === "error") opts.err.write(`${entry.level}: ${msg.line}\n`);
+					return;
+				}
+				case "transcript":
+					// The tool calls with their arguments, as the thread's transcript records them (RUN-16).
+					if (msg.event.type === "tool_start") opts.err.write(`  ${msg.event.tool} ${msg.event.args}\n`);
+					return;
+				case "loadout": {
+					// AGT-27: what the session actually had.
+					const { tools, skills, agents } = msg.loadout;
+					opts.err.write(
+						`loadout: tools ${tools.join(", ")} · skills ${skills.map(s => s.name).join(", ") || "(none)"} · agents ${agents.map(a => a.name).join(", ") || "(none)"}\n`,
+					);
 					return;
 				}
 				case "done":
@@ -404,7 +259,7 @@ export async function dryRun(opts: DryRunOptions): Promise<HostResult> {
 			cwd: dirs.root,
 			env: hostEnv(dirs, marker),
 			stdin: "ignore",
-			// Its log lines arrive as `log` messages too; stdout stays the plan's.
+			// Its log lines arrive as `log` messages too; stdout stays the answer's.
 			stdout: "ignore",
 			stderr: "inherit",
 			serialization: "json",
@@ -422,16 +277,20 @@ export async function dryRun(opts: DryRunOptions): Promise<HostResult> {
 		else opts.signal?.addEventListener("abort", onAbort, { once: true });
 
 		const result = await outcome.promise;
-		const changed = await gitRun(["status", "--porcelain"], { cwd: checkout });
-		if (changed.stdout.trim()) opts.err.write(`warning: the planning run changed the checkout:\n${changed.stdout}`);
-		opts.out.write(`${result.output === undefined ? "(no plan)" : JSON.stringify(result.output, null, 2)}\n${usageLine(result)}\n`);
+		opts.out.write(`${result.output === undefined ? "(no answer)" : JSON.stringify(result.output, null, 2)}\n`);
+		// CHAT-10: new or changed regular files in `outputs/`, also after a stop; text formats only, so printed as text.
+		const outputs = join(dirs.scratch, "outputs");
+		for (const file of await listOutputFiles(outputs)) {
+			const content = await readFile(file.path, "utf8");
+			opts.out.write(`\n== outputs/${relative(outputs, file.path)} (${Buffer.byteLength(content)} bytes)\n${content}${content.endsWith("\n") ? "" : "\n"}`);
+		}
+		opts.out.write(`${usageLine(result)}\n`);
 		return result;
 	} finally {
 		opts.signal?.removeEventListener("abort", onAbort);
 		clearTimeout(killTimer);
 		killGroup();
 		killMarkedProcesses(marker);
-		reader.close();
 		signins.close();
 		await rm(root, { recursive: true, force: true });
 	}
@@ -442,9 +301,9 @@ async function main(): Promise<number> {
 	try {
 		parsed = parseArgs({
 			options: {
-				repo: { type: "string" },
-				issue: { type: "string" },
-				ref: { type: "string", default: "HEAD" },
+				prompt: { type: "string" },
+				file: { type: "string", multiple: true },
+				"omp-dir": { type: "string" },
 				model: { type: "string" },
 				thinking: { type: "string" },
 				"agent-dir": { type: "string" },
@@ -460,19 +319,18 @@ async function main(): Promise<number> {
 		console.log(USAGE);
 		return 0;
 	}
-	if (!values.repo || !values.issue) {
-		console.error(`dry-run: --repo and --issue are required\n${USAGE}`);
+	if (!values.prompt) {
+		console.error(`dry-run: --prompt is required\n${USAGE}`);
 		return 2;
 	}
 	const interrupt = new AbortController();
 	const run = dryRun({
-		repo: values.repo,
-		issueFile: values.issue,
-		ref: values.ref,
+		prompt: values.prompt,
+		files: values.file ?? [],
+		ompDir: values["omp-dir"],
 		model: values.model,
 		thinking: values.thinking,
 		agentDir: resolve(values["agent-dir"] ?? defaultAgentDir()),
-		input: process.stdin,
 		out: process.stdout,
 		err: process.stderr,
 		signal: interrupt.signal,

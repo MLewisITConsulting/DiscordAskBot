@@ -1,7 +1,8 @@
 import { lstat, mkdir, readdir, readFile, realpath, writeFile } from "node:fs/promises";
-import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { type CustomTool, zod } from "@oh-my-pi/pi-coding-agent";
 import { convertFileWithMarkit } from "@oh-my-pi/pi-coding-agent/utils/markit";
+import { ASSET_NAME_RE } from "../../shared/agentRules";
 
 /** Largest file `write_file` writes (AGT-29); the same 10 MiB the orchestrator accepts as a scratch upload. */
 export const WRITE_MAX_BYTES = 10 * 1024 * 1024;
@@ -10,7 +11,17 @@ export const WRITE_MAX_BYTES = 10 * 1024 * 1024;
  * File tools of ask-only chats (`ask` profile). omp's own `read`, `grep`, `glob`, `bash` and `write` are not
  * confined to a directory, so a public chat gets these instead (AGT-28): every path is resolved against the thread's scratch
  * directory (`StartOptions.scratchRoot`) and anything that leaves it (absolute paths, `..`, symlinks, internal URLs) is refused.
+ * The one exception is `skill://` (AGT-30): `list_files` and `read_file` also read the run's copy of the admin's skills,
+ * each confined to its own skill folder by the same rules; `write_file` refuses it.
  */
+
+/** The two roots the file tools read. */
+export interface ToolRoots {
+	/** The thread's scratch directory: read and written. */
+	scratch: string;
+	/** `<ompDir>/skills`: the run's copy of the admin's skills, read-only. */
+	skills: string;
+}
 
 /** Longest text `read_file` returns in one call. */
 export const READ_MAX_BYTES = 256 * 1024;
@@ -21,6 +32,8 @@ const IMAGE_MAX_BYTES = 5 * 1024 * 1024;
 const CONVERTIBLE: Record<string, true> = { ".pdf": true, ".docx": true, ".pptx": true, ".xlsx": true, ".epub": true };
 const IMAGE_TYPES: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp" };
 const URL_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//;
+/** `skill://<name>` or `skill://<name>/<relative path>`. */
+const SKILL_URI = /^skill:\/\/([^/]*)(?:\/(.*))?$/s;
 
 function isInside(root: string, path: string): boolean {
 	const rel = relative(root, path);
@@ -62,6 +75,22 @@ export async function resolveInside(root: string, rel: string): Promise<string> 
 	return abs;
 }
 
+/**
+ * Absolute path for a tool's `path` argument. `skill://<name>[/<rel>]` resolves inside `<skills>/<name>` (an existing,
+ * non-symlinked directory with an AGT-25 name) with `resolveInside`'s rules, so `..` cannot reach a sibling skill;
+ * anything else is a scratch path. `skill` is the skill's folder for a skill path.
+ */
+export async function resolveToolPath(roots: ToolRoots, path: string): Promise<{ abs: string; skill?: string }> {
+	const m = SKILL_URI.exec(path);
+	if (!m) return { abs: await resolveInside(roots.scratch, path) };
+	const name = m[1]!;
+	const rel = m[2] ?? "";
+	if (!ASSET_NAME_RE.test(name)) throw new Error(`Invalid skill name in ${path}`);
+	const skillDir = join(roots.skills, name);
+	if (!(await lstat(skillDir).catch(() => undefined))?.isDirectory()) throw new Error(`No such skill: ${name}`);
+	return { abs: await resolveInside(skillDir, rel === "" ? "." : rel), skill: skillDir };
+}
+
 /** A page of `text`: lines from `offset` (1-based), at most `limit` lines and `maxBytes` bytes, with a note on how to continue. */
 export function pageText(text: string, offset: number, limit: number, maxBytes: number): string {
 	const lines = text.split("\n");
@@ -83,11 +112,11 @@ export function pageText(text: string, offset: number, limit: number, maxBytes: 
 }
 
 const listParams = zod.object({
-	path: zod.string().optional().describe("Directory to list, relative to your workspace. Default: the whole workspace."),
+	path: zod.string().optional().describe("Directory to list: relative to your workspace, or skill://<name>[/<dir>] for a skill's files. Default: the whole workspace."),
 });
 
 const readParams = zod.object({
-	path: zod.string().describe("File to read, relative to your workspace, e.g. inputs/data.csv."),
+	path: zod.string().describe("File to read: relative to your workspace (e.g. inputs/data.csv), or skill://<name> (the skill's instructions) or skill://<name>/<file>."),
 	offset: zod.number().int().min(1).optional().describe("First line to read (1-based) for text files."),
 	limit: zod.number().int().min(1).max(10_000).optional().describe(`Number of lines to read (default ${READ_DEFAULT_LINES}).`),
 });
@@ -97,16 +126,20 @@ const writeParams = zod.object({
 	content: zod.string().describe("The complete text content of the file."),
 });
 
-function listFilesTool(root: string): CustomTool<typeof listParams> {
+function listFilesTool(roots: ToolRoots): CustomTool<typeof listParams> {
 	return {
 		name: "list_files",
 		label: "List Files",
-		description: "List the files in your workspace (recursively) with their sizes. The user's attached files are in inputs/; files you write to outputs/ are sent back to the user.",
+		description:
+			"List the files in your workspace (recursively) with their sizes. The user's attached files are in inputs/; files you write to outputs/ are sent back to the user. skill://<name> lists a skill's files.",
 		parameters: listParams,
 		approval: "read",
 		loadMode: "essential",
 		async execute(_id, params) {
-			const dir = await resolveInside(root, params.path ?? ".");
+			const { abs: dir, skill } = await resolveToolPath(roots, params.path ?? ".");
+			// Skill entries are shown as the skill:// paths read_file accepts.
+			const base = skill ?? roots.scratch;
+			const prefix = skill ? `skill://${basename(skill)}/` : "";
 			const lines: string[] = [];
 			let truncated = false;
 			async function walk(current: string): Promise<void> {
@@ -116,7 +149,7 @@ function listFilesTool(root: string): CustomTool<typeof listParams> {
 						return;
 					}
 					const path = join(current, entry.name);
-					const rel = relative(root, path).split(sep).join("/");
+					const rel = prefix + relative(base, path).split(sep).join("/");
 					if (entry.isDirectory()) {
 						lines.push(`${rel}/`);
 						await walk(path);
@@ -132,7 +165,7 @@ function listFilesTool(root: string): CustomTool<typeof listParams> {
 	};
 }
 
-function readFileTool(root: string): CustomTool<typeof readParams> {
+function readFileTool(roots: ToolRoots): CustomTool<typeof readParams> {
 	return {
 		name: "read_file",
 		label: "Read File",
@@ -140,9 +173,18 @@ function readFileTool(root: string): CustomTool<typeof readParams> {
 		parameters: readParams,
 		approval: "read",
 		loadMode: "essential",
+		// AGT-30: omp lists the installed skills in the system prompt only when an active tool declares this (spike A1).
+		readsSkillUris: true,
 		async execute(_id, params, _onUpdate, _ctx, signal) {
-			const abs = await resolveInside(root, params.path);
-			const stat = await lstat(abs).catch(() => undefined);
+			const resolved = await resolveToolPath(roots, params.path);
+			const skill = resolved.skill;
+			let abs = resolved.abs;
+			let stat = await lstat(abs).catch(() => undefined);
+			// `skill://<name>` is the skill's folder; read_file serves its SKILL.md.
+			if (skill && stat?.isDirectory()) {
+				abs = await resolveInside(abs, "SKILL.md");
+				stat = await lstat(abs).catch(() => undefined);
+			}
 			if (!stat) throw new Error(`No such file: ${params.path}`);
 			if (!stat.isFile()) throw new Error(`${params.path} is not a file; use list_files`);
 			const ext = extname(abs).toLowerCase();
@@ -177,6 +219,7 @@ function writeFileTool(root: string): CustomTool<typeof writeParams> {
 		loadMode: "essential",
 		async execute(_id, params) {
 			const size = Buffer.byteLength(params.content);
+			if (SKILL_URI.test(params.path)) throw new Error("skills are read-only");
 			if (size > WRITE_MAX_BYTES) throw new Error(`Content is ${size} bytes; the limit is ${WRITE_MAX_BYTES} bytes`);
 			const abs = await resolveInside(root, params.path);
 			if (abs === resolve(root)) throw new Error("Give a file path");
@@ -187,7 +230,7 @@ function writeFileTool(root: string): CustomTool<typeof writeParams> {
 	};
 }
 
-/** `list_files`, `read_file` and `write_file`, confined to `root`. */
-export function createScratchTools(root: string): CustomTool[] {
-	return [listFilesTool(root), readFileTool(root), writeFileTool(root)];
+/** `list_files`, `read_file` and `write_file`, confined to the scratch dir, plus read-only `skill://` paths. */
+export function createScratchTools(roots: ToolRoots): CustomTool[] {
+	return [listFilesTool(roots), readFileTool(roots), writeFileTool(roots.scratch)];
 }

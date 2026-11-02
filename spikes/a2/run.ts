@@ -6,8 +6,9 @@
  *   bun spikes/a2/run.ts
  *
  * Makes a sandbox (run-local HOME and PI_CODING_AGENT_DIR, like a worker), seeds agents in every place omp looks,
- * then imports `spike.ts`, which loads omp. Sign-ins come from the developer's omp store (`~/.omp/agent`, or
- * `A2_AUTH_DIR`); the model is `A2_MODEL` (default anthropic/claude-haiku-5-5). The sandbox is removed afterwards.
+ * then starts `spike.ts` in a child process with that environment: omp (and Bun's `os.homedir()`) read it at load,
+ * as in a worker's agent host (S2). Sign-ins come from the developer's omp store (`~/.omp/agent`, or `A2_AUTH_DIR`);
+ * the model is `A2_MODEL` (default anthropic/claude-haiku-5-5). The sandbox is removed afterwards.
  */
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -17,7 +18,9 @@ const authDir = process.env.A2_AUTH_DIR || process.env.PI_CODING_AGENT_DIR || jo
 const root = await mkdtemp(join(tmpdir(), "askbot-a2-"));
 const home = join(root, "home");
 const agentDir = join(home, ".omp", "agent");
+// The thread's scratch copy (write_file writes here) and the proposed session cwd (nothing the model can write).
 const scratch = join(root, "scratch");
+const work = join(root, "work");
 const ompDir = join(root, "omp");
 
 const agentFile = (name: string, description: string, extra: string, body: string) =>
@@ -35,7 +38,7 @@ await put(
 		"researcher",
 		"Looks things up on the web and reports back in two sentences.",
 		"tools: web_search\n",
-		"You are a research assistant. Use web_search when you need facts. Answer in at most two sentences.",
+		"You are a research assistant. Always call web_search before answering, even if you think you know. Answer in at most two sentences.",
 	),
 );
 // Invalid under AGT-25 (bash is outside the allowlist); the worker must drop it. Here it stays, to see what omp does.
@@ -59,19 +62,20 @@ await put(
 );
 await mkdir(join(scratch, "inputs"), { recursive: true });
 await mkdir(join(scratch, "outputs"), { recursive: true });
+await mkdir(work, { recursive: true });
 
-process.env.HOME = home;
-process.env.PI_CODING_AGENT_DIR = agentDir;
-
-let code = 0;
+const paths = { authDir, agentDir, scratch, work, ompDir, model: process.env.A2_MODEL || "anthropic/claude-haiku-5-5" };
+let code = 2;
 try {
-	// Dynamic on purpose: omp reads HOME / PI_CODING_AGENT_DIR when it loads, so it must load after they are set (S2).
-	const { runSpike } = await import("./spike");
-	code = (await runSpike({ authDir, agentDir, scratch, ompDir, model: process.env.A2_MODEL || "anthropic/claude-haiku-5-5" })) ? 0 : 1;
-} catch (err) {
-	console.error(err);
-	code = 2;
+	const proc = Bun.spawn([process.execPath, join(import.meta.dir, "spike.ts")], {
+		cwd: work,
+		env: { ...process.env, HOME: home, PI_CODING_AGENT_DIR: agentDir, A2_PATHS: JSON.stringify(paths) },
+		stdout: "inherit",
+		stderr: "inherit",
+	});
+	code = await proc.exited;
 } finally {
 	await rm(root, { recursive: true, force: true });
 }
+console.log(`A2 RESULT: ${code === 0 ? "all checks as expected" : `exit ${code}`}`);
 process.exit(code);

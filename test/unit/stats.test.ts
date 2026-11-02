@@ -1,29 +1,40 @@
 import { describe, expect, test } from "bun:test";
-import { type Db, openDb } from "../../src/orchestrator/store/db";
-import { issueOverview, latestLoadouts, loadoutKey, parseUsageWindow, usageReport } from "../../src/orchestrator/store/stats";
+import { type AgentRunOutcome, type Db, openDb } from "../../src/orchestrator/store/db";
+import { activeThreads, LOADOUT_KEY, latestLoadout, parseUsageWindow, saveLoadout, usageReport } from "../../src/orchestrator/store/stats";
 import type { Loadout } from "../../src/shared/agent";
-import type { RunUsage } from "../../src/shared/transcript";
 
 const NOW = new Date("2026-10-15T12:00:00.000Z");
 
-function usage(costUsd: number, input = 100, output = 10): RunUsage {
-	return { costUsd, input, output, cacheRead: 5, cacheWrite: 1 };
+interface RunOpts {
+	channel?: string;
+	user?: string;
+	outcome?: AgentRunOutcome;
+	durationMs?: number;
+	input?: number;
 }
 
-/** Inserts a run whose `finished_at` is `hoursAgo` before NOW (recordRun stamps the real clock, so patch it). */
-function run(db: Db, kind: "plan" | "implement" | "chat", repo: string, costUsd: number, hoursAgo: number, jobId?: string) {
-	db.recordRun({ kind, repo, jobId, threadId: "t", startedAt: NOW.toISOString(), usage: usage(costUsd) });
-	const at = new Date(NOW.getTime() - hoursAgo * 3_600_000).toISOString();
-	db.raw.run("UPDATE agent_runs SET finished_at = ? WHERE id = (SELECT MAX(id) FROM agent_runs)", [at]);
+/** Records a run that finished `hoursAgo` before NOW after `durationMs` (recordRun stamps the real clock, so patch it). */
+function run(db: Db, costUsd: number, hoursAgo: number, opts: RunOpts = {}) {
+	const finished = new Date(NOW.getTime() - hoursAgo * 3_600_000);
+	const started = new Date(finished.getTime() - (opts.durationMs ?? 60_000));
+	db.recordRun({
+		threadId: "t",
+		channelId: opts.channel ?? "c1",
+		userId: opts.user ?? "u1",
+		outcome: opts.outcome ?? "finished",
+		startedAt: started.toISOString(),
+		usage: { costUsd, input: opts.input ?? 100, output: 10, cacheRead: 5, cacheWrite: 1 },
+	});
+	db.raw.run("UPDATE agent_runs SET finished_at = ? WHERE id = (SELECT MAX(id) FROM agent_runs)", [finished.toISOString()]);
 }
 
-describe("usageReport", () => {
-	test("windows filter by finish time and totals split by kind and repo, sorted by cost", () => {
+describe("usageReport (OBS-06)", () => {
+	test("windows filter by finish time; totals split by ask channel and by user, highest cost first", () => {
 		const db = openDb(":memory:");
-		run(db, "plan", "o/a", 1, 1);
-		run(db, "implement", "o/a", 2, 30);
-		run(db, "chat", "o/b", 0.5, 24 * 10);
-		run(db, "plan", "o/b", 4, 24 * 40);
+		run(db, 1, 1, { channel: "c1", user: "alice" });
+		run(db, 2, 30, { channel: "c2", user: "bob" });
+		run(db, 0.5, 24 * 10, { channel: "c2", user: "alice" });
+		run(db, 4, 24 * 40, { channel: "c1", user: "carol", input: 1000 });
 
 		const day = usageReport(db, "24h", NOW);
 		expect(day.totals).toEqual({ runs: 1, costUsd: 1, tokensIn: 100, tokensOut: 10, cacheRead: 5, cacheWrite: 1 });
@@ -31,56 +42,57 @@ describe("usageReport", () => {
 
 		const week = usageReport(db, "7d", NOW);
 		expect(week.totals.runs).toBe(2);
-		expect(week.byKind).toEqual([
-			{ kind: "implement", runs: 1, costUsd: 2 },
-			{ kind: "plan", runs: 1, costUsd: 1 },
+		expect(week.byChannel).toEqual([
+			{ id: "c2", runs: 1, costUsd: 2, tokensIn: 100, tokensOut: 10 },
+			{ id: "c1", runs: 1, costUsd: 1, tokensIn: 100, tokensOut: 10 },
 		]);
 
 		const all = usageReport(db, "all", NOW);
 		expect(all.since).toBeUndefined();
 		expect(all.totals.costUsd).toBe(7.5);
-		expect(all.byRepo).toEqual([
-			{ repo: "o/b", runs: 2, costUsd: 4.5 },
-			{ repo: "o/a", runs: 2, costUsd: 3 },
+		expect(all.byChannel.map(g => [g.id, g.runs, g.costUsd])).toEqual([
+			["c1", 2, 5],
+			["c2", 2, 2.5],
 		]);
+		expect(all.byUser).toEqual([
+			{ id: "carol", runs: 1, costUsd: 4, tokensIn: 1000, tokensOut: 10 },
+			{ id: "bob", runs: 1, costUsd: 2, tokensIn: 100, tokensOut: 10 },
+			{ id: "alice", runs: 2, costUsd: 1.5, tokensIn: 200, tokensOut: 20 },
+		]);
+	});
+
+	test("run counts by outcome and the average duration; none in the window reads zero and null", () => {
+		const db = openDb(":memory:");
+		expect(usageReport(db, "7d", NOW).outcomes).toEqual({ finished: 0, failed: 0, stopped: 0, limit: 0, avgDurationMs: null });
+		run(db, 1, 1, { outcome: "finished", durationMs: 10_000 });
+		run(db, 1, 1, { outcome: "finished", durationMs: 20_000 });
+		run(db, 1, 1, { outcome: "failed", durationMs: 30_000 });
+		run(db, 1, 1, { outcome: "stopped", durationMs: 40_000 });
+		run(db, 1, 1, { outcome: "limit", durationMs: 50_000 });
+		run(db, 1, 24 * 30, { outcome: "failed", durationMs: 1_000_000 });
+		expect(usageReport(db, "7d", NOW).outcomes).toEqual({ finished: 2, failed: 1, stopped: 1, limit: 1, avgDurationMs: 30_000 });
 	});
 
 	test("daily series covers 14 UTC days oldest first, zero-filled", () => {
 		const db = openDb(":memory:");
-		run(db, "plan", "o/a", 1, 1);
-		run(db, "plan", "o/a", 2, 2);
-		run(db, "plan", "o/a", 3, 24 * 3);
-		run(db, "plan", "o/a", 9, 24 * 20);
+		run(db, 1, 1);
+		run(db, 2, 2);
+		run(db, 3, 24 * 3);
+		run(db, 9, 24 * 20);
 		const { daily } = usageReport(db, "7d", NOW);
 		expect(daily).toHaveLength(14);
 		expect(daily[0]!.day).toBe("2026-10-02");
 		expect(daily.at(-1)).toEqual({ day: "2026-10-15", costUsd: 3 });
 		expect(daily.find(d => d.day === "2026-10-12")).toEqual({ day: "2026-10-12", costUsd: 3 });
+		expect(daily.find(d => d.day === "2026-10-13")).toEqual({ day: "2026-10-13", costUsd: 0 });
 		expect(daily.reduce((sum, d) => sum + d.costUsd, 0)).toBe(6);
 	});
 
-	test("job outcomes count statuses per kind", () => {
+	test("setup time: claim and agent start are recorded; runs started in the window count (NFR-06)", () => {
 		const db = openDb(":memory:");
-		const issue = db.insertIssue("o/a", 1, "t");
-		const ok = db.insertJob(issue.id, "plan");
-		db.claimNextJob();
-		db.finishJob(ok.id, { status: "succeeded" });
-		const bad = db.insertJob(issue.id, "implement");
-		db.claimNextJob();
-		db.finishJob(bad.id, { status: "failed", error: "boom" });
-
-		const { jobs } = usageReport(db, "all");
-		expect(jobs.map(j => [j.kind, j.succeeded, j.failed, j.cancelled])).toEqual([
-			["implement", 0, 1, 0],
-			["plan", 1, 0, 0],
-		]);
-		expect(jobs[1]!.avgDurationMs).toBeGreaterThanOrEqual(0);
-	});
-
-	test("setup time: claim and agent start are recorded; per repository over the window, slowest average first (NFR-06)", () => {
-		const db = openDb(":memory:");
+		db.insertAskChat("t0", "c1", "u1");
 		// Recording: the claim stamps claimed_at, `registered` (→ running) stamps started_at.
-		const recorded = db.insertRun({ kind: "draft", draftId: "d0", repo: "o/a" });
+		const recorded = db.insertRun({ threadId: "t0" });
 		const claimed = db.claimRun("worker-1", 60_000)!;
 		expect(claimed.id).toBe(recorded.id);
 		expect(claimed.claimed_at).not.toBeNull();
@@ -88,26 +100,24 @@ describe("usageReport", () => {
 		const started = db.transitionRun(recorded.id, ["assigned"], "running")!;
 		expect(Date.parse(started.started_at!)).toBeGreaterThanOrEqual(Date.parse(claimed.claimed_at!));
 
+		db.raw.run("DELETE FROM runs");
+		expect(usageReport(db, "24h", NOW).setup).toBeNull();
 		const at = (msAgo: number) => new Date(NOW.getTime() - msAgo).toISOString();
-		const setupRun = (id: string, repo: string | undefined, setupMs: number, startedMsAgo: number) => {
-			const row = db.insertRun({ kind: repo ? "draft" : "ask", draftId: id, ...(repo ? { repo } : {}) });
+		const setupRun = (thread: string, setupMs: number, startedMsAgo: number) => {
+			db.insertAskChat(thread, "c1", "u1");
+			const row = db.insertRun({ threadId: thread });
 			db.raw.run("UPDATE runs SET claimed_at = ?, started_at = ? WHERE id = ?", [at(startedMsAgo + setupMs), at(startedMsAgo), row.id]);
 		};
-		db.raw.run("DELETE FROM runs");
-		setupRun("d1", "o/fast", 10_000, 3_600_000);
-		setupRun("d2", "o/slow", 300_000, 3_600_000);
-		setupRun("d3", "o/slow", 100_000, 7_200_000);
-		setupRun("d4", undefined, 4_000, 3_600_000);
-		setupRun("d5", "o/fast", 900_000, 3 * 86_400_000); // outside 24h
+		setupRun("t1", 10_000, 3_600_000);
+		setupRun("t2", 300_000, 3_600_000);
+		setupRun("t3", 20_000, 7_200_000);
+		setupRun("t4", 900_000, 3 * 86_400_000); // outside 24h
 		// Never started (still setting up): not counted.
-		db.insertRun({ kind: "draft", draftId: "d6", repo: "o/fast" });
+		db.insertAskChat("t5", "c1", "u1");
+		db.insertRun({ threadId: "t5" });
 
-		expect(usageReport(db, "24h", NOW).setup).toEqual([
-			{ repo: "o/slow", runs: 2, avgMs: 200_000, maxMs: 300_000 },
-			{ repo: "o/fast", runs: 1, avgMs: 10_000, maxMs: 10_000 },
-			{ repo: "ask", runs: 1, avgMs: 4_000, maxMs: 4_000 },
-		]);
-		expect(usageReport(db, "7d", NOW).setup[0]).toEqual({ repo: "o/fast", runs: 2, avgMs: 455_000, maxMs: 900_000 });
+		expect(usageReport(db, "24h", NOW).setup).toEqual({ runs: 3, avgMs: 110_000, maxMs: 300_000 });
+		expect(usageReport(db, "7d", NOW).setup).toEqual({ runs: 4, avgMs: 307_500, maxMs: 900_000 });
 	});
 });
 
@@ -118,22 +128,26 @@ test("parseUsageWindow falls back to 7d for unknown values", () => {
 	expect(parseUsageWindow(null)).toBe("7d");
 });
 
-test("issueOverview counts every state and lists open issues with their active job", () => {
+test("activeThreads lists ask threads with an unfinished run, oldest first", () => {
 	const db = openDb(":memory:");
-	const a = db.insertIssue("o/a", 1, "one");
-	db.insertJob(a.id, "plan");
-	const b = db.insertIssue("o/a", 2, "two");
-	db.updateIssue(b.id, { state: "done" });
-	const overview = issueOverview(db);
-	expect(overview.counts).toMatchObject({ queued: 1, done: 1, planning: 0 });
-	expect(overview.open).toHaveLength(1);
-	expect(overview.open[0]).toMatchObject({ number: 1, state: "queued", job: "plan", threadId: null });
+	db.insertAskChat("t1", "c1", "alice");
+	db.insertAskChat("t2", "c2", "bob");
+	db.insertAskChat("t3", "c1", "carol");
+	db.insertRun({ threadId: "t1" });
+	const done = db.insertRun({ threadId: "t2" });
+	db.transitionRun(done.id, ["pending"], "finished");
+	db.insertRun({ threadId: "t3" });
+	expect(activeThreads(db)).toEqual([
+		{ threadId: "t1", channelId: "c1", ownerId: "alice" },
+		{ threadId: "t3", channelId: "c1", ownerId: "carol" },
+	]);
 });
 
-test("latestLoadouts returns stored loadouts in profile order", () => {
+test("the latest loadout survives in kv (AGT-27)", () => {
 	const db = openDb(":memory:");
-	const loadout = (profile: Loadout["profile"]): Loadout => ({ capturedAt: NOW.toISOString(), profile, tools: [], skills: [], agents: [], mcp: [] });
-	db.kvSet(loadoutKey("chat"), JSON.stringify(loadout("chat")));
-	db.kvSet(loadoutKey("plan"), JSON.stringify(loadout("plan")));
-	expect(latestLoadouts(db).map(l => l.profile)).toEqual(["plan", "chat"]);
+	expect(latestLoadout(db)).toBeUndefined();
+	const loadout: Loadout = { capturedAt: NOW.toISOString(), profile: "ask", tools: ["read_file", "yield"], skills: [], agents: [] };
+	saveLoadout(db, loadout);
+	expect(db.kvGet(LOADOUT_KEY)).toBe(JSON.stringify(loadout));
+	expect(latestLoadout(db)).toEqual(loadout);
 });

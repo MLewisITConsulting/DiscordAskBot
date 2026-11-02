@@ -1,383 +1,380 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+/**
+ * Phase 5 exit (implementation §4): a fresh install configured entirely in the browser — setup token → admin account →
+ * the Discord settings → an ask channel chosen from the dropdown → model sign-in — with each step's validation errors
+ * shown. The real orchestrator admin API (vault, controller, every feature route as `main.ts` mounts them) behind the
+ * real web server; Discord's REST API and gateway and the provider sign-in are faked. Forms are read from the served HTML and posted back the way a browser submits them.
+ */
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Subprocess } from "bun";
+import type { OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/registry/oauth/types";
+import { ChannelType, PermissionFlagsBits as P } from "discord-api-types/v10";
+import { createAdminApi } from "../../src/orchestrator/api/admin";
+import { createAdminFeatures } from "../../src/orchestrator/api/features";
 import { type InternalApi, startInternalApi } from "../../src/orchestrator/api/server";
-import { createWorkerDispatcher, type WorkerDispatcher } from "../../src/orchestrator/dispatch/workers";
+import { createFakeDispatcher } from "../../src/orchestrator/dispatch/fake";
 import { type Controller, createController } from "../../src/orchestrator/engine/controller";
-import { createGitHub } from "../../src/orchestrator/github/app";
-import { createRepos } from "../../src/orchestrator/git/repos";
+import type { SigninBackend } from "../../src/orchestrator/store/accounts";
 import { openAgentLog } from "../../src/orchestrator/store/agentlog";
 import { type Db, dbPath, openDb } from "../../src/orchestrator/store/db";
-import { ensureOmpAssetsDir, skillsBundle } from "../../src/orchestrator/store/ompAssets";
 import { openSignins, type Signins } from "../../src/orchestrator/store/signins";
 import { openVault } from "../../src/orchestrator/store/vault";
-import { parseSettings } from "../../src/shared/config";
-import { git } from "../../src/shared/git";
-import { setLogSink } from "../../src/shared/log";
-import { workerRoot } from "../../src/worker/status";
-import { createFakeDiscord, type Emitted, type FakeDiscord, type FakeMessage } from "../fakes/discord";
-import { type FakeGitHub, startFakeGitHub } from "../fakes/github";
+import type { LoginState } from "../../src/shared/adminModels";
+import { ASK_CHANNEL_MISSING } from "../../src/shared/config";
+import { openRollingFiles } from "../../src/shared/rollinglog";
+import { createAdminClient } from "../../src/web/adminClient";
+import { FEATURE_PAGES } from "../../src/web/pages";
+import { startWebServer, type WebServer } from "../../src/web/server";
+import { outsideImageUpdater } from "../fakes/ompUpdates";
+import { eventually } from "../fakes/adminPages";
+import { createFakeDiscord } from "../fakes/discord";
+import { type FakeDiscordRest, startFakeDiscordRest } from "../fakes/discordRest";
 
-/**
- * Phase 5 exit (implementation.md §4) on the fake surfaces: the real controller, bot, scheduler, dispatcher, git
- * endpoint, mirrors and runs repos, with worker processes (`test/fixtures/worker-process.ts`) running the fixture agent
- * host. Its `auto` script plays whatever each run's output schema asks for, driven by a `fixture:auto` marker in the
- * issue or request. "GitHub" is the fake API server over local bare repositories: what the orchestrator pushes is what
- * the API reports. The orchestrator is restarted at every step of each flow; nothing may be lost or done twice (NFR-03).
- */
+const WEB_TOKEN = "web-token-for-phase5";
+const SETUP_TOKEN = "setup-token-for-phase5";
+const PASSWORD = "correct horse battery";
+const ADMIN_DISCORD_USER = "234567890123456789";
 
-const WORKER_TOKEN = "phase5-worker-token";
-const WORK = "work-channel";
-const ALICE = "u-alice";
-const LEASE_MS = 1_500;
-const WORKER_PROCESS = join(import.meta.dir, "..", "fixtures", "worker-process.ts");
-const MARKER = "fixture:auto";
-
-const cleanups: (() => Promise<void> | void)[] = [];
-afterEach(async () => {
-	for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
-});
-
-async function until(cond: () => boolean | Promise<boolean>, what: string, timeoutMs = 20_000): Promise<void> {
-	const end = Date.now() + timeoutMs;
-	while (!(await cond())) {
-		if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
-		await Bun.sleep(20);
-	}
-}
-
-interface Orchestrator {
-	db: Db;
-	dispatcher: WorkerDispatcher;
-	api: InternalApi;
-	controller: Controller;
-	stop(): Promise<void>;
-}
-
-interface Harness {
-	discord: FakeDiscord;
-	gh: FakeGitHub;
-	orch: Orchestrator;
-	/** Where the bare "GitHub" repositories live. */
-	gitRoot: string;
-	/** The test's temp root; agent hosts dump what they see to `<root>/host-dumps` (SEC-01). */
-	root: string;
-	restart(): Promise<void>;
-	/** Head of `branch` on "GitHub", or undefined. */
-	head(repo: string, branch: string): Promise<string | undefined>;
-	/** Commit subjects of `branch` on "GitHub", newest first. */
-	log(repo: string, branch: string): Promise<string[]>;
-	work(subcommand: string, options: Record<string, string | number>, channelId?: string): Promise<Emitted>;
-	click(m: FakeMessage, label: string): Promise<Emitted>;
-}
-
-/** A bare repository on "GitHub" with one commit on `main`. */
-async function seedRepo(gitRoot: string, repo: string): Promise<void> {
-	const bare = join(gitRoot, `${repo}.git`);
-	const work = join(gitRoot, "seed", repo);
-	await mkdir(bare, { recursive: true });
-	await mkdir(work, { recursive: true });
-	await git(["init", "-q", "--bare", "-b", "main", bare]);
-	await git(["init", "-q", "-b", "main"], { cwd: work });
-	await writeFile(join(work, "README.md"), `# ${repo}\n`);
-	await git(["add", "-A"], { cwd: work });
-	await git(["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "Initial commit"], { cwd: work });
-	await git(["push", "-q", bare, "main"], { cwd: work });
-}
-
-async function boot(): Promise<Harness> {
-	const root = await mkdtemp(join(tmpdir(), "askbot-phase5-"));
-	cleanups.push(() => rm(root, { recursive: true, force: true }));
-	// The in-process components log a lot; keep the test output readable.
-	setLogSink(() => {});
-	cleanups.push(() => setLogSink(undefined));
-	const stateDir = join(root, "state");
-	const gitRoot = join(root, "github");
-	await mkdir(stateDir, { recursive: true });
-	const ompDir = join(stateDir, "omp");
-	await ensureOmpAssetsDir(ompDir);
-	const masterKey = Buffer.from(crypto.randomUUID() + crypto.randomUUID(), "utf8");
-
-	const gh = startFakeGitHub({ gitRoot });
-	cleanups.push(() => gh.stop());
-	const discord = createFakeDiscord({ guildId: "g1", channels: [{ id: WORK, name: "work" }] });
-	const alice = discord.actor(ALICE, { username: "alice" });
-
-	let port = 0;
-	async function start(first: boolean): Promise<Orchestrator> {
-		const db = openDb(dbPath(stateDir));
-		const vault = await openVault(db, masterKey);
-		if (first) {
-			await vault.initialize("admin", "correct horse battery");
-			vault.writeSettings(
-				parseSettings({
-					config: {
-						discord: { guildId: "g1", allowedUserIds: [ALICE], workChannelId: WORK },
-						github: { appId: gh.appId, pollIntervalSeconds: 1 },
-					},
-					secrets: { discordToken: "discord-token", githubAppPrivateKey: gh.privateKey },
-				}),
-			);
-		}
-		const settings = () => vault.readSettings();
-		const signins: Signins = await openSignins(stateDir);
-		const dispatcher = createWorkerDispatcher({
-			db,
-			stateDir,
-			// Every worker here connects from 127.0.0.1 (architecture §6 address binding is tested in dispatch.test.ts).
-			bindWorkerAddresses: false,
-			limits: () => {
-				const config = settings()?.config;
-				if (!config) return undefined;
-				return { maxConcurrentJobs: config.limits.maxConcurrentJobs, maxChatSessions: config.limits.maxChatSessions, maxConcurrentRuns: 4 };
-			},
-			reattachGraceMs: 10_000,
-			spec: {
-				stateDir,
-				ompConfig: () => vault.readOmpConfig(),
-				providerKeys: () => ({}),
-				credentials: () => signins.snapshotForRun(),
-				skillsHash: async () => (await skillsBundle(ompDir)).hash,
-			},
-			skills: () => skillsBundle(ompDir),
-			credentialRequest: req => signins.handleCredentialRequest(req),
-			leaseMs: LEASE_MS,
-			sweepMs: 50,
-			repos: createRepos({ stateDir, remoteUrl: repo => `file://${join(gitRoot, `${repo}.git`)}` }),
-		});
-		const api = startInternalApi({
-			host: "127.0.0.1",
-			port,
-			stateDir,
-			db,
-			version: "0.0.0-test",
-			workerCapacity: 4,
-			phase: () => controller.status().phase,
-			config: () => settings()?.config,
-			dispatcher,
-			admin: { handle: async () => new Response("admin") },
-			workers: dispatcher,
-			workerToken: WORKER_TOKEN,
-		});
-		port = Number(new URL(api.url).port);
-		const controller = createController({
-			stateDir,
-			db,
-			vault,
-			agentLog: await openAgentLog({ dir: join(stateDir, "logs", "agent") }),
-			dispatcher,
-			connectDiscord: () => discord,
-			connectGitHub: ({ appId, privateKey, labels }) => createGitHub({ appId, privateKey, labels, baseUrl: gh.url, throttle: false }),
-		});
-		await controller.apply();
-		expect(controller.status()).toMatchObject({ phase: "running", error: undefined });
-		let stopped = false;
-		const stop = async () => {
-			if (stopped) return;
-			stopped = true;
-			// main.ts's shutdown order (RUN-09): runs keep going on their workers.
-			await api.stop();
-			dispatcher.close();
-			await controller.stop();
-			signins.close();
-			db.close();
-		};
-		cleanups.push(stop);
-		return { db, dispatcher, api, controller, stop };
-	}
-
-	// A stand-in for the launcher (LCH-02): a worker for each pending run, one per 3 s at most while the run is unclaimed.
-	const workers: { proc: Subprocess<"ignore", "pipe", "pipe">; root: string; startedAt: number }[] = [];
-	const launcher = setInterval(() => {
-		let pending: number;
-		try {
-			pending = h.orch.dispatcher.pendingRuns();
-		} catch {
-			// The orchestrator is restarting: its database is closed for a moment.
-			return;
-		}
-		const starting = workers.filter(w => Date.now() - w.startedAt < 3_000).length;
-		for (let i = starting; i < pending; i++) {
-			const proc = Bun.spawn(["bun", WORKER_PROCESS], {
-				env: {
-					...process.env,
-					ASKBOT_ORCHESTRATOR_URL: h.orch.api.url,
-					TEST_WORKER_TOKEN: WORKER_TOKEN,
-					TEST_CLAIM_TIMEOUT_MS: "4000",
-					// Every agent host records what its agent can read (SEC-01, AGT-02).
-					TEST_HOST_DUMP_DIR: join(root, "host-dumps"),
-				},
-				stdin: "ignore",
-				stdout: "pipe",
-				stderr: "pipe",
+/** Anthropic-like browser flow: the admin pastes the code from the redirect; only `good-code` is accepted. */
+function fakeSignin(signins: Signins): SigninBackend {
+	return {
+		providers: () => [{ id: "anthropic", name: "Anthropic (Claude Pro/Max)", storedAs: "anthropic" }],
+		async login(_providerId: string, ctrl: OAuthLoginCallbacks) {
+			ctrl.onAuth({ url: "https://claude.example.com/oauth/authorize?redirect_uri=http://localhost:54545/callback" });
+			const pasted = (await ctrl.onManualCodeInput!(ctrl.signal)).trim();
+			if (pasted !== "good-code") throw new Error("Token exchange failed: invalid code");
+			await signins.authStorage.credentials.upsert("anthropic", {
+				type: "oauth",
+				access: "access-token",
+				refresh: "refresh-token",
+				expires: Date.now() + 3_600_000,
+				email: "admin@example.com",
+				authorizedAt: Date.now(),
 			});
-			void new Response(proc.stdout).text();
-			void new Response(proc.stderr).text();
-			workers.push({ proc, root: workerRoot(join(tmpdir(), "askbot-worker"), proc.pid), startedAt: Date.now() });
-		}
-	}, 100);
-	cleanups.push(async () => {
-		clearInterval(launcher);
-		for (const w of workers) {
-			const children = Bun.spawnSync(["pgrep", "-P", String(w.proc.pid)]).stdout.toString().split("\n").filter(Boolean).map(Number);
-			w.proc.kill("SIGKILL");
-			for (const pid of children) {
-				for (const target of [-pid, pid]) {
-					try {
-						process.kill(target, "SIGKILL");
-					} catch {}
-				}
-			}
-			await w.proc.exited;
-			await rm(w.root, { recursive: true, force: true });
-		}
-	});
+			return { email: "admin@example.com" };
+		},
+		models: () => signins.authStorage.credentials.list().map(row => ({ provider: row.provider, id: `${row.provider}/claude-test`, name: "Claude test" })),
+		changed() {},
+	};
+}
 
-	const h: Harness = {
+const ENTITIES: Record<string, string> = { "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#39;": "'", "&#x27;": "'" };
+const unescape = (s: string) => s.replace(/&(?:amp|lt|gt|quot|#39|#x27);/g, e => ENTITIES[e]!);
+
+/** The fields a browser would submit for the form posting to `action`, before any button is pressed. */
+async function formFields(page: string, action: string): Promise<Record<string, string>> {
+	const fields: [string, string][] = [];
+	let inForm = false;
+	let select: { name: string; selected?: string; first?: string } | undefined;
+	let textarea: { name: string; text: string } | undefined;
+	let found = false;
+	await new HTMLRewriter()
+		.on("form", {
+			element(el) {
+				inForm = el.getAttribute("action") === action;
+				found ||= inForm;
+				el.onEndTag(() => {
+					inForm = false;
+				});
+			},
+		})
+		.on("input", {
+			element(el) {
+				const name = el.getAttribute("name");
+				const type = el.getAttribute("type") ?? "text";
+				if (!inForm || !name || ["submit", "button", "file", "reset"].includes(type)) return;
+				if ((type === "checkbox" || type === "radio") && !el.hasAttribute("checked")) return;
+				fields.push([name, unescape(el.getAttribute("value") ?? (type === "checkbox" ? "on" : ""))]);
+			},
+		})
+		.on("select", {
+			element(el) {
+				const name = el.getAttribute("name");
+				if (!inForm || !name) return;
+				select = { name };
+				el.onEndTag(() => {
+					const value = select!.selected ?? select!.first;
+					if (value !== undefined) fields.push([select!.name, value]);
+					select = undefined;
+				});
+			},
+		})
+		.on("option", {
+			element(el) {
+				if (!select || el.hasAttribute("disabled")) return;
+				const value = unescape(el.getAttribute("value") ?? "");
+				if (el.hasAttribute("selected")) select.selected = value;
+				select.first ??= value;
+			},
+		})
+		.on("textarea", {
+			element(el) {
+				const name = el.getAttribute("name");
+				if (!inForm || !name) return;
+				textarea = { name, text: "" };
+				el.onEndTag(() => {
+					fields.push([textarea!.name, unescape(textarea!.text).replace(/^\n/, "")]);
+					textarea = undefined;
+				});
+			},
+			text(chunk) {
+				if (textarea) textarea.text += chunk.text;
+			},
+		})
+		.transform(new Response(page))
+		.text();
+	if (!found) throw new Error(`no form posting to ${action}`);
+	return Object.fromEntries(fields);
+}
+
+/** `value → label` of a select's enabled options, and the disabled ones' labels. */
+function selectOptions(page: string, name: string): { enabled: Map<string, string>; disabled: string[] } {
+	const select = new RegExp(`<select[^>]*name="${name.replaceAll(".", "\\.")}"[^>]*>([\\s\\S]*?)</select>`).exec(page);
+	if (!select) throw new Error(`no select ${name}`);
+	const enabled = new Map<string, string>();
+	const disabled: string[] = [];
+	for (const m of select[1]!.matchAll(/<option([^>]*)>([^<]*)<\/option>/g)) {
+		const value = /value="([^"]*)"/.exec(m[1]!)?.[1] ?? "";
+		if (/\bdisabled\b/.test(m[1]!)) disabled.push(unescape(m[2]!));
+		else enabled.set(value, unescape(m[2]!));
+	}
+	return { enabled, disabled };
+}
+
+interface Install {
+	stateDir: string;
+	db: Db;
+	signins: Signins;
+	controller: Controller;
+	api: InternalApi;
+	web: WebServer;
+	discord: FakeDiscordRest;
+	cookie?: string;
+	get(path: string): Promise<Response>;
+	post(path: string, fields: Record<string, string>): Promise<Response>;
+	/** Follows a POST's redirect like a browser and returns the page shown. */
+	submit(path: string, fields: Record<string, string>): Promise<{ status: number; page: string }>;
+}
+
+let s: Install;
+
+beforeAll(async () => {
+	const stateDir = mkdtempSync(join(tmpdir(), "askbot-phase5-"));
+	mkdirSync(join(stateDir, "logs", "orchestrator"), { recursive: true });
+	const db = openDb(dbPath(stateDir));
+	const vault = await openVault(db);
+	const agentLog = await openAgentLog({ dir: join(stateDir, "logs", "agent"), maxBytes: 1024 ** 3 });
+	const processLog = openRollingFiles({ dir: join(stateDir, "logs", "orchestrator"), prefix: "orchestrator", maxBytes: 1024 ** 3 });
+	const signins = await openSignins(stateDir);
+	const discord = startFakeDiscordRest({ token: "real-bot-token" });
+	const dispatcher = createFakeDispatcher();
+	const controller = createController({
+		stateDir,
+		ompDir: join(stateDir, "omp"),
+		db,
+		vault,
+		agentLog,
+		dispatcher,
+		connectDiscord: () => createFakeDiscord({ guildId: discord.guildId }),
+	});
+	const features = createAdminFeatures({
+		vault,
+		signins,
+		agentLog,
+		processLog,
+		stateDir,
+		ompDir: join(stateDir, "omp"),
+		ompUpdates: outsideImageUpdater(db),
+		discordApi: discord.api,
+		signinBackend: fakeSignin(signins),
+	});
+	const admin = createAdminApi({
+		db,
+		vault,
+		controller,
+		dispatcher,
+		version: "0.0.0-test",
+		workerCapacity: 4,
+		webToken: WEB_TOKEN,
+		setupToken: SETUP_TOKEN,
+		routes: features.routes,
+		modelAccounts: features.modelAccounts,
+		checkChannels: features.checkChannels,
+	});
+	const api = startInternalApi({
+		host: "127.0.0.1",
+		port: 0,
+		stateDir,
+		db,
+		version: "0.0.0-test",
+		workerCapacity: 4,
+		phase: () => controller.status().phase,
+		config: () => undefined,
+		dispatcher,
+		admin,
+	});
+	await controller.apply();
+	const web = startWebServer({
+		admin: createAdminClient({ baseUrl: api.url, token: WEB_TOKEN, timeoutMs: 5_000 }),
+		host: "127.0.0.1",
+		port: 0,
+		pages: FEATURE_PAGES,
+	});
+	const headers = (): Record<string, string> => (s.cookie ? { cookie: s.cookie } : {});
+	s = {
+		stateDir,
+		db,
+		signins,
+		controller,
+		api,
+		web,
 		discord,
-		gh,
-		gitRoot,
-		root,
-		orch: await start(true),
-		async restart() {
-			await h.orch.stop();
-			h.orch = await start(false);
-		},
-		async head(repo, branch) {
-			const r = await git(["for-each-ref", "--format=%(objectname)", `refs/heads/${branch}`], { cwd: join(gitRoot, `${repo}.git`) });
-			return r || undefined;
-		},
-		async log(repo, branch) {
-			return (await git(["log", "--format=%s", branch], { cwd: join(gitRoot, `${repo}.git`) })).split("\n");
-		},
-		work: (subcommand, options, channelId = WORK) => discord.emitCommand({ command: "work", subcommand, options, actor: alice, channelId }),
-		click(m, label) {
-			const button = m.components.flatMap(row => row.components).find(b => "label" in b && b.label === label);
-			if (!button || !("custom_id" in button)) throw new Error(`no ${label} button`);
-			return discord.emitComponent({ message: { channelId: m.channelId, messageId: m.id }, customId: button.custom_id, actor: alice });
+		get: path => fetch(web.url + path, { redirect: "manual", headers: headers() }),
+		post: (path, fields) =>
+			fetch(web.url + path, {
+				method: "POST",
+				redirect: "manual",
+				headers: { ...headers(), origin: web.url, "content-type": "application/x-www-form-urlencoded" },
+				body: new URLSearchParams(fields).toString(),
+			}),
+		async submit(path, fields) {
+			const res = await s.post(path, fields);
+			const cookie = res.headers.get("set-cookie")?.split(";")[0];
+			if (cookie) s.cookie = cookie;
+			if (res.status !== 303) return { status: res.status, page: await res.text() };
+			const next = await s.get(res.headers.get("location")!);
+			return { status: next.status, page: await next.text() };
 		},
 	};
-	return h;
-}
+});
 
-/** The newest message in `threadId` with buttons whose content includes `text`. */
-function withButtons(h: Harness, threadId: string, text: string): FakeMessage | undefined {
-	return h.discord.messages(threadId).findLast(m => m.content.includes(text) && m.components.length > 0);
-}
+afterAll(async () => {
+	await s.web.stop();
+	await s.api.stop();
+	await s.controller.stop();
+	await s.discord.stop();
+	s.signins.close();
+	s.db.close();
+	rmSync(s.stateDir, { recursive: true, force: true });
+});
 
-function said(h: Harness, threadId: string, text: string): boolean {
-	return h.discord.messages(threadId).some(m => m.content.includes(text));
-}
+describe("phase 5 exit: a fresh install configured in the browser", () => {
+	test("1. setup token and admin account", async () => {
+		const home = await s.get("/");
+		expect(home.headers.get("location")).toBe("/setup");
+		const form = await formFields(await (await s.get("/setup")).text(), "/setup");
+		expect(Object.keys(form).sort()).toEqual(["confirm", "password", "token", "username"]);
 
-/** Pull requests filed on the fake repository. */
-function pulls(h: Harness, repo: string) {
-	return [...h.gh.getRepo(repo).issues.values()].filter(i => i.pull);
-}
+		const mismatch = await s.submit("/setup", { token: SETUP_TOKEN, username: "admin", password: PASSWORD, confirm: "something else" });
+		expect(mismatch.status).toBe(400);
+		expect(mismatch.page).toContain('class="error"');
 
-describe("phase 5 exit", () => {
-	test("label → plan → approve → push CI → PR → review → revise → merge, with a restart at each step", async () => {
-		const h = await boot();
-		const repo = "acme/app";
-		await seedRepo(h.gitRoot, repo);
-		h.gh.addRepo(repo);
-		h.gh.getRepo(repo).workflows.push({ id: 1, name: "CI", path: ".github/workflows/ci.yml", state: "active", source: "on: push\njobs: {}\n" });
-		const ghIssue = h.gh.addIssue(repo, { title: "Add a thing", body: `Please add a thing. ${MARKER}` });
+		const wrongToken = await s.submit("/setup", { token: "not-the-token", username: "admin", password: PASSWORD, confirm: PASSWORD });
+		expect(wrongToken.status).toBe(400);
+		expect(wrongToken.page).toContain('class="error"');
+		expect(s.cookie).toBeUndefined();
 
-		await h.work("start", { repo, issue: ghIssue.number });
-		const issueId = h.orch.db.findIssue(repo, ghIssue.number)!.id;
-		const threadId = h.orch.db.getIssue(issueId)!.thread_id!;
-		await h.restart();
+		const created = await s.submit("/setup", { token: SETUP_TOKEN, username: "admin", password: PASSWORD, confirm: PASSWORD });
+		expect(created.status).toBe(200);
+		expect(s.cookie).toBeDefined();
+		expect(s.controller.status().phase).toBe("unconfigured");
+	});
 
-		// 1. The plan, on a worker, awaiting approval.
-		await until(() => h.orch.db.getIssue(issueId)?.state === "awaiting_approval", "the plan");
-		await until(() => !!withButtons(h, threadId, "Plan ready for your approval"), "the plan message");
-		await h.restart();
-		await h.click(withButtons(h, threadId, "Plan ready for your approval")!, "Approve");
+	test("2. Discord settings: invalid input is refused, then saved without an ask channel", async () => {
+		const admin = await (await s.get("/admin")).text();
+		// WEB-23: no dropdown before the bot token and guild id are stored.
+		expect(admin).not.toContain('name="discord.askChannelIds.add"');
+		expect(admin).toContain("Save the Discord bot token and guild id to choose channels");
+		const form = await formFields(admin, "/admin/settings");
 
-		// 2. Implement on a worker, pushed to the issue branch, then the CI gate waits for push CI.
-		await until(() => said(h, threadId, "Waiting for CI"), "the CI wait", 40_000);
-		const branch = h.orch.db.getIssue(issueId)!.branch!;
-		expect(branch).toStartWith(`askbot/issue-${ghIssue.number}-add-a-thing`);
-		const pushed = (await h.head(repo, branch))!;
-		expect(await h.log(repo, branch)).toEqual(["Implement the change", "Initial commit"]);
-		await h.restart();
-		h.gh.addCheckRun(repo, pushed, { name: "build", status: "completed", conclusion: "success" });
+		const noAllowed = await s.submit("/admin/settings", { ...form, "discord.guildId": s.discord.guildId, "secrets.discordToken": "real-bot-token" });
+		expect(noAllowed.status).toBe(400);
+		expect(noAllowed.page).toContain("allowedUserIds");
 
-		// 3. Green CI opens the PR exactly once.
-		await until(() => h.orch.db.getIssue(issueId)?.state === "in_review", "the PR", 30_000);
-		const pr = h.orch.db.getIssue(issueId)!.pr_number!;
-		expect(pulls(h, repo).map(p => p.number)).toEqual([pr]);
-		expect(h.gh.getIssue(repo, pr).body).toContain(`Closes #${ghIssue.number}`);
-		await until(() => said(h, threadId, "Implementation complete"), "Implementation complete");
-		await h.restart();
+		const saved = await s.submit("/admin/settings", {
+			...form,
+			"discord.guildId": s.discord.guildId,
+			"discord.allowedUserIds": ADMIN_DISCORD_USER,
+			"secrets.discordToken": "wrong-bot-token",
+		});
+		expect(saved.status).toBe(200);
+		expect(saved.page).toContain(`Settings saved. Engine is unconfigured: ${ASK_CHANNEL_MISSING}`);
+		expect(s.controller.status()).toMatchObject({ phase: "unconfigured", error: ASK_CHANNEL_MISSING });
+		// A wrong bot token: the channel field says why and offers Retry (WEB-23).
+		expect(saved.page).toContain("Retry");
 
-		// 4. A review comment with the keyword makes the revise run push a follow-up commit.
-		h.gh.addIssueComment(repo, pr, { body: `/askbot please tidy this up ${MARKER}`, login: "alice", association: "MEMBER" });
-		await until(async () => (await h.log(repo, branch))[0] === "Address the follow-up", "the revise push", 40_000);
-		await until(() => said(h, threadId, "Review feedback addressed"), "the revise message");
-		await h.restart();
-		expect(await h.log(repo, branch)).toEqual(["Address the follow-up", "Implement the change", "Initial commit"]);
+		const fixed = await s.submit("/admin/settings", { ...(await formFields(saved.page, "/admin/settings")), "secrets.discordToken": "real-bot-token" });
+		expect(fixed.status).toBe(200);
+		expect(fixed.page).toContain("Settings saved.");
+	});
 
-		// 5. Merging the PR finishes the issue and archives the thread.
-		h.gh.getIssue(repo, pr).pull!.merged = true;
-		h.gh.updateIssue(repo, pr, { state: "closed" });
-		await until(() => h.orch.db.getIssue(issueId)?.state === "done", "done");
-		await until(() => h.discord.channels().find(c => c.id === threadId)?.archived === true, "the archived thread");
-		expect(pulls(h, repo)).toHaveLength(1);
-		expect(h.gh.getIssue(repo, ghIssue.number).comments.filter(c => c.body.startsWith("<!-- askbot:plan -->"))).toHaveLength(1);
+	test("3. the ask channel is chosen from the dropdown; a channel deleted meanwhile is refused", async () => {
+		const ops = s.discord.addChannel({ name: "ops", type: ChannelType.GuildCategory });
+		const ask = s.discord.addChannel({ name: "ask-here", parentId: ops.id });
+		s.discord.addChannel({ name: "voice", type: ChannelType.GuildVoice });
+		s.discord.addChannel({ name: "secret", overwrites: [{ id: s.discord.guildId, deny: P.ViewChannel }] });
+		const doomed = s.discord.addChannel({ name: "doomed" });
 
-		// The issue branch is still on "GitHub" after done: nothing deletes remote branches (WS-06).
-		expect(await h.head(repo, branch)).toBeDefined();
-		expect(h.gh.requests.filter(r => r.method === "DELETE" && r.path.includes("/git/refs"))).toEqual([]);
+		const page = await (await s.get("/admin?refreshChannels=1")).text();
+		const options = selectOptions(page, "discord.askChannelIds.add");
+		expect([...options.enabled.values()]).toEqual(expect.arrayContaining(["#ask-here", "#doomed"]));
+		expect([...options.enabled.values()].join(" ")).not.toContain("voice");
+		// The bot can't see #secret: listed, not choosable (WEB-21).
+		expect(options.disabled.join(" ")).toContain("#secret");
+		const form = await formFields(page, "/admin/settings");
 
-		// Installation tokens were minted for the orchestrator, yet no run's agent saw one, nor the Discord token or the
-		// App key (SEC-01, AGT-02): plan, implement and revise runs, each dumped by the fixture host.
-		expect(h.gh.requests.some(r => r.method === "POST" && r.path.endsWith("/access_tokens"))).toBe(true);
-		const dumps = await readdir(join(h.root, "host-dumps"));
-		expect(dumps.length).toBeGreaterThanOrEqual(3);
-		for (const name of dumps) {
-			const seen = await readFile(join(h.root, "host-dumps", name), "utf8");
-			expect(seen).not.toContain("discord-token");
-			expect(seen).not.toContain("ghs_");
-			expect(seen).not.toContain("PRIVATE KEY");
-			for (const line of h.gh.privateKey.split("\n").filter(l => l.length > 20)) expect(seen).not.toContain(line);
-		}
-	}, 180_000);
+		// WEB-24: the save is checked against the live guild.
+		s.discord.channels.delete(doomed.id);
+		const refused = await s.submit("/admin/settings", { ...form, "discord.askChannelIds.add": doomed.id });
+		expect(refused.status).toBe(400);
+		expect(refused.page).toContain(doomed.id);
+		expect(s.controller.status().phase).toBe("unconfigured");
 
-	test("/work plan → Execute → PR, and /work issue → filed and planned, with restarts", async () => {
-		const h = await boot();
-		const repo = "acme/lib";
-		await seedRepo(h.gitRoot, repo);
-		h.gh.addRepo(repo);
+		const saved = await s.submit("/admin/settings", { ...form, "discord.askChannelIds.add": ask.id });
+		expect(saved.status).toBe(200);
+		expect(saved.page).toContain("Settings saved. Engine is running.");
+		expect(s.controller.status().phase).toBe("running");
+		// WEB-22: the chosen channel is listed and no longer offered.
+		expect(saved.page).toContain(`value="${ask.id}" data-ask-channel`);
+		expect(selectOptions(saved.page, "discord.askChannelIds.add").enabled.has(ask.id)).toBe(false);
+	});
 
-		// /work plan, restarted while planning.
-		await h.work("plan", { repo, prompt: `Add a changelog. ${MARKER}` });
-		const planThread = h.discord.channels().find(c => c.kind === "thread")!.id;
-		await h.restart();
-		await until(() => !!withButtons(h, planThread, "Plan ready for your review"), "the request plan", 30_000);
-		await h.restart();
-		await h.click(withButtons(h, planThread, "Plan ready for your review")!, "Execute");
+	test("4. model sign-in: a wrong code fails with its error, the right one adds the account", async () => {
+		const page = await (await s.get("/admin/models")).text();
+		expect(page).toContain('value="anthropic"');
 
-		// Execute files the issue, binds this thread, and implements it: no push CI, so the PR opens at once.
-		await until(() => h.orch.db.issueByThread(planThread)?.state === "in_review", "the executed plan's PR", 40_000);
-		const executed = h.orch.db.issueByThread(planThread)!;
-		expect(h.gh.getIssue(repo, executed.number).labels).toContain("askbot");
-		expect(pulls(h, repo)).toHaveLength(1);
-		expect(await h.log(repo, executed.branch!)).toEqual(["Implement the change", "Initial commit"]);
+		const login = async (code: string): Promise<LoginState> => {
+			const started = await s.post("/admin/models/login", { provider: "anthropic" });
+			expect(started.status).toBe(303);
+			const location = started.headers.get("location")!;
+			await eventually(async () => {
+				const state = (await (await s.get(`${location}.json`)).json()) as LoginState;
+				return state.status === "needs_input" ? state : undefined;
+			}, "the paste box");
+			const loginPage = await (await s.get(location)).text();
+			const input = await formFields(loginPage, `${location}/input`);
+			await s.submit(`${location}/input`, { ...input, text: code });
+			return eventually(async () => {
+				const state = (await (await s.get(`${location}.json`)).json()) as LoginState;
+				return state.status === "failed" || state.status === "done" ? state : undefined;
+			}, "the sign-in to finish");
+		};
 
-		// /work issue, restarted while drafting: filed once, tracked, and planned.
-		const issues = h.gh.getRepo(repo).issues.size;
-		await h.work("issue", { repo, request: `Document the release steps. ${MARKER}` });
-		await h.restart();
-		await until(() => h.orch.db.openIssues().some(i => i.repo === repo && i.number !== executed.number && i.state === "awaiting_approval"), "the drafted issue's plan", 40_000);
-		const drafted = h.orch.db.openIssues().find(i => i.repo === repo && i.number !== executed.number)!;
-		const filed = h.gh.getIssue(repo, drafted.number);
-		expect(filed.title).toBe("Fixture drafted issue");
-		expect(filed.labels).toContain("askbot");
-		expect(filed.body).toContain("> Document the release steps.");
-		// One issue filed by the draft, one PR from Execute; nothing else.
-		expect(h.gh.getRepo(repo).issues.size).toBe(issues + 1);
-	}, 180_000);
+		const failed = await login("bad-code");
+		expect(failed).toMatchObject({ status: "failed" });
+		expect(JSON.stringify(failed)).toContain("Token exchange failed: invalid code");
+		expect(s.signins.authStorage.credentials.list()).toHaveLength(0);
+
+		expect(await login("good-code")).toMatchObject({ status: "done" });
+		const after = await (await s.get("/admin/models")).text();
+		expect(after).toContain("admin@example.com");
+		expect(after).toContain("anthropic/claude-test");
+	});
+
+	test("the home checklist shows every step done", async () => {
+		const home = await (await s.get("/")).text();
+		const steps = [...home.matchAll(/<li data-step="(\w+)" class="(\w+)">/g)].map(m => `${m[1]}:${m[2]}`);
+		expect(steps).toEqual(["setup:done", "botToken:done", "guild:done", "allowedUsers:done", "askChannel:done", "modelAccess:done"]);
+	});
 });

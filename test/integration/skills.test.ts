@@ -9,7 +9,7 @@ import { esc } from "../../src/web/views";
 import { type AdminStack, startAdminStack } from "../fixtures/adminStack";
 import { makeZip } from "../fixtures/zip";
 
-const REVIEWER = "---\nname: reviewer\ndescription: Reviews a diff\n---\nLook closely.\n";
+const REVIEWER = "---\nname: reviewer\ndescription: Reviews a diff\ntools: web_search\n---\nLook closely.\n";
 const DEPLOY = "---\nname: deploy\ndescription: Deploys the app\n---\nRun run.sh.\n";
 
 let stack: AdminStack | undefined;
@@ -101,9 +101,13 @@ describe("/admin/skills", () => {
 		["traversal in zip", "skill", "t.zip", () => makeZip([{ path: "SKILL.md", data: DEPLOY }, { path: "../../agents/x.md", data: "x" }]), "points outside the skill folder"],
 		["zip without SKILL.md", "skill", "m.zip", () => makeZip([{ path: "README.md", data: "hi" }]), "no SKILL.md at the top"],
 		["bad name in zip", "skill", "n.zip", () => makeZip([{ path: "SKILL.md", data: "---\nname: -bad\ndescription: d\n---\n" }]), "must be 1–64 lowercase letters"],
-		["reserved agent name", "agent", "main.md", () => "---\nname: main\ndescription: d\n---\n", "reserved agent names"],
+		["reserved agent name", "agent", "main.md", () => "---\nname: main\ndescription: d\ntools: web_search\n---\n", "reserved agent names"],
+		["agent with bash", "agent", "a.md", () => "---\nname: a\ndescription: d\ntools: bash\n---\n", '"tools" may not include bash (allowed: web_search)'],
+		["agent with task", "agent", "a.md", () => "---\nname: a\ndescription: d\ntools: web_search, task\n---\n", '"task" is not allowed in "tools"'],
+		["agent with spawns", "agent", "a.md", () => "---\nname: a\ndescription: d\ntools: web_search\nspawns: a\n---\n", '"spawns" is not allowed'],
+		["agent without tools", "agent", "a.md", () => "---\nname: a\ndescription: d\n---\n", '"tools" is required'],
 		["agent as zip", "agent", "a.zip", () => makeZip([{ path: "SKILL.md", data: DEPLOY }]), "only skills can be uploaded as a .zip"],
-		["agent over 256 KiB", "agent", "big.md", () => `---\nname: big\ndescription: d\n---\n${"x".repeat(256 * 1024)}`, "larger than 256 KiB"],
+		["agent over 256 KiB", "agent", "big.md", () => `---\nname: big\ndescription: d\ntools: web_search\n---\n${"x".repeat(256 * 1024)}`, "larger than 256 KiB"],
 		["not markdown", "agent", "notes.txt", () => REVIEWER, "Only .md files can be uploaded"],
 	];
 	for (const [what, kind, name, data, message] of REJECTED) {
@@ -145,12 +149,15 @@ describe("/admin/skills", () => {
 		mkdirSync(join(ompDir, "skills", "nodesc"), { recursive: true });
 		writeFileSync(join(ompDir, "skills", "nodesc", "SKILL.md"), "---\nname: nodesc\n---\n");
 		writeFileSync(join(ompDir, "agents", "noname.md"), "---\ndescription: d\n---\n");
+		writeFileSync(join(ompDir, "agents", "shell.md"), "---\nname: shell\ndescription: d\ntools: bash\n---\n");
 		const html = await page(s);
 		expect(html).toContain("<code>empty</code>");
 		expect(html).toContain("No SKILL.md in this folder.");
 		expect(html).toContain("<code>nodesc</code>");
 		expect(html).toContain("<code>noname</code>");
-		expect(html).toContain(esc('Missing "name" or "description" in frontmatter.'));
+		expect(html).toContain(esc('frontmatter needs a string "name" and a non-empty "description".'));
+		expect(html).toContain("<code>shell</code>");
+		expect(html).toContain(esc('"tools" may not include bash (allowed: web_search).'));
 	});
 
 	test("the page needs a login and uploads need the same origin", async () => {

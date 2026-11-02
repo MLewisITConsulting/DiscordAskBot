@@ -1,3 +1,4 @@
+import { SUBAGENT_TOOLS } from "../shared/agentRules";
 import { MAX_SKILL_UPLOAD_BYTES, type SkillAssetKind, type SkillAssetView, type SkillRemoveRequest, type SkillsListing, type SkillUploadResponse } from "../shared/adminSkills";
 import { AdminApiError } from "./adminClient";
 import { field } from "./forms";
@@ -14,7 +15,6 @@ export interface SkillsPageOptions {
 	listing: SkillsListing;
 	flash?: Flash;
 	error?: string;
-	vscode: boolean;
 }
 
 function assetTable(kind: SkillAssetKind, entries: SkillAssetView[], empty: string): string {
@@ -36,7 +36,7 @@ export function skillsPage(opts: SkillsPageOptions): string {
 	const { listing } = opts;
 	return layout(
 		"Skills and agents",
-		`${nav("skills", opts.vscode)}
+		`${nav("skills")}
 <h1>Skills and agents</h1>
 <p>These files are stored in the orchestrator at <code>${esc(listing.dir)}</code>: skills in <code>skills/&lt;name&gt;/SKILL.md</code>, task agents in <code>agents/&lt;name&gt;.md</code>.
 Every agent session started after a change uses it; sessions already running keep what they started with.</p>
@@ -45,7 +45,8 @@ ${messages(opts.error, opts.flash)}
 <label><span>Type</span> <select name="kind"><option value="skill">Skill</option><option value="agent">Agent</option></select></label>
 <label><span>File</span> <input type="file" name="file" accept=".md,.zip,text/markdown,application/zip" required></label>
 <p class="hint">An agent is one <code>.md</code> file of at most 256 KiB. A skill is its <code>SKILL.md</code>, or a <code>.zip</code> of the skill folder (at most 5 MiB unpacked, <code>SKILL.md</code> at the top, no symlinks) to include the files it references; a zip replaces the whole folder.
-The frontmatter needs a <code>name</code> (lowercase letters, digits and hyphens) and a <code>description</code>; the name, not the file name, decides where the file is stored, and replaces an entry with the same name.</p>
+The frontmatter needs a <code>name</code> (lowercase letters, digits and hyphens) and a <code>description</code>; the name, not the file name, decides where the file is stored, and replaces an entry with the same name.
+An agent's frontmatter also needs <code>tools</code>, naming only ${SUBAGENT_TOOLS.map(tool => `<code>${tool}</code>`).join(", ")}; <code>task</code>, <code>spawns</code>, <code>advisor</code> and <code>prewalk</code> are refused, and <code>main</code> and <code>sub</code> are reserved names.</p>
 <button type="submit">Upload</button>
 </form>
 <h2>Skills</h2>
@@ -66,7 +67,7 @@ async function render(ctx: PageContext, error?: string, status = 200): Promise<R
 	}
 	const flash = ctx.session.flash;
 	ctx.session.flash = undefined;
-	return html(skillsPage({ listing, flash, error, vscode: ctx.vscode }), status);
+	return html(skillsPage({ listing, flash, error }), status);
 }
 
 export const skillsPages: PageRoutes = {

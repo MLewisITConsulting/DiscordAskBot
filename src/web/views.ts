@@ -2,7 +2,7 @@ import type { AdminState } from "../shared/adminApi";
 import { CHANNELS_UNCONFIGURED, type ChannelListing } from "../shared/adminChannels";
 import { CHANNEL_EXTRAS, channelFieldHtml } from "./channelFields";
 import {
-	CHANNEL_FIELDS,
+	ASK_CHANNELS_FIELD,
 	CONFIG_FIELDS,
 	configDefault,
 	MAX_USERNAME_CHARS,
@@ -150,7 +150,7 @@ export function layout(title: string, body: string): string {
 </html>`;
 }
 
-export type SitePageId = "status" | "logs" | "settings" | "repos" | "models" | "omp" | "skills" | "vscode" | "status-json" | "healthz";
+export type SitePageId = "status" | "logs" | "settings" | "models" | "omp" | "skills" | "status-json" | "healthz";
 export type NavPage = "home" | SitePageId;
 
 export interface SitePage {
@@ -159,38 +159,28 @@ export interface SitePage {
 	href: string;
 }
 
-/** Every page, in order. The home cards and the ☰ menu are both built from this list (WEB-10), through `sitePages`. */
-const SITE_PAGES: readonly SitePage[] = [
+/** Every page, in order. The home cards and the ☰ menu are both built from this list (WEB-10). */
+export const SITE_PAGES: readonly SitePage[] = [
 	{ id: "status", title: "Status", href: "/status" },
 	{ id: "logs", title: "Logs", href: "/logs" },
 	{ id: "settings", title: "Settings", href: "/admin" },
-	{ id: "repos", title: "Repositories", href: "/admin/repos" },
 	{ id: "models", title: "Model accounts", href: "/admin/models" },
-	{ id: "omp", title: "omp and MCP", href: "/admin/omp" },
+	{ id: "omp", title: "omp", href: "/admin/omp" },
 	{ id: "skills", title: "Skills and agents", href: "/admin/skills" },
-	{ id: "vscode", title: "VS Code", href: "/admin/vscode/" },
 	{ id: "status-json", title: "Status JSON", href: "/status.json" },
 	{ id: "healthz", title: "Health check", href: "/healthz" },
 ];
 
 const HOME_PAGE = { id: "home", title: "Home", href: "/" } as const;
 
-/** The site pages; VS Code only when it is on (`ASKBOT_WEB_VSCODE`). */
-export function sitePages(vscode: boolean): readonly SitePage[] {
-	return vscode ? SITE_PAGES : SITE_PAGES.filter(page => page.id !== "vscode");
-}
-
 /** The one anchor renderer for cards and menu entries; marks the page being viewed. */
 export function pageLink(page: SitePage | typeof HOME_PAGE, current?: NavPage): string {
 	return `<a href="${esc(page.href)}"${page.id === current ? ' aria-current="page"' : ""}>${esc(page.title)}</a>`;
 }
 
-/**
- * Navigation shared by the logged-in pages: a ☰ button that discloses every page, the theme selector and Log out.
- * `vscode`: VS Code is on, so the menu lists it.
- */
-export function nav(current: NavPage, vscode: boolean): string {
-	const items = [HOME_PAGE, ...sitePages(vscode)].map(page => `<li>${pageLink(page, current)}</li>`).join("\n");
+/** Navigation shared by the logged-in pages: a ☰ button that discloses every page, the theme selector and Log out. */
+export function nav(current: NavPage): string {
+	const items = [HOME_PAGE, ...SITE_PAGES].map(page => `<li>${pageLink(page, current)}</li>`).join("\n");
 	return `<nav><strong>AskBot</strong>
 <button type="button" class="menu-toggle" aria-expanded="false" aria-controls="site-menu"><span aria-hidden="true">☰</span> Menu</button>
 <div id="site-menu" class="menu" hidden>
@@ -302,8 +292,8 @@ export function errorPage(message: string): string {
 }
 
 /** A logged-in page whose data could not be loaded because the orchestrator is unavailable. */
-export function unavailablePage(current: NavPage, vscode: boolean, title: string, reason: string): string {
-	return layout(title, `${nav(current, vscode)}<h1>${esc(title)}</h1>${messages(`${ORCHESTRATOR_UNAVAILABLE}: ${reason}`)}`);
+export function unavailablePage(current: NavPage, title: string, reason: string): string {
+	return layout(title, `${nav(current)}<h1>${esc(title)}</h1>${messages(`${ORCHESTRATOR_UNAVAILABLE}: ${reason}`)}`);
 }
 
 function secretStatus(set: boolean): string {
@@ -314,10 +304,6 @@ const FORM_HELP = {
 	discordToken: {
 		text: "The bot token from the Discord Developer Portal (your application → Bot → Reset Token). Stored encrypted and never shown again; leave blank to keep the stored token.",
 		example: "MTIz… (about 70 characters: three parts separated by dots)",
-	},
-	githubAppPrivateKey: {
-		text: "The .pem file GitHub downloaded when you clicked “Generate a private key” on your GitHub App. Paste the whole file, including the BEGIN and END lines. Stored encrypted; leave blank to keep the stored key.",
-		example: "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo…\n…\n-----END RSA PRIVATE KEY-----",
 	},
 	providerName: {
 		text: "omp provider id the API key is for, such as anthropic, openai or openrouter.",
@@ -337,9 +323,8 @@ const FORM_HELP = {
 	confirm: { text: "The new password again, to catch typos." },
 } satisfies Record<string, Help>;
 
-/** Channel fields are typed ids, dropdowns or a listing error (WEB-20 to WEB-23); `channels` says which. */
+/** The ask-only channel field is typed ids, a dropdown or a listing error (WEB-20 to WEB-23); `channels` says which. */
 function settingsForm(state: SettingsFormState, channels: ChannelListing): string {
-	const channelFields: string[] = Object.values(CHANNEL_FIELDS);
 	const sections: string[] = [];
 	for (const [section, legend] of Object.entries(SECTION_LABELS)) {
 		const fields = CONFIG_FIELDS.filter(def => def.name.startsWith(`${section}.`)).map(def => {
@@ -347,7 +332,7 @@ function settingsForm(state: SettingsFormState, channels: ChannelListing): strin
 			const help = { text: def.help, example: def.example, fallback: configDefault(def) };
 			if (def.kind === "boolean") return checkboxInput(def.name, def.label, state.config[def.name] === "true", help);
 			const typed = textInput(def.name, def.label, state.config[def.name] ?? "", hint, help);
-			return channelFields.includes(def.name) ? channelFieldHtml(def.name, state.config, channels, labelWithHelp(def.name, def.label, help), typed) : typed;
+			return def.name === ASK_CHANNELS_FIELD ? channelFieldHtml(def.name, state.config, channels, labelWithHelp(def.name, def.label, help), typed) : typed;
 		});
 		sections.push(`<fieldset><legend>${esc(legend)}</legend>${fields.join("\n")}</fieldset>`);
 	}
@@ -366,13 +351,11 @@ function settingsForm(state: SettingsFormState, channels: ChannelListing): strin
 <td></td>
 </tr>`);
 	const discordToken = labelWithHelp(SECRET_FIELDS.discordToken, "Discord bot token", FORM_HELP.discordToken);
-	const githubKey = labelWithHelp(SECRET_FIELDS.githubAppPrivateKey, "GitHub App private key (PEM)", FORM_HELP.githubAppPrivateKey);
 
 	return `<form method="post" action="/admin/settings">
 <fieldset><legend>Secrets</legend>
 <p class="hint">Secrets are never shown. Leave a field blank to keep the current value.</p>
 <label><span>${discordToken.label}</span> <input type="password" name="${SECRET_FIELDS.discordToken}" autocomplete="off"${discordToken.describedBy}> ${secretStatus(state.discordTokenSet)}</label>
-<label><span>${githubKey.label}</span> <textarea name="${SECRET_FIELDS.githubAppPrivateKey}" autocomplete="off"${githubKey.describedBy}></textarea> ${secretStatus(state.githubAppPrivateKeySet)}</label>
 <table><thead><tr><th>Provider${infoTip("help-provider-name", FORM_HELP.providerName)}</th><th>API key${infoTip("help-provider-key", FORM_HELP.providerKey)}</th><th>Remove${infoTip("help-provider-remove", FORM_HELP.providerRemove)}</th></tr></thead><tbody>
 ${providerRows.join("\n")}
 </tbody></table>
@@ -403,20 +386,18 @@ export interface AdminPageOptions {
 	username: string;
 	/** Undefined when the settings cannot be shown (vault locked); `settingsError` says why. */
 	settings?: SettingsFormState;
-	/** The Discord channel listing for the channel fields; omitted, they are typed ids (WEB-23). */
+	/** The Discord channel listing for the ask-only channel field; omitted, it takes typed ids (WEB-23). */
 	channels?: ChannelListing;
 	flash?: Flash;
 	settingsError?: string;
 	accountError?: string;
-	/** VS Code is on (menu entry). */
-	vscode: boolean;
 }
 
 export function adminPage(opts: AdminPageOptions): string {
 	const { state } = opts;
 	return layout(
 		"Settings",
-		`${nav("settings", opts.vscode)}
+		`${nav("settings")}
 <h1>Settings</h1>
 ${messages(undefined, opts.flash)}
 <section class="status" aria-live="polite">

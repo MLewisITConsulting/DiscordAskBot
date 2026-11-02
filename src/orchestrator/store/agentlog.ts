@@ -9,15 +9,17 @@ import { type TranscriptEvent, truncateEvent } from "../../shared/transcript";
  * for the web tail, and subscribers receive every new entry.
  */
 
-/** Which run an event belongs to; supplied by the orchestrator from the run record, not by the worker. */
+/** Which run an event belongs to (OBS-03); supplied by the orchestrator, not by the worker. */
 export interface AgentLogRun {
-	/** jobId, or `chat-<threadId>` for chats. */
+	/** `ask-<threadId>`: the ask thread's turns. */
 	run: string;
-	/** The run kind (`plan`, `implement`, `chat`, …). */
-	kind: string;
-	repo: string;
-	issue?: number;
-	thread?: string;
+	kind: "ask";
+	/** The ask thread. */
+	thread: string;
+	/** The ask-only channel the thread is in. */
+	channel: string;
+	/** Discord user id of the person who started the thread. */
+	user: string;
 }
 
 export type AgentLogEntry = AgentLogRun & TranscriptEvent & { seq: number; ts: string };

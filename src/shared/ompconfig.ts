@@ -10,11 +10,13 @@ import { errorMessage } from "./log";
  * without restarting the engine (AGT-23).
  */
 
-/** Settings AskBot relies on to run headless; admins cannot override them. */
+/** Settings AskBot relies on to run headless and confined; admins cannot override them (AGT-20). */
 export const LOCKED_SETTINGS: Record<string, { value: unknown; reason: string }> = {
 	"tools.approvalMode": { value: "yolo", reason: "There is no one at a terminal to approve tool calls; AskBot controls risk with the confined ask tools (AGT-09)." },
 	"ask.timeout": { value: 0, reason: "The agent never asks the user questions; the ask tool is not exposed (AGT-09)." },
 	"async.enabled": { value: false, reason: "Subagents must finish inside the turn so their usage and limits count (AGT-32)." },
+	skillful: { value: true, reason: "The skill list in the prompt is how /ask finds the admin's skills (AGT-30)." },
+	"task.maxRecursionDepth": { value: 1, reason: "Subagents must not spawn subagents (AGT-31)." },
 };
 
 const ompConfigSchema = z.object({

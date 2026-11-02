@@ -64,7 +64,7 @@ export function hasAskChannel(config: Config): boolean {
 /** ENG-02: why the engine stays `unconfigured` after the first save. */
 export const ASK_CHANNEL_MISSING = "Add an ask-only channel in Settings (Discord) to start the engine.";
 
-/** Everything an admin enters (§13); stored encrypted in the vault. */
+/** Everything an admin enters (requirements §9); stored encrypted in the vault. */
 export interface Settings {
 	config: Config;
 	secrets: Secrets;
@@ -76,7 +76,7 @@ export interface SettingsIssue {
 	message: string;
 }
 
-/** Its message is the first issue's (§13); `issues` holds every one, for editors that mark each field. */
+/** Its message is the first issue's (requirements §9); `issues` holds every one, for editors that mark each field. */
 export class ConfigError extends Error {
 	override name = "ConfigError";
 	constructor(readonly issues: SettingsIssue[]) {
@@ -95,7 +95,7 @@ function parseOrThrow<T>(schema: z.ZodType<T>, value: unknown, prefix: (string |
 	);
 }
 
-/** Validate an already-parsed config object (everything in §13 except `secrets.*`). */
+/** Validate an already-parsed config object (everything in requirements §9 except `secrets.*`). */
 export function parseConfig(raw: unknown): Config {
 	return parseOrThrow(configSchema, raw, []);
 }

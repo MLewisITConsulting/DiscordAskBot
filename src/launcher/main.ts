@@ -77,7 +77,7 @@ export function workerSpec(worker: WorkerSettings, name: string): WorkerContaine
 		user: `${WORKER_UID}:${WORKER_UID}`,
 		labels: { [ROLE_LABEL]: WORKER_ROLE },
 		remove: true,
-		// catatonit as PID 1 reaps the orphans of git and the agent host's children (the image has no init of its own).
+		// catatonit as PID 1 reaps the orphans of the agent host's children (the image has no init of its own).
 		init: true,
 		netns: { nsmode: "bridge" },
 		Networks: { [worker.network]: {} },
@@ -295,8 +295,8 @@ export class Launcher {
 export async function runLauncher(): Promise<never> {
 	const env = loadEnv();
 	if (!env.workerNetwork) throw new Error("ASKBOT_WORKER_NETWORK must be set: the launcher puts workers on that network");
-	const image = env.workerImage ?? env.image;
-	if (!image) throw new Error("ASKBOT_IMAGE must be set (or ASKBOT_WORKER_IMAGE): the launcher starts workers from it");
+	const image = env.image;
+	if (!image) throw new Error("ASKBOT_IMAGE must be set: the launcher starts workers from it");
 	const launcher = new Launcher({
 		podman: new PodmanClient(env.podmanSocket),
 		orchestratorUrl: env.orchestratorUrl,

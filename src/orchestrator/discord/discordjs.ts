@@ -3,8 +3,6 @@ import {
 	type APIMessage,
 	type APIInteractionGuildMember,
 	ApplicationCommandOptionType,
-	type AutocompleteInteraction,
-	type ButtonInteraction,
 	ChannelType,
 	type ChatInputCommandInteraction,
 	Client,
@@ -16,20 +14,16 @@ import {
 	type InteractionReplyOptions,
 	type Message,
 	MessageFlags,
-	type ModalSubmitInteraction,
 	type RateLimitData,
 	RateLimitError,
 	RESTEvents,
 	Routes,
-	type StringSelectMenuInteraction,
 	type TextBasedChannel,
 } from "discord.js";
 import { errorMessage, log } from "../../shared/log";
 import { createOutboundQueue } from "./queue";
 import {
 	type Actor,
-	type ChannelInfo,
-	type ChannelKind,
 	type DiscordConnection,
 	type InAttachment,
 	type InboundEvent,
@@ -66,18 +60,16 @@ function isQueuedRoute(data: Pick<RateLimitData, "route" | "method">): boolean {
 	return data.method.toUpperCase() !== "GET" && (data.route.startsWith("/channels") || data.route.startsWith("/guilds"));
 }
 
-function allowedMentions(msg: OutMessage) {
-	return { parse: [], users: msg.mentions?.users ?? [], roles: msg.mentions?.roles ?? [] };
-}
+/** DSC-07: every bot message disables all mentions. */
+const NO_MENTIONS = { parse: [] };
 
-/** REST body and files of a message create or edit (also used by `rest.ts`). */
+/** REST body and files of a message create or edit. */
 export function restMessage(msg: OutMessage, extra: Record<string, unknown> = {}) {
 	const files = msg.files?.map((file, index) => ({ key: `files[${index}]`, name: file.name, data: file.data }));
 	return {
 		body: {
 			content: msg.content,
-			allowed_mentions: allowedMentions(msg),
-			...(msg.components ? { components: msg.components } : {}),
+			allowed_mentions: NO_MENTIONS,
 			...(files ? { attachments: files.map((file, index) => ({ id: index, filename: file.name })) } : {}),
 			...extra,
 		},
@@ -85,12 +77,11 @@ export function restMessage(msg: OutMessage, extra: Record<string, unknown> = {}
 	};
 }
 
-/** Payload of an interaction edit or update (no flags). */
+/** Payload of an interaction reply edit (no flags). */
 function editPayload(msg: OutMessage) {
 	return {
 		content: msg.content,
-		allowedMentions: allowedMentions(msg),
-		...(msg.components ? { components: msg.components } : {}),
+		allowedMentions: NO_MENTIONS,
 		...(msg.files ? { files: msg.files.map(file => ({ attachment: Buffer.from(file.data), name: file.name })) } : {}),
 	};
 }
@@ -99,33 +90,8 @@ function replyPayload(msg: ReplyOptions): InteractionReplyOptions {
 	return { ...editPayload(msg), ...(msg.ephemeral ? { flags: MessageFlags.Ephemeral } : {}) };
 }
 
-function channelKind(type: ChannelType): ChannelKind {
-	switch (type) {
-		case ChannelType.GuildText:
-		case ChannelType.GuildAnnouncement:
-			return "text";
-		case ChannelType.GuildCategory:
-			return "category";
-		case ChannelType.PublicThread:
-		case ChannelType.PrivateThread:
-		case ChannelType.AnnouncementThread:
-			return "thread";
-		default:
-			return "other";
-	}
-}
-
-/** The surface's view of a REST channel object (also used by `rest.ts`). */
-export function channelInfo(channel: APIChannel): ChannelInfo {
-	const info: ChannelInfo = {
-		id: channel.id,
-		name: "name" in channel && channel.name ? channel.name : "",
-		kind: channelKind(channel.type),
-		parentId: "parent_id" in channel ? (channel.parent_id ?? null) : null,
-	};
-	if ("topic" in channel && channel.topic) info.topic = channel.topic;
-	if ("thread_metadata" in channel && channel.thread_metadata) info.archived = channel.thread_metadata.archived;
-	return info;
+function isThreadType(type: ChannelType): boolean {
+	return type === ChannelType.PublicThread || type === ChannelType.PrivateThread || type === ChannelType.AnnouncementThread;
 }
 
 function actorOf(user: { id: string; username: string; bot: boolean }, member: GuildMember | APIInteractionGuildMember | null | undefined): Actor {
@@ -142,22 +108,18 @@ function attachmentOf(a: { name: string; url: string; size: number; contentType:
 	return { name: a.name, url: a.url, size: a.size, ...(a.contentType ? { contentType: a.contentType } : {}) };
 }
 
-type Repliable = ChatInputCommandInteraction | ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction;
-
 /**
  * Interaction responses with the 3 s rule handled here (DSC-08 keeps it out of engine code): if the handler has not
- * responded after `autoDeferMs`, the interaction is deferred — silently (deferUpdate) for components and modals from a
- * message, as a public "thinking" reply for commands — and later responses are mapped onto the deferred one.
+ * responded after `autoDeferMs`, the interaction is deferred as a public "thinking" reply, and later responses are
+ * mapped onto the deferred one.
  */
-function responder(i: Repliable, autoDeferMs: number) {
-	const silent = !i.isChatInputCommand() && (!i.isModalSubmit() || i.isFromMessage());
+function responder(i: ChatInputCommandInteraction, autoDeferMs: number) {
 	let acked = false;
 	let deferring: Promise<unknown> | undefined;
 	const timer = setTimeout(() => {
 		if (acked) return;
 		acked = true;
-		const update = i.isModalSubmit() && i.isFromMessage() ? i.deferUpdate() : i.isMessageComponent() ? i.deferUpdate() : i.deferReply();
-		deferring = update.catch(err => log("warn", "interaction auto-defer failed", { error: errorMessage(err) }));
+		deferring = i.deferReply().catch(err => log("warn", "interaction auto-defer failed", { error: errorMessage(err) }));
 	}, autoDeferMs);
 	const take = async (): Promise<boolean> => {
 		clearTimeout(timer);
@@ -172,9 +134,9 @@ function responder(i: Repliable, autoDeferMs: number) {
 	const base: InteractionResponder = {
 		async reply(msg) {
 			if (!(await take())) return void (await i.reply(replyPayload(msg)));
-			if (silent || msg.ephemeral) {
+			if (msg.ephemeral) {
 				await i.followUp(replyPayload(msg));
-				if (!silent) await i.deleteReply().catch(() => {});
+				await i.deleteReply().catch(() => {});
 			} else {
 				await i.editReply(editPayload(msg));
 			}
@@ -198,31 +160,14 @@ function responder(i: Repliable, autoDeferMs: number) {
 			return acked;
 		},
 		done: () => clearTimeout(timer),
-		async update(msg: OutMessage) {
-			if (i.isChatInputCommand() || (i.isModalSubmit() && !i.isFromMessage())) throw new Error("this interaction has no message to update");
-			const deferred = await take();
-			if (deferred) await i.editReply(editPayload(msg));
-			else await i.update(editPayload(msg));
-		},
-		async deferUpdate() {
-			if (i.isChatInputCommand() || (i.isModalSubmit() && !i.isFromMessage())) throw new Error("this interaction has no message to update");
-			if (await take()) return;
-			await i.deferUpdate();
-		},
-		async showModal(modal: Parameters<ButtonInteraction["showModal"]>[0]) {
-			if (!i.isMessageComponent()) throw new Error("only a component interaction can open a modal");
-			if (await take()) throw new Error("the interaction was already deferred; a modal can no longer be shown");
-			await i.showModal(modal);
-		},
 	};
 }
 
-/** Command options as name → value, from the top level or the subcommand; attachment options are returned separately. */
+/** Command options as name → value; attachment options are returned separately. */
 function commandOptions(data: readonly CommandInteractionOption[]): { options: Record<string, string | number | boolean>; attachments: InAttachment[] } {
 	const options: Record<string, string | number | boolean> = {};
 	const attachments: InAttachment[] = [];
-	const leaves = data.length === 1 && data[0]!.type === ApplicationCommandOptionType.Subcommand ? (data[0]!.options ?? []) : data;
-	for (const option of leaves) {
+	for (const option of data) {
 		if (option.type === ApplicationCommandOptionType.Attachment) {
 			if (option.attachment) attachments.push(attachmentOf(option.attachment));
 		} else if (option.value !== undefined) {
@@ -307,65 +252,13 @@ export function createDiscordJsConnection(opts: DiscordJsOptions = {}): DiscordC
 	}
 
 	client.on(Events.InteractionCreate, async interaction => {
-		const where = whereOf(interaction.guildId, interaction.channelId ?? "", interaction.channel);
-		const actor = actorOf(interaction.user, interaction.member);
-		if (interaction.isChatInputCommand()) {
-			if (interaction.commandName !== "work" && interaction.commandName !== "ask") return;
-			const r = responder(interaction, autoDeferMs);
-			const { options, attachments } = commandOptions(interaction.options.data);
-			await deliver(
-				{ type: "command", command: interaction.commandName, subcommand: interaction.options.getSubcommand(false), options, attachments, actor, where, ...r.base },
-				r,
-			);
-		} else if (interaction.isAutocomplete()) {
-			const i: AutocompleteInteraction = interaction;
-			if (i.commandName !== "work" && i.commandName !== "ask") return;
-			const focused = i.options.getFocused(true);
-			await deliver({
-				type: "autocomplete",
-				command: i.commandName,
-				subcommand: i.options.getSubcommand(false),
-				focused: { name: focused.name, value: String(focused.value) },
-				actor,
-				where,
-				respond: async choices => void (await i.respond(choices)),
-			});
-		} else if (interaction.isButton() || interaction.isStringSelectMenu()) {
-			const r = responder(interaction, autoDeferMs);
-			await deliver(
-				{
-					type: "component",
-					customId: interaction.customId,
-					values: interaction.isStringSelectMenu() ? [...interaction.values] : [],
-					message: { channelId: interaction.message.channelId, messageId: interaction.message.id },
-					actor,
-					where,
-					...r.base,
-					update: r.update,
-					deferUpdate: r.deferUpdate,
-					showModal: r.showModal,
-				},
-				r,
-			);
-		} else if (interaction.isModalSubmit()) {
-			const r = responder(interaction, autoDeferMs);
-			const fields: Record<string, string> = {};
-			for (const [id, field] of interaction.fields.fields) if ("value" in field && typeof field.value === "string") fields[id] = field.value;
-			await deliver(
-				{
-					type: "modal",
-					customId: interaction.customId,
-					fields,
-					message: interaction.message ? { channelId: interaction.message.channelId, messageId: interaction.message.id } : null,
-					actor,
-					where,
-					...r.base,
-					update: r.update,
-					deferUpdate: r.deferUpdate,
-				},
-				r,
-			);
-		}
+		if (!interaction.isChatInputCommand()) return;
+		const command = interaction.commandName;
+		if (command !== "ask" && command !== "stop") return;
+		const r = responder(interaction, autoDeferMs);
+		const { options, attachments } = commandOptions(interaction.options.data);
+		const where = whereOf(interaction.guildId, interaction.channelId, interaction.channel);
+		await deliver({ type: "command", command, options, attachments, actor: actorOf(interaction.user, interaction.member), where, ...r.base }, r);
 	});
 
 	client.on(Events.MessageCreate, async (message: Message) => {
@@ -422,11 +315,6 @@ export function createDiscordJsConnection(opts: DiscordJsOptions = {}): DiscordC
 				return thread.id;
 			});
 		},
-		archiveThread(threadId) {
-			return write("state", threadId, async () => {
-				await client.rest.patch(Routes.channel(threadId), { body: { archived: true } });
-			});
-		},
 		react(ref, emoji) {
 			return write("high", ref.channelId, async () => {
 				await client.rest.put(Routes.channelMessageOwnReaction(ref.channelId, ref.messageId, encodeURIComponent(emoji)));
@@ -443,33 +331,11 @@ export function createDiscordJsConnection(opts: DiscordJsOptions = {}): DiscordC
 		},
 		async starterMessage(threadId) {
 			const thread = await getChannel(threadId);
-			if (!thread || channelKind(thread.type) !== "thread" || !("parent_id" in thread) || !thread.parent_id) return null;
+			if (!thread || !isThreadType(thread.type) || !("parent_id" in thread) || !thread.parent_id) return null;
 			// A thread started from a message has that message's id.
 			const ref = { channelId: thread.parent_id, messageId: threadId };
 			const message = await getMessage(ref);
 			return message ? { ...ref, content: message.content } : null;
-		},
-		async channel(id) {
-			const channel = await getChannel(id);
-			return channel ? channelInfo(channel) : null;
-		},
-		createTextChannel(guildId, o) {
-			return write("high", `guild:${guildId}`, async () => {
-				try {
-					const created = (await client.rest.post(Routes.guildChannels(guildId), {
-						body: { name: o.name, type: ChannelType.GuildText, topic: o.topic, ...(o.parentId ? { parent_id: o.parentId } : {}) },
-					})) as APIChannel;
-					return created.id;
-				} catch (err) {
-					if (apiCode(err) === MISSING_PERMISSIONS) throw new MissingPermission("ManageChannels");
-					throw err;
-				}
-			});
-		},
-		setChannel(id, patch) {
-			return write("state", id, async () => {
-				await client.rest.patch(Routes.channel(id), { body: patch });
-			});
 		},
 		setNickname(guildId, nickname) {
 			return write("state", `guild:${guildId}`, async () => {

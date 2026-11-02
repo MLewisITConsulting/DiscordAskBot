@@ -1,4 +1,5 @@
-import type { StatusReport, UsageWindow } from "../shared/adminApi";
+import type { StatusReport, UsageGroup, UsageWindow } from "../shared/adminApi";
+import type { Loadout } from "../shared/agent";
 import { type Cell, formatCount, formatDuration, formatTime, formatUsd, type LiveContext, liveView, loadoutSummary } from "./live";
 import { esc, layout, nav, table } from "./views";
 
@@ -9,6 +10,7 @@ export const DEFAULT_WINDOW: UsageWindow = "7d";
 type Usage = StatusReport["usage"];
 
 const USAGE_HEADERS = ["Runs", "Cost", "Tokens in", "Tokens out", "Cache read", "Cache write"];
+const GROUP_HEADERS = ["Runs", "Cost", "Tokens in", "Tokens out"];
 
 function totalsCells(totals: Usage["totals"]): Cell[] {
 	return [
@@ -18,18 +20,6 @@ function totalsCells(totals: Usage["totals"]): Cell[] {
 		formatCount(totals.tokensOut),
 		formatCount(totals.cacheRead),
 		formatCount(totals.cacheWrite),
-	];
-}
-
-function outcomeCells(job: Usage["jobs"][number]): Cell[] {
-	const finished = job.succeeded + job.failed + job.cancelled;
-	return [
-		job.kind,
-		formatCount(job.succeeded),
-		formatCount(job.failed),
-		formatCount(job.cancelled),
-		finished ? `${Math.round((job.succeeded / finished) * 100)}%` : "—",
-		job.avgDurationMs === null ? "—" : formatDuration(job.avgDurationMs),
 	];
 }
 
@@ -43,47 +33,63 @@ function dailyChart(daily: Usage["daily"]): string {
 	return `<div class="chart" role="img" aria-label="Daily cost for the last ${daily.length} days">${bars.join("\n")}</div>`;
 }
 
-function usageSection(usage: Usage): string {
+function groupRows(groups: UsageGroup[], label: (id: string) => Cell): Cell[][] {
+	return groups.map(group => [label(group.id), formatCount(group.runs), formatUsd(group.costUsd), formatCount(group.tokensIn), formatCount(group.tokensOut)]);
+}
+
+function usageSection(usage: Usage, ctx: LiveContext): string {
 	const windows = USAGE_WINDOWS.map(window =>
 		window === usage.window
 			? `<strong aria-current="page">${esc(WINDOW_LABELS[window])}</strong>`
 			: `<a href="/status?window=${window}">${esc(WINDOW_LABELS[window])}</a>`,
 	);
+	const channel = (id: string): Cell => (ctx.guildId ? [`#${id}`, `https://discord.com/channels/${encodeURIComponent(ctx.guildId)}/${encodeURIComponent(id)}`] : `#${id}`);
+	const { outcomes, setup } = usage;
 	return `<section id="usage"><h2>Usage</h2>
 <p>Window: ${windows.join(" · ")}${usage.since ? ` <span class="hint">(since ${esc(formatTime(usage.since))})</span>` : ""}</p>
 <h3>Totals</h3>
 ${table(USAGE_HEADERS, [totalsCells(usage.totals)], "")}
-<h3>By kind</h3>
-${table(["Kind", "Runs", "Cost"], usage.byKind.map(row => [row.kind, formatCount(row.runs), formatUsd(row.costUsd)]), "No runs in this window.")}
-<h3>By repository</h3>
-${table(["Repository", "Runs", "Cost"], usage.byRepo.map(row => [row.repo, formatCount(row.runs), formatUsd(row.costUsd)]), "No runs in this window.")}
-<h3>Job outcomes</h3>
-${table(["Kind", "Succeeded", "Failed", "Cancelled", "Success rate", "Avg duration"], usage.jobs.map(outcomeCells), "No finished jobs in this window.")}
+<h3>By ask channel</h3>
+${table(["Channel", ...GROUP_HEADERS], groupRows(usage.byChannel, channel), "No runs in this window.")}
+<h3>By Discord user</h3>
+${table(["User", ...GROUP_HEADERS], groupRows(usage.byUser, id => id), "No runs in this window.")}
+<h3>Run outcomes</h3>
+${table(
+	["Finished", "Failed", "Stopped", "Stopped by a limit", "Avg duration"],
+	[
+		[
+			formatCount(outcomes.finished),
+			formatCount(outcomes.failed),
+			formatCount(outcomes.stopped),
+			formatCount(outcomes.limit),
+			outcomes.avgDurationMs === null ? "—" : formatDuration(outcomes.avgDurationMs),
+		],
+	],
+	"",
+)}
 <h3>Daily cost (last ${usage.daily.length} days)</h3>
 ${dailyChart(usage.daily)}
-<h3>Setup time by repository</h3>
-<p class="hint">From a worker claiming a run to its agent starting: worker start, downloads, checkout and <code>setupCommand</code>.</p>
+<h3>Setup time</h3>
+<p class="hint">From a worker claiming a run to its agent starting: worker start and the downloads of skills, session and scratch inputs.</p>
 ${table(
-	["Repository", "Runs", "Average", "Slowest"],
-	usage.setup.map(row => [row.repo, formatCount(row.runs), formatDuration(row.avgMs), formatDuration(row.maxMs)]),
+	["Runs", "Average", "Slowest"],
+	setup ? [[formatCount(setup.runs), formatDuration(setup.avgMs), formatDuration(setup.maxMs)]] : [],
 	"No runs started in this window.",
 )}
 </section>`;
 }
 
-const LOADOUT_HEADERS = ["Profile", "Captured", "Tools", "Skills", "Agents", "MCP servers"];
-
-function loadoutSection(loadouts: StatusReport["loadouts"]): string {
-	const rows: Cell[][] = loadouts.map(loadout => [
-		loadout.profile,
-		formatTime(loadout.capturedAt),
-		loadout.tools.join(", ") || "—",
-		loadout.skills.map(skill => skill.name).join(", ") || "—",
-		loadout.agents.map(agent => agent.name).join(", ") || "—",
-		loadout.mcp.map(m => `${m.server} (${m.status}, ${m.tools.length} tools${m.error ? `: ${m.error}` : ""})`).join("; ") || "—",
-	]);
-	return `<section id="loadouts"><h2>Latest loadout per profile</h2>
-${table(LOADOUT_HEADERS, rows, "No run has reported a loadout yet.")}
+function loadoutSection(loadout: Loadout | undefined): string {
+	const rows: Cell[][] = loadout
+		? [
+				["Captured", formatTime(loadout.capturedAt)],
+				["Tools", loadout.tools.join(", ") || "—"],
+				["Skills", loadout.skills.map(skill => skill.name).join(", ") || "—"],
+				["Agents", loadout.agents.map(agent => agent.name).join(", ") || "—"],
+			]
+		: [];
+	return `<section id="loadout"><h2>Latest loadout</h2>
+${table([], rows, "No run has reported a loadout yet.")}
 </section>`;
 }
 
@@ -119,13 +125,12 @@ setInterval(async () => {
 		const data = await res.json();
 		const view = liveView(data, { guildId: root.dataset.guild || undefined, now: Date.now() });
 		fill("state-rows", view.state, "");
-		fill("watch-rows", view.watches, "No watched repositories.");
 		fill("limit-rows", view.limits, "Limits are shown once the settings are saved and unlocked.");
 		fill("worker-rows", view.workers, "No workers connected.");
 		fill("warning-rows", view.warnings, "No warnings.");
-		fill("open-rows", view.open, "No open issues.");
 		fill("pending-rows", view.pending, "No pending runs.");
 		fill("run-rows", view.running, "No runs in progress.");
+		fill("thread-rows", view.threads, "No active ask threads.");
 	} catch {}
 }, 5000);
 </script>`;
@@ -133,23 +138,18 @@ setInterval(async () => {
 export interface StatusPageOptions {
 	report: StatusReport;
 	context: LiveContext;
-	vscode: boolean;
 }
 
 export function statusPage(opts: StatusPageOptions): string {
 	const { report } = opts;
 	const view = liveView(report, opts.context);
-	const states = Object.keys(report.issues.counts);
 	return layout(
 		"Status",
-		`${nav("status", opts.vscode)}
+		`${nav("status")}
 <main id="status-root" data-guild="${esc(opts.context.guildId ?? "")}">
 <h1>Status</h1>
 <section id="current" class="status" aria-live="polite"><h2>Current state</h2>
 ${table([], view.state, "", "state-rows")}
-</section>
-<section id="watches"><h2>Watched repositories</h2>
-${table(["Repository", "Channel", "State", "Last poll", "Last error"], view.watches, "No watched repositories.", "watch-rows")}
 </section>
 <section id="limits"><h2>Concurrency limits</h2>
 ${table([], view.limits, "Limits are shown once the settings are saved and unlocked.", "limit-rows")}
@@ -160,17 +160,15 @@ ${table(["Worker", "Address", "Run", "Phase", "omp", "Connected for"], view.work
 </section>
 <section id="runs"><h2>Runs</h2>
 <h3>Pending</h3>
-${table(["Run", "Repository", "Waiting for"], view.pending, "No pending runs.", "pending-rows")}
+${table(["Thread", "Waiting for"], view.pending, "No pending runs.", "pending-rows")}
 <h3>In progress</h3>
-${table(["Run", "Repository", "Worker", "State", "Elapsed", "Setup", "Last tool", "Cost", "Tokens", "Loadout"], view.running, "No runs in progress.", "run-rows")}
+${table(["Thread", "Worker", "State", "Elapsed", "Setup", "Last tool", "Cost", "Tokens", "Loadout"], view.running, "No runs in progress.", "run-rows")}
 </section>
-<section id="issues"><h2>Issues</h2>
-${table(states, states.length ? [states.map(state => formatCount(report.issues.counts[state] ?? 0))] : [], "No issues.")}
-<h3>Open issues</h3>
-${table(["Issue", "Title", "State", "Job", "Thread"], view.open, "No open issues.", "open-rows")}
+<section id="threads"><h2>Active ask threads</h2>
+${table(["Thread", "Channel", "Started by"], view.threads, "No active ask threads.", "thread-rows")}
 </section>
-${usageSection(report.usage)}
-${loadoutSection(report.loadouts)}
+${usageSection(report.usage, opts.context)}
+${loadoutSection(report.loadout)}
 </main>
 ${STATUS_PAGE_SCRIPT}`,
 	);

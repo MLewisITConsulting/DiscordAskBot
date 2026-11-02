@@ -1,20 +1,7 @@
 import { errorMessage, log } from "../../shared/log";
-import type { IssueState } from "../engine/state";
 import type { DiscordSurface } from "./surface";
 
-/** Icon on an issue thread's top message (in the watch or work channel) for each issue state. */
-export const ISSUE_ICONS: Record<IssueState, string> = {
-	queued: "📥",
-	planning: "🛠️",
-	awaiting_approval: "📋",
-	implementing: "🛠️",
-	in_review: "👀",
-	done: "✅",
-	failed: "❌",
-	cancelled: "⏹️",
-};
-
-/** Icon on a chat thread's top message: while a run is answering, and how the last run ended (DSC-15). */
+/** Icon on an ask thread's top message: while a run is answering, and how the last run ended (DSC-15). */
 export const CHAT_ICONS = { working: "🛠️", done: "✅", failed: "❌", stopped: "⏹️", limit: "⚠️" } as const;
 
 /**

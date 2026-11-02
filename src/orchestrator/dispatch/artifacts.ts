@@ -3,19 +3,14 @@ import { lstat, mkdir, readdir, rename, rm, statfs } from "node:fs/promises";
 import { join } from "node:path";
 import { errorMessage, log } from "../../shared/log";
 import { ARTIFACTS } from "../../shared/wire";
-import { BundleRejected, type RefKind, type Repos } from "../git/repos";
 import type { OmpRuntimeSource } from "../omp/updates";
 import type { Db, RunRow } from "../store/db";
-import { sessionPath } from "../store/sessions";
-import type { RunRefs } from "./checkouts";
-import { writesCode } from "./dispatcher";
+import { sessionDir, sessionPath } from "../store/sessions";
 import { holdsLease } from "./leases";
-import { sessionDir } from "./spec";
 
 /**
  * Run artifact endpoints, `/internal/runs/<runId>/…` (architecture §4.5): the session file, the skills bundle, the omp
- * runtime copy, the ask scratch files, and the checkout bundles (a checkpoint to restore, uploaded checkpoints and the
- * result). Each request needs that run's live lease token (`Authorization: Bearer <lease>`, SEC-14); a lease token opens
+ * runtime copy and the ask scratch files. Each request needs that run's live lease token (`Authorization: Bearer <lease>`, SEC-14); a lease token opens
  * nothing but its own run.
  */
 
@@ -23,9 +18,7 @@ export const RUNS_PREFIX = "/internal/runs/";
 /** CHAT-10: the largest scratch output accepted per file, and per run in total. */
 export const MAX_SCRATCH_OUTPUT_BYTES = 25 * 1024 * 1024;
 export const MAX_SCRATCH_OUTPUTS_PER_RUN = 100 * 1024 * 1024;
-/** The largest checkpoint or result bundle accepted (RUN-18, RUN-19); the internal API's request body limit follows it. */
-export const MAX_BUNDLE_BYTES = 2 * 1024 ** 3;
-/** The largest session file accepted (RUN-18). */
+/** The largest session file accepted (RUN-18): the largest upload, so the internal API's request body limit follows it. */
 export const MAX_SESSION_BYTES = 256 * 1024 ** 2;
 /** Uploads are refused while the state volume has less free space than this, so SQLite keeps room to write. */
 export const STATE_FREE_FLOOR_BYTES = 1024 ** 3;
@@ -37,12 +30,8 @@ export interface ArtifactDeps {
 	stateDir: string;
 	/** The skills and agents tar and its content hash (AGT-24). */
 	skills(): Promise<{ hash: string; tar: Uint8Array }>;
-	repos: Repos;
-	refs: RunRefs;
 	/** The omp runtime copy archives (UPD-07); none outside the image. */
 	ompRuntime?: Pick<OmpRuntimeSource, "archive">;
-	/** The largest checkpoint or result bundle: `MAX_BUNDLE_BYTES`, or the worker's checkout limit when smaller (STO-06). */
-	bundleLimitBytes: number;
 	/** Free space the state volume must keep: uploads that would go below it are refused with 507. */
 	freeFloorBytes: number;
 }
@@ -203,38 +192,6 @@ export function createArtifactHandler(deps: ArtifactDeps): ArtifactHandler {
 		return new Response(Bun.file(path));
 	}
 
-	/** RUN-17: the continued run's kept checkpoint, else its unpushed result, as a bundle over this run's start commit. */
-	async function getRestore(row: RunRow): Promise<Response> {
-		const previous = row.continues_run_id ? deps.db.getRun(row.continues_run_id) : null;
-		const kind = previous ? deps.refs.restoreKind(previous) : undefined;
-		if (!previous?.repo || !kind || !row.start_commit) return text(404, "nothing to restore");
-		const stream = await deps.repos.bundleStream(previous.repo, previous.id, kind, row.start_commit);
-		if (!stream) return text(404, "nothing to restore");
-		log("info", "restore bundle served", { run: row.id, from: previous.id, ref: kind });
-		return new Response(stream, { headers: { "content-type": "application/x-git-bundle" } });
-	}
-
-	/** RUN-18, RUN-19: imports an uploaded checkpoint or result into the runs repo (forced; the ref is the run's own). */
-	async function putBundle(req: Request, row: RunRow, token: string, kind: RefKind): Promise<Response> {
-		if (!row.repo || !row.start_commit) return text(404, "this run has no checkout");
-		if (!writesCode(row.kind)) return text(403, "read-only runs keep no checkpoint or result");
-		const file = await receive(join(deps.stateDir, "tmp"), req.body, deps.bundleLimitBytes, deps.freeFloorBytes);
-		if (file instanceof Response) return file;
-		try {
-			if (!stillHeld(row, token)) return text(401, "unauthorized");
-			const { commits } = await deps.repos.importBundle(row.repo, row.id, kind, file, row.start_commit);
-			deps.refs.kept(row.id, kind);
-			log("info", `${kind} imported`, { run: row.id, repo: row.repo, commits });
-			return Response.json({ commits });
-		} catch (err) {
-			if (!(err instanceof BundleRejected)) throw err;
-			log("warn", `${kind} bundle rejected`, { run: row.id, repo: row.repo, error: err.message });
-			return text(422, err.message);
-		} finally {
-			await rm(file, { force: true });
-		}
-	}
-
 	async function handle(req: Request): Promise<Response> {
 		const url = new URL(req.url);
 		const [rawId, ...rest] = url.pathname.slice(RUNS_PREFIX.length).split("/");
@@ -264,11 +221,6 @@ export function createArtifactHandler(deps: ArtifactDeps): ArtifactHandler {
 					const body = bundle.tar as Uint8Array<ArrayBuffer>;
 					return new Response(body, { headers: { "content-type": "application/x-tar", etag: `"${bundle.hash}"` } });
 				}
-			} else if (artifact.length === 1 && artifact[0] === ARTIFACTS.checkpoint) {
-				if (req.method === "GET") return await getRestore(row);
-				if (req.method === "PUT") return await oneAtATime(`${row.id}/checkpoint`, () => putBundle(req, row, token, "checkpoint"));
-			} else if (artifact.length === 1 && artifact[0] === ARTIFACTS.result) {
-				if (req.method === "PUT") return await oneAtATime(`${row.id}/result`, () => putBundle(req, row, token, "result"));
 			} else if (artifact.length === 3 && artifact[0] === "scratch") {
 				const name = artifact[2]!;
 				if (!isPlainFileName(name)) return text(400, "invalid file name");

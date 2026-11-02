@@ -6,14 +6,17 @@ import type { TranscriptEvent } from "./transcript";
  * proxies the event stream and the file downloads; it never reads log files itself.
  */
 
-/** One agent transcript entry, as the orchestrator's agent log keeps it. */
+/** One agent transcript entry, as the orchestrator's agent log keeps it (OBS-03). */
 export type LogEntry = {
-	/** jobId, or `chat-<threadId>` for chats. */
+	/** `ask-<threadId>`: the ask thread's turns. */
 	run: string;
-	kind: string;
-	repo: string;
-	issue?: number;
-	thread?: string;
+	kind: "ask";
+	/** The ask thread. */
+	thread: string;
+	/** The ask-only channel the thread is in. */
+	channel: string;
+	/** Discord user id of the person who started the thread. */
+	user: string;
 	seq: number;
 	ts: string;
 } & TranscriptEvent;

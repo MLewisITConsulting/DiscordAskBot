@@ -1,22 +1,17 @@
-import type { APIApplicationCommandOptionChoice, APIModalInteractionResponseCallbackData, RESTPostAPIApplicationCommandsJSONBody } from "discord-api-types/v10";
+import type { RESTPostAPIApplicationCommandsJSONBody } from "discord-api-types/v10";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { errorMessage, log } from "../../src/shared/log";
 import { createOutboundQueue, type OutboundQueue, type QueueClock } from "../../src/orchestrator/discord/queue";
 import {
 	type Actor,
-	type AutocompleteEvent,
-	type ChannelInfo,
-	type ChannelKind,
 	type CommandEvent,
-	type ComponentEvent,
+	type CommandName,
 	type DiscordConnection,
 	type InAttachment,
 	type InboundEvent,
 	type InteractionResponder,
 	type MessageEvent,
-	type MessageRow,
 	MissingPermission,
-	type ModalEvent,
 	type MsgRef,
 	type OutFile,
 	type OutMessage,
@@ -61,19 +56,23 @@ export interface SimulatedRest {
 	windowMs: number;
 }
 
-export interface FakeChannel extends ChannelInfo {
+export type ChannelKind = "text" | "category" | "thread" | "other";
+
+export interface FakeChannel {
+	id: string;
+	name: string;
+	kind: ChannelKind;
+	/** Category of a channel, or the parent channel of a thread. */
+	parentId: string | null;
+	topic?: string;
 	guildId: string;
-	/** Created through `createTextChannel`. */
-	created: boolean;
 }
 
 export interface FakeMessage {
 	id: string;
 	channelId: string;
 	content: string;
-	components: MessageRow[];
 	files: OutFile[];
-	mentions?: OutMessage["mentions"];
 	/** The bot's own reactions. */
 	reactions: string[];
 	authorId: string;
@@ -84,15 +83,13 @@ export interface FakeMessage {
 	edits: number;
 }
 
-export type FakeResponseType = "reply" | "defer" | "editReply" | "followUp" | "update" | "deferUpdate" | "showModal" | "respond";
+export type FakeResponseType = "reply" | "defer" | "editReply" | "followUp";
 
 export interface FakeResponse {
 	type: FakeResponseType;
-	/** reply, editReply, followUp, update. */
+	/** reply, editReply, followUp. */
 	msg?: ReplyOptions;
 	ephemeral?: boolean;
-	modal?: APIModalInteractionResponseCallbackData;
-	choices?: APIApplicationCommandOptionChoice<string>[];
 }
 
 export interface Emitted {
@@ -139,22 +136,18 @@ export interface FakeDiscord extends DiscordConnection {
 	lastMessage(channelId: string): FakeMessage | undefined;
 	deleteMessage(ref: MsgRef): void;
 	deleteChannel(id: string): void;
-	/** Makes `createTextChannel` / `setNickname` throw `MissingPermission`. */
-	deny(permission: "ManageChannels" | "ChangeNickname", denied?: boolean): void;
+	/** Makes `setNickname` throw `MissingPermission`. */
+	deny(permission: "ChangeNickname", denied?: boolean): void;
 	nickname(guildId?: string): string | undefined;
 	commands(guildId?: string): RESTPostAPIApplicationCommandsJSONBody[] | undefined;
 	actor(userId: string, opts?: { username?: string; roleIds?: string[]; isBot?: boolean }): Actor;
 	emitCommand(e: {
-		command: "work" | "ask";
-		subcommand?: string | null;
+		command: CommandName;
 		options?: Record<string, string | number | boolean>;
 		attachments?: InAttachment[];
 		actor: Actor;
 		channelId: string;
 	}): Promise<Emitted>;
-	emitAutocomplete(e: { command: "work" | "ask"; subcommand?: string | null; focused: { name: string; value: string }; actor: Actor; channelId: string }): Promise<Emitted>;
-	emitComponent(e: { message: MsgRef; customId: string; values?: string[]; actor: Actor }): Promise<Emitted>;
-	emitModal(e: { customId: string; fields: Record<string, string>; message?: MsgRef | null; actor: Actor; channelId?: string }): Promise<Emitted>;
 	/**
 	 * Posts a user message (stored) and delivers it, unless the author is a bot or the channel is outside a guild (DSC-08).
 	 * `unfiltered` delivers it anyway, as if the adapter's filter were missing, with `guildId` overriding the channel's
@@ -199,14 +192,13 @@ export function createFakeDiscord(opts: FakeDiscordOptions = {}): FakeDiscord {
 	let loginCount = 0;
 	let token: string | undefined;
 
-	function addChannel(c: { id?: string; name: string; kind?: ChannelKind; parentId?: string | null; topic?: string; guildId?: string }, created = false): FakeChannel {
+	function addChannel(c: { id?: string; name: string; kind?: ChannelKind; parentId?: string | null; topic?: string; guildId?: string }): FakeChannel {
 		const channel: FakeChannel = {
 			id: c.id ?? newId(),
 			name: c.name,
 			kind: c.kind ?? "text",
 			parentId: c.parentId ?? null,
 			guildId: c.guildId ?? guildId,
-			created,
 			...(c.topic !== undefined ? { topic: c.topic } : {}),
 		};
 		channelStore.set(channel.id, channel);
@@ -257,9 +249,7 @@ export function createFakeDiscord(opts: FakeDiscordOptions = {}): FakeDiscord {
 			id: newId(),
 			channelId,
 			content: msg.content,
-			components: msg.components ?? [],
 			files: msg.files ?? [],
-			mentions: msg.mentions,
 			reactions: [],
 			authorId,
 			attachments: [],
@@ -272,9 +262,7 @@ export function createFakeDiscord(opts: FakeDiscordOptions = {}): FakeDiscord {
 
 	function applyEdit(message: FakeMessage, msg: OutMessage): void {
 		message.content = msg.content;
-		if (msg.components) message.components = msg.components;
 		if (msg.files) message.files = msg.files;
-		message.mentions = msg.mentions;
 		message.edits++;
 	}
 
@@ -316,7 +304,7 @@ export function createFakeDiscord(opts: FakeDiscordOptions = {}): FakeDiscord {
 	}
 
 	/** Interaction responses with Discord's acknowledgement rules, recorded in `responses`. */
-	function responder(responses: FakeResponse[], target: MsgRef | null) {
+	function responder(responses: FakeResponse[]) {
 		let acked = false;
 		const ack = (type: FakeResponseType) => {
 			if (acked) throw new Error(`interaction already acknowledged (${type})`);
@@ -347,22 +335,6 @@ export function createFakeDiscord(opts: FakeDiscordOptions = {}): FakeDiscord {
 			base,
 			get acked() {
 				return acked;
-			},
-			async update(msg: OutMessage) {
-				if (!target) throw new Error("update needs a message");
-				ack("update");
-				applyEdit(messageOf(target), msg);
-				persist();
-				responses.push({ type: "update", msg });
-			},
-			async deferUpdate() {
-				if (!target) throw new Error("deferUpdate needs a message");
-				ack("deferUpdate");
-				responses.push({ type: "deferUpdate" });
-			},
-			async showModal(modal: APIModalInteractionResponseCallbackData) {
-				ack("showModal");
-				responses.push({ type: "showModal", modal });
 			},
 		};
 	}
@@ -433,11 +405,6 @@ export function createFakeDiscord(opts: FakeDiscordOptions = {}): FakeDiscord {
 				return from.messageId;
 			});
 		},
-		archiveThread(threadId) {
-			return write("state", threadId, () => {
-				channelOf(threadId).archived = true;
-			});
-		},
 		react(ref, emoji) {
 			return write("high", ref.channelId, () => {
 				const message = messageOf(ref);
@@ -459,25 +426,6 @@ export function createFakeDiscord(opts: FakeDiscordOptions = {}): FakeDiscord {
 			if (thread?.kind !== "thread" || !thread.parentId) return null;
 			const message = messageStore.get(threadId);
 			return message && message.channelId === thread.parentId ? { channelId: thread.parentId, messageId: threadId, content: message.content } : null;
-		},
-		async channel(id) {
-			const channel = channelStore.get(id);
-			if (!channel) return null;
-			const { guildId: _g, created: _c, ...info } = channel;
-			return { ...info };
-		},
-		createTextChannel(guild, o) {
-			return write("high", `guild:${guild}`, () => {
-				if (denied.has("ManageChannels")) throw new MissingPermission("ManageChannels");
-				return addChannel({ name: o.name, topic: o.topic, parentId: o.parentId ?? null, guildId: guild }, true).id;
-			});
-		},
-		setChannel(id, patch) {
-			return write("state", id, () => {
-				const channel = channelOf(id);
-				if (patch.name !== undefined) channel.name = patch.name;
-				if (patch.topic !== undefined) channel.topic = patch.topic;
-			});
 		},
 		setNickname(guild, nickname) {
 			return write("state", `guild:${guild}`, () => {
@@ -541,70 +489,15 @@ export function createFakeDiscord(opts: FakeDiscordOptions = {}): FakeDiscord {
 
 		async emitCommand(e) {
 			const responses: FakeResponse[] = [];
-			const r = responder(responses, null);
+			const r = responder(responses);
 			const event: CommandEvent = {
 				type: "command",
 				command: e.command,
-				subcommand: e.subcommand ?? null,
 				options: e.options ?? {},
 				attachments: e.attachments ?? [],
 				actor: e.actor,
 				where: where(e.channelId),
 				...r.base,
-			};
-			await deliver(event, r);
-			return { responses };
-		},
-		async emitAutocomplete(e) {
-			const responses: FakeResponse[] = [];
-			const event: AutocompleteEvent = {
-				type: "autocomplete",
-				command: e.command,
-				subcommand: e.subcommand ?? null,
-				focused: e.focused,
-				actor: e.actor,
-				where: where(e.channelId),
-				async respond(choices) {
-					responses.push({ type: "respond", choices });
-				},
-			};
-			await deliver(event);
-			return { responses };
-		},
-		async emitComponent(e) {
-			const responses: FakeResponse[] = [];
-			const r = responder(responses, e.message);
-			const event: ComponentEvent = {
-				type: "component",
-				customId: e.customId,
-				values: e.values ?? [],
-				message: e.message,
-				actor: e.actor,
-				where: where(e.message.channelId),
-				...r.base,
-				update: r.update,
-				deferUpdate: r.deferUpdate,
-				showModal: r.showModal,
-			};
-			await deliver(event, r);
-			return { responses };
-		},
-		async emitModal(e) {
-			const responses: FakeResponse[] = [];
-			const message = e.message ?? null;
-			const r = responder(responses, message);
-			const channelId = e.channelId ?? message?.channelId;
-			if (!channelId) throw new Error("emitModal needs a message or a channelId");
-			const event: ModalEvent = {
-				type: "modal",
-				customId: e.customId,
-				fields: e.fields,
-				message,
-				actor: e.actor,
-				where: where(channelId),
-				...r.base,
-				update: r.update,
-				deferUpdate: r.deferUpdate,
 			};
 			await deliver(event, r);
 			return { responses };

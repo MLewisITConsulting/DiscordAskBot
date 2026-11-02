@@ -1,47 +1,32 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { RunStatus } from "../../shared/adminApi";
-import type { TodoItem } from "../../shared/agent";
 import type { RunUsage, TranscriptEvent } from "../../shared/transcript";
 import {
 	type AbortReason,
-	type CheckoutRequest,
 	type Dispatcher,
-	ownerKey,
-	type PushOutcome,
 	RunDetached,
 	type RunHandle,
 	type RunHooks,
 	RunLost,
-	type RunOwner,
 	type RunProgress,
 	type RunRequest,
 	type RunResult,
-	type RunUi,
 	type SteerOptions,
-	UI_CALL_CONTEXT,
-	type UiCallContext,
-	writesCode,
 } from "./dispatcher";
 
 /**
  * In-memory `Dispatcher` (implementation.md phase 2), the one tests drive. It follows the `Dispatcher` contract — start
- * or attach per owner, results kept until an attached caller received them, detaching via the caller's signal leaves the
- * run going, one-shot `abort`, steers settled as `delivered` or `ended` (RUN-15), a `UiCallContext` on every question,
- * usage reported once per run (OBS-05) — and runs a scriptable sequence of steps instead of an agent. Without a script, a
- * run yields a canned output for its kind, so the engine can run end to end.
+ * or attach per ask thread, results kept until an attached caller received them, detaching via the caller's signal
+ * leaves the run going, one-shot `abort`, steers settled as `delivered` or `ended` (RUN-15), usage reported once per run
+ * (OBS-05) — and runs a scriptable sequence of steps instead of an agent. Without a script, a run yields a canned answer,
+ * so the engine can run end to end.
  */
 
 /** One thing a fake run does, in order. */
 export type FakeStep =
 	| { progress: Partial<RunProgress> }
-	| { todos: TodoItem[] }
 	| { transcript: TranscriptEvent }
-	/**
-	 * A question through the attached caller's `hooks.ui`; the answer is recorded in `FakeRun.answers`. The `ui` passed in
-	 * adds a `UiCallContext` to the dialog options of every call.
-	 */
-	| { ui(ui: RunUi, signal: AbortSignal): Promise<unknown> }
 	| { delayMs: number }
 	/** Waits until the promise settles (a test-controlled gate). */
 	| { until: Promise<unknown> };
@@ -54,7 +39,7 @@ export interface FakeRunScript {
 	steps?: FakeStep[];
 	/** After the steps, wait until the test calls `finish`, `fail` or `lose` on the run. */
 	hold?: boolean;
-	/** The `yield` output; defaults to the canned output for the run's kind. */
+	/** The `yield` output; defaults to the canned output. */
 	output?: unknown;
 	/** The run ended at a limit (or was aborted) without being asked to. */
 	aborted?: AbortReason;
@@ -72,15 +57,13 @@ export interface FakeRunScript {
 	 * test calls `deliverSteers()`. `ended`: always `ended`.
 	 */
 	steerResult?: "delivered" | "queued" | "ended";
-	/** Ask runs: files written to `<req.scratchDir>/outputs/<name>` when the run ends; their names become `result.outputs`. */
+	/** Files written to `<req.scratchDir>/outputs/<name>` when the run ends; their names become `result.outputs`. */
 	outputFiles?: Record<string, string>;
-	/** Runs that write code: the commits of their result (RUN-19); default 1. 0 means the branch had no new commits. */
-	commits?: number;
 }
 
 /** Which runs a script applies to; every given field must match. A function decides itself. */
 export type FakeMatch =
-	| { owner?: RunOwner; kind?: RunRequest["kind"]; profile?: RunRequest["profile"] }
+	| { threadId?: string; profile?: RunRequest["profile"] }
 	| ((req: RunRequest) => boolean);
 
 export type FakeOutcome = { type: "result"; result: RunResult } | { type: "error"; error: Error };
@@ -94,9 +77,6 @@ export interface FakeRun {
 	/** The first abort reason, if any (AGT-07). */
 	readonly aborted: AbortReason | undefined;
 	readonly steers: { text: string; from: string; scratchInputs?: string[] }[];
-	readonly answers: unknown[];
-	/** `onPosted` calls of the run's questions, by `UiCallContext.key`. */
-	readonly posted: ReadonlyMap<string, { channelId: string; messageIds: string[] }>;
 	/** How many `runAgent` calls attached to this run, the starting call included. */
 	readonly attachCount: number;
 	/** True while a caller is attached. */
@@ -117,12 +97,6 @@ export interface FakeDispatcherOptions {
 	scripts?: { match: FakeMatch; script: FakeRunScript; times?: number }[];
 	/** Replaces the canned outputs. */
 	cannedOutput?(req: RunRequest): unknown;
-	/** Answers `mcpTest`; default `{ ok: true, tools: [] }`. */
-	mcpTest?(spec: { name: string; server: unknown }): Promise<{ ok: boolean; tools: string[]; error?: string }>;
-	/** Answers `pushResult` for a kept result; default `{ pushed: true, sha: "fake-sha-<n>" }`. */
-	push?(p: { runId: string; branch: string; req: RunRequest }): PushOutcome | Promise<PushOutcome>;
-	/** Answers `repoConfig`; default: the base branch is the default branch, no `setupCommand`. */
-	repoConfig?(checkout: CheckoutRequest): Promise<{ baseBranch: string; setupCommand?: string }>;
 }
 
 export interface FakeDispatcher extends Dispatcher {
@@ -130,64 +104,31 @@ export interface FakeDispatcher extends Dispatcher {
 	script(match: FakeMatch, script: FakeRunScript, times?: number): void;
 	/** `script(match, script, 1)`. */
 	once(match: FakeMatch, script: FakeRunScript): void;
-	/** The next `runAgent` for `owner` that finds no run throws `RunLost` (a run lost while no orchestrator was attached). */
-	markLost(owner: RunOwner): void;
-	/** The live or undelivered run of `owner`. */
-	run(owner: RunOwner): FakeRun | undefined;
+	/** The next `runAgent` for `threadId` that finds no run throws `RunLost` (a run lost while no orchestrator was attached). */
+	markLost(threadId: string): void;
+	/** The live or undelivered run of the ask thread. */
+	run(threadId: string): FakeRun | undefined;
 	/** Every run started so far, oldest first. */
 	readonly runs: readonly FakeRun[];
 	/** Every `runAgent` request, attaches included, in call order. */
 	readonly calls: readonly { req: RunRequest; attached: boolean }[];
-	/** Every `mcpTest` request, in call order. */
-	readonly mcpTests: readonly { name: string; server: unknown }[];
-	/** Every successful or refused `pushResult`, in call order. */
-	readonly pushes: readonly { runId: string; branch: string; outcome: PushOutcome }[];
-	/** Results deleted with `discardResult`, and issues released with `releaseIssue`. */
-	readonly discarded: readonly string[];
-	readonly released: readonly number[];
 	/** Settles once no run is unfinished. */
 	idle(): Promise<void>;
 }
 
 const DEFAULT_USAGE: RunUsage = { costUsd: 0.01, input: 1000, output: 200, cacheRead: 0, cacheWrite: 0 };
 
-/** The canned `yield` output of a run of `req.kind` (AGT-12 shapes). */
-export function cannedOutput(req: RunRequest): unknown {
-	switch (req.kind) {
-		case "plan": {
-			const plan = {
-				summary: "Canned plan from the fake dispatcher.",
-				planMarkdown: "## Plan\n1. Make the change.\n2. Test it.",
-				complexity: "small",
-			};
-			return req.owner.kind === "plan" ? { title: "Canned request plan", ...plan } : plan;
-		}
-		case "implement":
-			return { prTitle: "Canned change", prBody: "Made by the fake dispatcher.", testing: "Nothing was run." };
-		case "revise":
-		case "fix_ci":
-			return { summary: "Canned follow-up from the fake dispatcher." };
-		case "chat":
-		case "ask":
-			return { answer: "Canned answer from the fake dispatcher." };
-		case "draft":
-			return {
-				title: "Canned issue",
-				body: "## Summary\nCanned.\n\n## Context\nNone.\n\n## Acceptance criteria\n- [ ] Done",
-			};
-	}
+/** The canned `yield` output of an ask run (AGT-12). */
+export function cannedOutput(_req: RunRequest): unknown {
+	return { answer: "Canned answer from the fake dispatcher." };
 }
 
 function matches(match: FakeMatch, req: RunRequest): boolean {
 	if (typeof match === "function") return match(req);
-	if (match.owner && ownerKey(match.owner) !== ownerKey(req.owner)) return false;
-	if (match.kind && match.kind !== req.kind) return false;
+	if (match.threadId && match.threadId !== req.threadId) return false;
 	if (match.profile && match.profile !== req.profile) return false;
 	return true;
 }
-
-/** Index of the dialog options argument per `RunUi` method. */
-const DIALOG_ARG: Record<Exclude<keyof RunUi, "notify">, number> = { askDialog: 1, select: 2, input: 2, editor: 2, confirm: 2 };
 
 interface Caller {
 	hooks: RunHooks;
@@ -211,7 +152,7 @@ interface RunImpl extends FakeRun {
 	outcome: FakeOutcome | undefined;
 	handle: RunHandle;
 	pendingSince: number | undefined;
-	/** Status view (§9.3): when it became pending, left pending ("claimed") and registered ("started"); latest progress. */
+	/** Status view (NFR-06): when it became pending, left pending ("claimed") and registered ("started"); latest progress. */
 	createdAt: number;
 	claimedAt: number | undefined;
 	startedAt: number | undefined;
@@ -219,11 +160,8 @@ interface RunImpl extends FakeRun {
 	liveUsage: RunUsage;
 	/** Usage computed at the end, waiting for a caller when none was attached (OBS-05: reported exactly once). */
 	usageOwed: RunUsage | undefined;
-	posted: Map<string, { channelId: string; messageIds: string[] }>;
 	/** Steers not yet settled. */
 	queued: QueuedSteer[];
-	/** Delivery promises of questions not yet answered, settled false when the run ends. */
-	openQuestions: Set<(delivered: boolean) => void>;
 }
 
 export function createFakeDispatcher(opts: FakeDispatcherOptions = {}): FakeDispatcher {
@@ -233,16 +171,10 @@ export function createFakeDispatcher(opts: FakeDispatcherOptions = {}): FakeDisp
 		left: s.times ?? Number.POSITIVE_INFINITY,
 	}));
 	const canned = opts.cannedOutput ?? cannedOutput;
-	const byOwner = new Map<string, RunImpl>();
-	const lostOwners = new Set<string>();
+	const byThread = new Map<string, RunImpl>();
+	const lostThreads = new Set<string>();
 	const runs: RunImpl[] = [];
 	const calls: { req: RunRequest; attached: boolean }[] = [];
-	const mcpTests: { name: string; server: unknown }[] = [];
-	/** Results of code-writing runs waiting for `pushResult` or `discardResult`, by run id (RUN-19). */
-	const keptResults = new Map<string, RunRequest>();
-	const pushes: { runId: string; branch: string; outcome: PushOutcome }[] = [];
-	const discarded: string[] = [];
-	const released: number[] = [];
 	let nextId = 1;
 	let idleWaiters: (() => void)[] = [];
 
@@ -258,7 +190,7 @@ export function createFakeDispatcher(opts: FakeDispatcherOptions = {}): FakeDisp
 
 	function unfinished(): number {
 		let n = 0;
-		for (const run of byOwner.values()) if (run.state !== "finished") n++;
+		for (const run of byThread.values()) if (run.state !== "finished") n++;
 		return n;
 	}
 
@@ -280,7 +212,7 @@ export function createFakeDispatcher(opts: FakeDispatcherOptions = {}): FakeDisp
 		}
 		run.caller = undefined;
 		caller.cleanup();
-		if (byOwner.get(run.key) === run) byOwner.delete(run.key);
+		if (byThread.get(run.key) === run) byThread.delete(run.key);
 		if (run.outcome.type === "result") caller.resolve(run.outcome.result);
 		else caller.reject(run.outcome.error);
 	}
@@ -321,48 +253,6 @@ export function createFakeDispatcher(opts: FakeDispatcherOptions = {}): FakeDisp
 		return promise;
 	}
 
-	/** `ui` with a `UiCallContext` added to the dialog options of every question (RUN-08, RUN-15). */
-	function contextUi(run: RunImpl, ui: RunUi): RunUi {
-		let n = 0;
-		const call = (method: keyof typeof DIALOG_ARG) =>
-			((...args: unknown[]) => {
-				const key = `${run.id}:${++n}`;
-				const delivered = Promise.withResolvers<boolean>();
-				run.openQuestions.add(delivered.resolve);
-				const context: UiCallContext = {
-					key,
-					onPosted: posted => void run.posted.set(key, posted),
-					delivered: delivered.promise,
-				};
-				const index = DIALOG_ARG[method];
-				const full = [...args];
-				while (full.length < index) full.push(undefined);
-				full[index] = { ...(full[index] as object | undefined), [UI_CALL_CONTEXT]: context };
-				const fn = ui[method] as ((...a: unknown[]) => Promise<unknown>) | undefined;
-				if (!fn) return Promise.reject(new Error(`${method} unsupported`));
-				return fn.apply(ui, full).then(
-					value => {
-						run.openQuestions.delete(delivered.resolve);
-						delivered.resolve(true);
-						return value;
-					},
-					err => {
-						run.openQuestions.delete(delivered.resolve);
-						delivered.resolve(false);
-						throw err;
-					},
-				);
-			}) as never;
-		return {
-			askDialog: call("askDialog"),
-			select: call("select"),
-			input: call("input"),
-			editor: call("editor"),
-			confirm: call("confirm"),
-			notify: (message, type) => ui.notify(message, type),
-		};
-	}
-
 	function start(req: RunRequest, hooks: RunHooks, signal: AbortSignal | undefined): Promise<RunResult> {
 		const script = pickScript(req);
 		const aborter = new AbortController();
@@ -374,17 +264,14 @@ export function createFakeDispatcher(opts: FakeDispatcherOptions = {}): FakeDisp
 		};
 		const run: RunImpl = {
 			id: nextId++,
-			key: ownerKey(req.owner),
+			key: req.threadId,
 			req,
 			script,
 			state: "pending",
 			registered: false,
 			aborted: undefined,
 			steers: [],
-			answers: [],
-			posted: new Map(),
 			queued: [],
-			openQuestions: new Set(),
 			attachCount: 0,
 			get attached() {
 				return run.caller !== undefined;
@@ -430,18 +317,12 @@ export function createFakeDispatcher(opts: FakeDispatcherOptions = {}): FakeDisp
 			},
 		};
 		const usage = (): RunUsage => ({ ...DEFAULT_USAGE, ...script.usage });
-		const baseResult = (): RunResult => {
-			const result: RunResult = {
-				output: script.output ?? canned(req),
-				usage: usage(),
-				oomKills: script.oomKills ?? 0,
-				hasSession: script.hasSession ?? true,
-			};
-			if (!writesCode(req.kind)) return result;
-			const code = { runId: `fake-run-${run.id}`, commits: script.commits ?? 1 };
-			if (code.commits > 0) keptResults.set(code.runId, req);
-			return { ...result, code };
-		};
+		const baseResult = (): RunResult => ({
+			output: script.output ?? canned(req),
+			usage: usage(),
+			oomKills: script.oomKills ?? 0,
+			hasSession: script.hasSession ?? true,
+		});
 		const hooksNow = () => run.caller?.hooks;
 		const register = () => {
 			if (run.registered) return;
@@ -489,12 +370,8 @@ export function createFakeDispatcher(opts: FakeDispatcherOptions = {}): FakeDisp
 					run.liveUsage = progress.usage;
 					if (progress.tool) run.lastTool = progress.tool;
 					hooks?.onProgress?.(progress);
-				} else if ("todos" in step) hooks?.onTodos?.(step.todos);
-				else if ("transcript" in step) hooks?.onTranscript?.(step.transcript);
-				else if ("ui" in step) {
-					if (!hooks) throw new Error("fake run asked a question while no caller was attached");
-					run.answers.push(await step.ui(contextUi(run, hooks.ui), aborter.signal));
-				} else if ("delayMs" in step) await waitFor(step.delayMs);
+				} else if ("transcript" in step) hooks?.onTranscript?.(step.transcript);
+				else if ("delayMs" in step) await waitFor(step.delayMs);
 				else await waitFor(step.until);
 				if (aborter.signal.aborted) throw new Error("aborted");
 			}
@@ -515,7 +392,7 @@ export function createFakeDispatcher(opts: FakeDispatcherOptions = {}): FakeDisp
 
 		/** Writes the script's output files into the scratch directory; returns their names (CHAT-10). */
 		async function writeOutputs(): Promise<string[] | undefined> {
-			if (!script.outputFiles || !req.scratchDir) return undefined;
+			if (!script.outputFiles) return undefined;
 			const dir = join(req.scratchDir, "outputs");
 			await mkdir(dir, { recursive: true });
 			for (const [name, content] of Object.entries(script.outputFiles)) await Bun.write(join(dir, name), content);
@@ -530,8 +407,6 @@ export function createFakeDispatcher(opts: FakeDispatcherOptions = {}): FakeDisp
 			run.state = "finished";
 			run.outcome = final;
 			settleSteers("ended");
-			for (const settle of run.openQuestions) settle(false);
-			run.openQuestions.clear();
 			const used = final.type === "result" ? final.result.usage : usage();
 			hooksNow()?.onTranscript?.({
 				type: "run_end",
@@ -557,7 +432,7 @@ export function createFakeDispatcher(opts: FakeDispatcherOptions = {}): FakeDisp
 			);
 		}
 
-		byOwner.set(run.key, run);
+		byThread.set(run.key, run);
 		runs.push(run);
 		const result = attach(run, req, hooks, signal);
 		// Ended runs ignore the outcome; `finish`, `fail` and `lose` may have ended it first.
@@ -573,10 +448,10 @@ export function createFakeDispatcher(opts: FakeDispatcherOptions = {}): FakeDisp
 
 	return {
 		runAgent(req, hooks, signal) {
-			const key = ownerKey(req.owner);
-			const existing = byOwner.get(key);
+			const key = req.threadId;
+			const existing = byThread.get(key);
 			if (existing) return attach(existing, req, hooks, signal);
-			if (lostOwners.delete(key)) {
+			if (lostThreads.delete(key)) {
 				calls.push({ req, attached: true });
 				return Promise.reject(new RunLost());
 			}
@@ -584,28 +459,25 @@ export function createFakeDispatcher(opts: FakeDispatcherOptions = {}): FakeDisp
 			return start(req, hooks, signal);
 		},
 		// A run lost while no caller was attached is still there to attach to: the attach reports `RunLost`.
-		hasRun: owner => byOwner.has(ownerKey(owner)) || lostOwners.has(ownerKey(owner)),
-		hasUnfinishedRun(owner) {
-			const run = byOwner.get(ownerKey(owner));
+		hasRun: threadId => byThread.has(threadId) || lostThreads.has(threadId),
+		hasUnfinishedRun(threadId) {
+			const run = byThread.get(threadId);
 			return run !== undefined && run.state !== "finished";
 		},
 		workers: () => [],
 		activeRuns() {
 			const iso = (ms: number) => new Date(ms).toISOString();
-			return [...byOwner.values()]
+			return [...byThread.values()]
 				.filter(run => run.state !== "finished")
 				.sort((a, b) => a.createdAt - b.createdAt)
 				.map(run => {
 					const status: RunStatus = {
 						id: `fake-run-${run.id}`,
-						kind: run.req.kind,
 						state: run.state === "pending" ? "pending" : run.registered ? "running" : "assigned",
-						owner: run.key,
+						threadId: run.key,
 						createdAt: iso(run.createdAt),
 						usage: run.liveUsage,
 					};
-					if (run.req.checkout) status.repo = run.req.checkout.repo;
-					if (run.req.threadId) status.threadId = run.req.threadId;
 					if (run.claimedAt !== undefined) status.claimedAt = iso(run.claimedAt);
 					if (run.startedAt !== undefined) status.startedAt = iso(run.startedAt);
 					if (run.claimedAt !== undefined && run.startedAt !== undefined) status.setupMs = run.startedAt - run.claimedAt;
@@ -617,7 +489,7 @@ export function createFakeDispatcher(opts: FakeDispatcherOptions = {}): FakeDisp
 			let pending = 0;
 			let running = 0;
 			let oldest: number | undefined;
-			for (const run of byOwner.values()) {
+			for (const run of byThread.values()) {
 				if (run.state === "pending") {
 					pending++;
 					if (run.pendingSince !== undefined && (oldest === undefined || run.pendingSince < oldest)) oldest = run.pendingSince;
@@ -625,56 +497,21 @@ export function createFakeDispatcher(opts: FakeDispatcherOptions = {}): FakeDisp
 			}
 			return { pending, running, oldestPendingMs: oldest === undefined ? null : Date.now() - oldest };
 		},
-		async mcpTest(spec, testOpts) {
-			mcpTests.push(spec);
-			testOpts?.onWaitingForWorker?.();
-			testOpts?.onStarted?.();
-			return opts.mcpTest ? opts.mcpTest(spec) : { ok: true, tools: [] };
-		},
-		async pushResult(runId, branch) {
-			const req = keptResults.get(runId);
-			if (!req) throw new Error(`run ${runId} keeps no result to push`);
-			const outcome = opts.push ? await opts.push({ runId, branch, req }) : { pushed: true as const, sha: `fake-sha-${pushes.length + 1}` };
-			pushes.push({ runId, branch, outcome });
-			return outcome;
-		},
-		async discardResult(runId) {
-			keptResults.delete(runId);
-			discarded.push(runId);
-		},
-		async releaseIssue(issueId) {
-			released.push(issueId);
-		},
-		async repoConfig(checkout) {
-			return opts.repoConfig ? opts.repoConfig(checkout) : { baseBranch: await checkout.defaultBranch() };
-		},
-		get pushes() {
-			return pushes;
-		},
-		get discarded() {
-			return discarded;
-		},
-		get released() {
-			return released;
-		},
 		script(match, script, times) {
 			scripts.push({ match, script, left: times ?? Number.POSITIVE_INFINITY });
 		},
 		once(match, script) {
 			scripts.push({ match, script, left: 1 });
 		},
-		markLost(owner) {
-			lostOwners.add(ownerKey(owner));
+		markLost(threadId) {
+			lostThreads.add(threadId);
 		},
-		run: owner => byOwner.get(ownerKey(owner)),
+		run: threadId => byThread.get(threadId),
 		get runs() {
 			return runs;
 		},
 		get calls() {
 			return calls;
-		},
-		get mcpTests() {
-			return mcpTests;
 		},
 		idle() {
 			if (unfinished() === 0) return Promise.resolve();

@@ -17,203 +17,82 @@ export interface FieldDef {
 }
 
 const MODEL_HELP =
-	"A model id from omp's model list; its provider needs an API key under Secrets (or a sign-in, from a later release). Blank uses omp's default model.";
+	"A model id from omp's model list; its provider needs a sign-in (Model accounts) or an API key under Secrets. Blank uses omp's default model.";
 
 const CHANNEL_ID_HELP =
 	"Once the bot token and guild ID are saved, choose it from the list, which shows what the bot is missing in each channel. Before that, enter its ID: in Discord, turn on Developer Mode (User Settings → Advanced), then right-click the channel → Copy Channel ID.";
 
-function stateLabel(key: string, suffix: string, what: string): FieldDef {
-	return {
-		name: `labels.states.${key}`,
-		label: `${what} label`,
-		kind: "text",
-		example: `ai:${suffix}`,
-		defaultText: `<trigger>:${suffix}`,
-		help: `GitHub label set on an issue while it is ${what.toLowerCase()}. Renaming it relabels every tracked issue without cancelling anything. Blank derives it from the trigger label. All labels must differ (case-insensitive).`,
-	};
-}
-
-/** Every scalar/list field of `Config`, in display order. Sections come from the first path segment. */
+/** Every scalar/list field of `Config` (requirements §9), in display order. Sections come from the first path segment. */
 export const CONFIG_FIELDS: FieldDef[] = [
 	{
 		name: "discord.guildId",
 		label: "Guild ID",
 		kind: "text",
 		example: "123456789012345678",
-		help: "ID of the Discord server (guild) AskBot works in. The /work and /ask commands are registered there, and every channel below must be in it. Turn on Developer Mode (User Settings → Advanced), then right-click the server icon → Copy Server ID.",
+		help: "ID of the Discord server (guild) AskBot works in. /ask and /stop are registered there, and every ask-only channel must be in it. Turn on Developer Mode (User Settings → Advanced), then right-click the server icon → Copy Server ID.",
 	},
 	{
 		name: "discord.allowedUserIds",
 		label: "Allowed user IDs",
 		kind: "list",
 		example: "234567890123456789, 345678901234567890",
-		help: "Discord users allowed to control AskBot: the /work commands, plan approval, answering agent questions and steering runs. Everyone else is refused. Right-click a user → Copy User ID. Separate several with commas or spaces. At least one user or role is required.",
+		help: "Discord users who may follow up, steer and /stop in every ask thread, and who are exempt from the one-live-run limit. Right-click a user → Copy User ID. Separate several with commas or spaces. At least one user or role is required.",
 	},
 	{
 		name: "discord.allowedRoleIds",
 		label: "Allowed role IDs",
 		kind: "list",
 		example: "456789012345678901",
-		help: "Members of these roles get the same control as the allowed users. Server Settings → Roles → right-click a role → Copy Role ID. Separate several with commas or spaces.",
-	},
-	{
-		name: "discord.workChannelId",
-		label: "Work channel",
-		kind: "text",
-		example: "567890123456789012",
-		help: `The one text channel where /work commands are used. Issues of repositories that are not watched get their threads here. It cannot be an ask-only channel or a watch channel. The engine starts once it is chosen; on a fresh install, save the bot token and guild ID first, then choose it here. ${CHANNEL_ID_HELP}`,
-	},
-	{
-		name: "discord.watchCategoryId",
-		label: "Watch category",
-		kind: "text",
-		example: "678901234567890123",
-		help: "Category that /work watch and the Repositories page create repository channels under. The bot needs Manage Channels there. Once the bot token and guild ID are saved, choose it from the list; before that, right-click the category → Copy Category ID. Blank creates them at the top level.",
+		help: "Members of these roles count as allowed members, like the allowed users. Server Settings → Roles → right-click a role → Copy Role ID. Separate several with commas or spaces.",
 	},
 	{
 		name: "discord.askChannelIds",
 		label: "Ask-only channels",
 		kind: "list",
 		example: "789012345678901234",
-		help: `Channels where anyone who can use the channel may run /ask, a general assistant with no repository. Separate several with commas or spaces. A channel cannot also be the work channel or a watch channel. ${CHANNEL_ID_HELP}`,
-	},
-	{
-		name: "github.appId",
-		label: "App ID",
-		kind: "number",
-		example: "1234567",
-		help: "The numeric App ID at the top of your GitHub App's settings page (not the Client ID). AskBot uses it with the private key under Secrets to act as the app. The repositories are the ones the App is installed on.",
-	},
-	{
-		name: "github.pollIntervalSeconds",
-		label: "Poll interval (seconds)",
-		kind: "number",
-		example: "30",
-		help: "How often AskBot checks GitHub for newly labelled issues in watched repositories, and for reviews, comments and CI results on tracked issues. Lower reacts faster but uses more of the App's API rate limit.",
-	},
-	{
-		name: "github.mentionKeyword",
-		label: "Mention keyword",
-		kind: "text",
-		example: "@askbot",
-		help: "Text that turns a general comment on an AskBot pull request into a change request, such as “/askbot rename the helper”. Reviews and inline comments always count. Only comments from the repository's owners, members and collaborators are acted on.",
+		help: `Channels where anyone may run /ask. The engine starts once at least one is chosen; on a fresh install, save the bot token and guild ID first, then choose them here. Separate several with commas or spaces. ${CHANNEL_ID_HELP}`,
 	},
 	{
 		name: "agent.name",
 		label: "Agent name",
 		kind: "text",
-		example: "Forge",
-		help: "The bot's nickname in the guild and the name it uses in Discord messages, 1–32 characters.",
+		example: "Helper",
+		help: "The bot's nickname in the guild and the name it uses in Discord messages and agent prompts, 1–32 characters.",
 	},
 	{
-		name: "labels.trigger",
-		label: "Trigger label",
+		name: "models.ask",
+		label: "Ask model",
 		kind: "text",
-		example: "ai-ready",
-		help: "Adding this label to an issue in a watched repository hands it to AskBot: it writes a plan and posts it in Discord for approval. AskBot creates the labels in each repository when they are missing.",
-	},
-	stateLabel("planning", "planning", "Planning"),
-	stateLabel("awaitingApproval", "awaiting-approval", "Awaiting approval"),
-	stateLabel("implementing", "implementing", "Implementing"),
-	stateLabel("inReview", "in-review", "In review"),
-	stateLabel("failed", "failed", "Failed"),
-	{
-		name: "models.plan",
-		label: "Plan model",
-		kind: "text",
-		example: "anthropic/claude-opus-4-5",
-		help: `Model for issue planning and /work plan, including revisions you request. ${MODEL_HELP}`,
-	},
-	{
-		name: "models.implement",
-		label: "Implement model",
-		kind: "text",
-		example: "xai-oauth/grok-4",
-		help: `Model for implementing an approved plan and for revise and fix-CI runs. ${MODEL_HELP}`,
-	},
-	{
-		name: "models.chat",
-		label: "Chat model",
-		kind: "text",
-		example: "google-gemini-cli/gemini-2.5-pro",
-		help: `Model for /work ask, /ask and /work issue drafts. ${MODEL_HELP}`,
+		example: "anthropic/claude-sonnet-4-5",
+		help: `Model for every /ask turn. ${MODEL_HELP}`,
 	},
 	{
 		name: "models.thinking",
 		label: "Thinking level",
 		kind: "text",
 		example: "medium",
-		help: "How much the model reasons before acting, for every run: auto, inherit, off, minimal, low, medium, high, xhigh or max. Higher is slower and costs more; models without reasoning ignore it.",
-	},
-	{
-		name: "limits.maxConcurrentJobs",
-		label: "Max concurrent jobs",
-		kind: "number",
-		example: "3",
-		help: "How many issue jobs (plan, implement, revise, fix CI) run at the same time across all repositories; further jobs wait in the queue. Chats are limited separately.",
+		help: "How much the model reasons before acting: auto, inherit, off, minimal, low, medium, high, xhigh or max. Higher is slower and costs more; models without reasoning ignore it.",
 	},
 	{
 		name: "limits.maxChatSessions",
 		label: "Max chat sessions",
 		kind: "number",
 		example: "4",
-		help: "How many Discord chats (/work ask and /ask) can have an agent answering at the same time.",
+		help: "How many /ask runs can be active at the same time; a new /ask is refused while this many are. To use more workers, raise it up to the worker capacity.",
 	},
 	{
-		name: "limits.planMinutes",
-		label: "Plan minutes",
-		kind: "number",
-		example: "45",
-		help: "Time limit for one planning run. Time spent waiting for your answers in Discord doesn't count.",
-	},
-	{
-		name: "limits.implementMinutes",
-		label: "Implement minutes",
-		kind: "number",
-		example: "180",
-		help: "Time limit for one implementation or revise run. Waiting for CI and for your answers doesn't count.",
-	},
-	{
-		name: "limits.fixMinutes",
-		label: "Fix minutes",
-		kind: "number",
-		example: "60",
-		help: "Time limit for one run that fixes failing CI checks.",
-	},
-	{
-		name: "limits.maxCostUsdPerJob",
-		label: "Max cost per job (USD)",
+		name: "limits.maxCostUsdPerTurn",
+		label: "Max cost per turn (USD)",
 		kind: "number",
 		example: "7.50",
-		help: "Spending cap for a single agent run, computed from the model's token prices. The run is stopped when it reaches the cap.",
-	},
-	{
-		name: "limits.maxCiFixAttempts",
-		label: "Max CI fix attempts",
-		kind: "number",
-		example: "2",
-		help: "How many times AskBot tries to fix failing CI for one issue, before and after the pull request is opened. 0 turns automatic CI fixes off.",
-	},
-	{
-		name: "limits.ciWaitMinutes",
-		label: "CI wait minutes",
-		kind: "number",
-		example: "90",
-		help: "How long AskBot waits for CI on its pushed branch before opening the pull request anyway.",
-	},
-	{
-		name: "limits.askTimeoutHours",
-		label: "Ask timeout (hours)",
-		kind: "number",
-		example: "8",
-		help: "How long an agent waits for an answer to a question in Discord before it continues with the options it recommended.",
+		help: "Spending cap for one /ask turn including its task subagents, computed from the model's token prices. The turn is stopped when it reaches the cap; another message continues it.",
 	},
 	{
 		name: "limits.chatIdleMinutes",
 		label: "Chat idle minutes",
 		kind: "number",
 		example: "60",
-		help: "After a chat thread has been quiet this long, its working copy or scratch folder is deleted. The conversation is kept.",
+		help: "After an ask thread has been quiet this long, its scratch folder (attachments and produced files) is deleted. The conversation is kept.",
 	},
 	{
 		name: "workers.maxConcurrentRuns",
@@ -242,15 +121,13 @@ export const CONFIG_FIELDS: FieldDef[] = [
 		label: "Install omp updates automatically",
 		kind: "boolean",
 		example: "true",
-		help: "When on, a newer omp for workers is installed as soon as the npm check finds it, without the Approve update button in the work channel. Discord still gets a notice before and a message after. A version whose install or first run failed is not retried automatically; approve it in Discord. Only in the container image.",
+		help: "When on, a newer omp for workers is installed as soon as the npm check finds it, without Approve update on the omp page. A version whose install or first run failed is not retried automatically; approve it on the omp page. Only in the container image.",
 	},
 ];
 
 export const SECTION_LABELS: Record<string, string> = {
 	discord: "Discord",
-	github: "GitHub",
 	agent: "Agent",
-	labels: "Labels",
 	models: "Models",
 	limits: "Limits",
 	workers: "Workers",
@@ -260,7 +137,6 @@ export const SECTION_LABELS: Record<string, string> = {
 
 export const SECRET_FIELDS = {
 	discordToken: "secrets.discordToken",
-	githubAppPrivateKey: "secrets.githubAppPrivateKey",
 } as const;
 
 export interface ProviderRow {
@@ -275,16 +151,12 @@ export interface SettingsFormState {
 	config: Record<string, string>;
 	providers: ProviderRow[];
 	discordTokenSet: boolean;
-	githubAppPrivateKeySet: boolean;
 }
 
 /** Config defaults, read from the schema by parsing a minimal valid config. */
-const DEFAULT_CONFIG: Config = parseConfig({
-	discord: { guildId: "-", allowedUserIds: ["-"], workChannelId: "-" },
-	github: { appId: 1 },
-});
+const DEFAULT_CONFIG: Config = parseConfig({ discord: { guildId: "-", allowedUserIds: ["-"] } });
 /** Fields whose placeholder value in `DEFAULT_CONFIG` must not be shown as a default. */
-const NO_DEFAULT_FIELDS = ["discord.guildId", "discord.allowedUserIds", "discord.workChannelId", "github.appId"];
+const NO_DEFAULT_FIELDS = ["discord.guildId", "discord.allowedUserIds"];
 
 /** Schema default of a config field for its hover help; "" when it has none. */
 export function configDefault(def: FieldDef): string {
@@ -366,15 +238,15 @@ function providerRows(form: FormData): { name: string; key: string; remove: bool
 	return rows;
 }
 
-/** Form names of the channel fields (WEB-20); the ask-only control adds `.add` (a dropdown) and `.remove` (checkboxes). */
-export const CHANNEL_FIELDS = { work: "discord.workChannelId", category: "discord.watchCategoryId", ask: "discord.askChannelIds" } as const;
+/** Form name of the ask-only channel field (WEB-20); its dropdown control adds `.add` (a dropdown) and `.remove` (checkboxes). */
+export const ASK_CHANNELS_FIELD = "discord.askChannelIds";
 
 /**
  * The submitted text of a config field. Ask-only channels come as one typed list, or as one hidden input per channel
  * with Remove checkboxes and an Add dropdown (WEB-20); they are merged into one list.
  */
 function submitted(form: FormData, name: string): string {
-	if (name !== CHANNEL_FIELDS.ask) return field(form, name);
+	if (name !== ASK_CHANNELS_FIELD) return field(form, name);
 	const removed = new Set(form.getAll(`${name}.remove`));
 	const ids = form
 		.getAll(name)
@@ -386,7 +258,7 @@ function submitted(form: FormData, name: string): string {
 }
 
 /**
- * Builds the admin API save request from the settings form; the orchestrator validates it as a whole (§13).
+ * Builds the admin API save request from the settings form; the orchestrator validates it as a whole (requirements §9).
  * Blank optional fields are omitted so schema defaults apply. Blank secret inputs are omitted, which keeps the stored
  * value; a provider row marked for removal is sent with an empty key, which deletes it.
  */
@@ -401,8 +273,6 @@ export function saveRequestFromForm(form: FormData): SettingsSaveRequest {
 	const secrets: SettingsSaveRequest["secrets"] = {};
 	const discordToken = field(form, SECRET_FIELDS.discordToken).trim();
 	if (discordToken) secrets.discordToken = discordToken;
-	const githubAppPrivateKey = field(form, SECRET_FIELDS.githubAppPrivateKey).trim();
-	if (githubAppPrivateKey) secrets.githubAppPrivateKey = githubAppPrivateKey;
 	const providerKeys: Record<string, string> = {};
 	for (const row of providerRows(form)) {
 		if (row.remove) providerKeys[row.name] = "";
@@ -422,7 +292,6 @@ export function formStateFromView(view: SettingsView): SettingsFormState {
 		config,
 		providers: view.secrets.providerKeys.map(name => ({ name, set: true })),
 		discordTokenSet: view.secrets.discordToken,
-		githubAppPrivateKeySet: view.secrets.githubAppPrivateKey,
 	};
 }
 
@@ -436,11 +305,10 @@ export function formStateFromSubmission(form: FormData, secrets: SecretsView): S
 			.filter(row => !row.remove)
 			.map(row => ({ name: row.name, set: secrets.providerKeys.includes(row.name) })),
 		discordTokenSet: secrets.discordToken,
-		githubAppPrivateKeySet: secrets.githubAppPrivateKey,
 	};
 }
 
-/** What a settings save reports (ENG-02), on the Settings page and in VS Code after a `settings.json` save (WEB-28). */
+/** What a settings save reports on the Settings page (ENG-02). */
 export function settingsSavedText(result: { phase: string; error?: string }): string {
 	return `Settings saved. Engine is ${result.phase}${result.error ? `: ${result.error.replace(/\.$/, "")}` : ""}.`;
 }

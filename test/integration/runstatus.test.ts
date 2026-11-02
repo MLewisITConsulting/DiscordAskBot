@@ -3,9 +3,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startInternalApi } from "../../src/orchestrator/api/server";
-import type { RunHooks, RunRequest, RunUi } from "../../src/orchestrator/dispatch/dispatcher";
+import type { RunHooks, RunRequest } from "../../src/orchestrator/dispatch/dispatcher";
 import { createWorkerDispatcher } from "../../src/orchestrator/dispatch/workers";
-import { createRepos } from "../../src/orchestrator/git/repos";
 import { dbPath, openDb } from "../../src/orchestrator/store/db";
 import type { Loadout } from "../../src/shared/agent";
 import type { ChildMessage } from "../../src/shared/protocol";
@@ -13,13 +12,13 @@ import type { RunUsage } from "../../src/shared/transcript";
 import { type DownMessage, WORKER_WS_PATH } from "../../src/shared/wire";
 
 /**
- * The status page's view of runs on the real worker dispatcher (§9.3, NFR-06): a scripted WebSocket worker claims an
+ * The status page's view of runs on the real worker dispatcher (NFR-06): a scripted WebSocket worker claims an
  * `/ask` run, the claim and the host's `registered` stamp the setup time, and progress and loadout show up live.
  */
 
 const WORKER_TOKEN = "worker-token";
 const USAGE: RunUsage = { costUsd: 0.25, input: 100, output: 20, cacheRead: 0, cacheWrite: 0 };
-const LOADOUT: Loadout = { capturedAt: "2026-10-30T00:00:00.000Z", profile: "ask", tools: ["read", "web_search"], skills: [], agents: [], mcp: [] };
+const LOADOUT: Loadout = { capturedAt: "2026-10-30T00:00:00.000Z", profile: "ask", tools: ["read", "web_search"], skills: [], agents: [] };
 
 const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {
@@ -79,18 +78,17 @@ test("a run's claim and agent start give its setup time; the status view shows w
 		stateDir,
 		// Every worker here connects from 127.0.0.1 (architecture §6 address binding is tested in dispatch.test.ts).
 		bindWorkerAddresses: false,
-		limits: () => ({ maxConcurrentJobs: 2, maxChatSessions: 2, maxConcurrentRuns: 4 }),
+		limits: () => ({ maxChatSessions: 2, maxConcurrentRuns: 4 }),
 		reattachGraceMs: 2000,
 		spec: {
 			stateDir,
-			ompConfig: () => ({ settings: {}, mcpServers: {} }),
+			ompConfig: () => ({ settings: {} }),
 			providerKeys: () => ({}),
 			credentials: async () => [],
 			skillsHash: async () => "skills-hash",
 		},
 		skills: async () => ({ hash: "skills-hash", tar: new Uint8Array() }),
 		credentialRequest: async () => ({ ok: false, error: "none" }),
-		repos: createRepos({ stateDir }),
 	});
 	const api = startInternalApi({
 		host: "127.0.0.1",
@@ -113,31 +111,27 @@ test("a run's claim and agent start give its setup time; the status view shows w
 		db.close();
 	});
 
-	db.insertChat("t1", "ask");
+	db.insertAskChat("t1", "c1", "u1");
 	const req: RunRequest = {
-		owner: { kind: "chat", threadId: "t1" },
-		kind: "ask",
+		threadId: "t1",
 		profile: "ask",
 		prompt: "Hello?",
 		thinking: "high",
 		limits: { minutes: 10, costUsd: 1 },
 		session: "chat-t1",
 		resume: false,
-		threadId: "t1",
+		scratchDir: join(stateDir, "scratch", "t1"),
 	};
-	const hooks: RunHooks = { ui: {} as RunUi, register: () => {} };
+	const hooks: RunHooks = { register: () => {} };
 	const result = dispatcher.runAgent(req, hooks);
 
 	// Pending: its age comes from created_at; nothing claimed yet.
 	const [pending] = dispatcher.activeRuns();
-	expect(pending).toMatchObject({ kind: "ask", state: "pending", owner: "chat:t1", threadId: "t1", usage: { costUsd: 0 } });
+	expect(pending).toMatchObject({ state: "pending", threadId: "t1", usage: { costUsd: 0 } });
 	expect(pending!.claimedAt).toBeUndefined();
-	expect(pending!.repo).toBeUndefined();
 
 	const worker = await connectWorker(api.url, "worker-1");
-	const assign = await worker.claim();
-	if (assign.kind !== "run") throw new Error("expected a run");
-	const { runId } = assign;
+	const { runId } = await worker.claim();
 
 	// Claimed, setting up: claimed_at is recorded, the setup time isn't known yet.
 	const claimedRow = db.getRun(runId)!;
@@ -159,9 +153,7 @@ test("a run's claim and agent start give its setup time; the status view shows w
 	expect(dispatcher.activeRuns()).toEqual([
 		{
 			id: runId,
-			kind: "ask",
 			state: "running",
-			owner: "chat:t1",
 			threadId: "t1",
 			workerId: "worker-1",
 			createdAt: startedRow.created_at,

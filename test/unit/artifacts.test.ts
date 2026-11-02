@@ -3,45 +3,44 @@ import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createArtifactHandler, MAX_BUNDLE_BYTES, MAX_SESSION_BYTES, STATE_FREE_FLOOR_BYTES } from "../../src/orchestrator/dispatch/artifacts";
-import { createRunRefs } from "../../src/orchestrator/dispatch/checkouts";
+import { createArtifactHandler, MAX_SESSION_BYTES, STATE_FREE_FLOOR_BYTES } from "../../src/orchestrator/dispatch/artifacts";
 import { claimNextRun } from "../../src/orchestrator/dispatch/leases";
-import { sessionDir } from "../../src/orchestrator/dispatch/spec";
-import { createRepos } from "../../src/orchestrator/git/repos";
-import { type Db, openDb, type RunRow } from "../../src/orchestrator/store/db";
-import { sessionPath } from "../../src/orchestrator/store/sessions";
+import { type Db, type NewRun, openDb, type RunRow } from "../../src/orchestrator/store/db";
+import { sessionDir, sessionPath } from "../../src/orchestrator/store/sessions";
 import { ARTIFACTS, runArtifactPath } from "../../src/shared/wire";
 
 /**
  * The run artifact uploads against a lease (security review F2, F8): one upload at a time per run and artifact, the
- * session and bundle caps, the state volume's free-space floor, and the lease checked again before anything is kept.
+ * session cap, the state volume's free-space floor, and the lease checked again before anything is kept.
  */
+
+/** A pending run of a new ask thread `threadId` (runs belong to an ask chat, DB-02). */
+function pending(db: Db, threadId: string, extra: Omit<NewRun, "threadId"> = {}): RunRow {
+	db.insertAskChat(threadId, "c1", "u1");
+	return db.insertRun({ threadId, ...extra });
+}
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
 	for (const fn of cleanups.splice(0)) await fn();
 });
 
-async function setup(over: { bundleLimitBytes?: number; freeFloorBytes?: number } = {}) {
+async function setup(over: { freeFloorBytes?: number } = {}) {
 	const stateDir = await mkdtemp(join(tmpdir(), "askbot-artifacts-"));
 	cleanups.push(() => rm(stateDir, { recursive: true, force: true }));
 	const db = openDb(":memory:");
-	const repos = createRepos({ stateDir });
 	const handler = createArtifactHandler({
 		db,
 		stateDir,
 		skills: async () => ({ hash: "h", tar: new Uint8Array() }),
-		repos,
-		refs: createRunRefs(db, repos),
-		bundleLimitBytes: over.bundleLimitBytes ?? MAX_BUNDLE_BYTES,
 		freeFloorBytes: over.freeFloorBytes ?? STATE_FREE_FLOOR_BYTES,
 	});
 	return { stateDir, db, handler };
 }
 
 /** A claimed run with a session and a scratch directory, and its lease token. */
-function claimed(db: Db, stateDir: string, kind: "draft" | "implement" = "draft"): { row: RunRow; token: string } {
-	db.insertRun({ kind, draftId: crypto.randomUUID(), sessionKey: "s1", scratchDir: join(stateDir, "scratch", "t1"), repo: "o/r", startCommit: "c0ffee" });
+function claimed(db: Db, stateDir: string): { row: RunRow; token: string } {
+	pending(db, "t1", { sessionKey: "s1", scratchDir: join(stateDir, "scratch", "t1") });
 	const row = claimNextRun(db, "w1", 60_000)!;
 	return { row, token: row.leaseToken };
 }
@@ -97,17 +96,10 @@ describe("run artifact uploads (F2, F8)", () => {
 		expect(existsSync(sessionPath(sessionDir(stateDir), "s1"))).toBe(false);
 	});
 
-	test("bundles are capped at the worker's disk limit", async () => {
-		const { stateDir, db, handler } = await setup({ bundleLimitBytes: 1024 });
-		const { row, token } = claimed(db, stateDir, "implement");
-		expect((await handler.handle(put(row.id, ARTIFACTS.result, token, new Uint8Array(2048)))).status).toBe(413);
-		expect((await handler.handle(put(row.id, ARTIFACTS.checkpoint, token, new Uint8Array(2048)))).status).toBe(413);
-	});
-
 	test("uploads are refused while the state volume is below its free-space floor", async () => {
 		const { stateDir, db, handler } = await setup({ freeFloorBytes: Number.MAX_SAFE_INTEGER });
-		const { row, token } = claimed(db, stateDir, "implement");
-		for (const artifact of [ARTIFACTS.session, ARTIFACTS.result, ARTIFACTS.scratchOutput("a.txt")]) {
+		const { row, token } = claimed(db, stateDir);
+		for (const artifact of [ARTIFACTS.session, ARTIFACTS.scratchOutput("a.txt")]) {
 			expect((await handler.handle(put(row.id, artifact, token, "x"))).status).toBe(507);
 		}
 		expect(existsSync(sessionPath(sessionDir(stateDir), "s1"))).toBe(false);

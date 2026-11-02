@@ -63,7 +63,7 @@ export function channelPermissions(guild: GuildData, member: MemberData, overwri
 	return permissions;
 }
 
-/** WEB-21: what the work channel and ask-only channels need, with the names Discord's UI uses. */
+/** WEB-21: what ask-only channels need, with the names Discord's UI uses. */
 export const CHANNEL_PERMISSIONS: readonly (readonly [bigint, string])[] = [
 	[PermissionFlagsBits.ViewChannel, "View Channel"],
 	[PermissionFlagsBits.SendMessages, "Send Messages"],
@@ -74,8 +74,14 @@ export const CHANNEL_PERMISSIONS: readonly (readonly [bigint, string])[] = [
 	[PermissionFlagsBits.AddReactions, "Add Reactions"],
 ];
 
-/** WEB-21: the watch category needs the channel permissions plus Manage Channels (DSC-38). */
-export const CATEGORY_PERMISSIONS: readonly (readonly [bigint, string])[] = [...CHANNEL_PERMISSIONS, [PermissionFlagsBits.ManageChannels, "Manage Channels"]];
+/** WEB-23: the channel permissions (WEB-21) plus Change Nickname (DSC-29). */
+export const BOT_PERMISSIONS = CHANNEL_PERMISSIONS.reduce((all, [bit]) => all | bit, PermissionFlagsBits.ChangeNickname);
+
+/** The bot's invite link (WEB-23): the bot and slash-command scopes with `BOT_PERMISSIONS`. */
+export function botInviteLink(clientId: string): string {
+	const params = new URLSearchParams({ client_id: clientId, scope: "bot applications.commands", permissions: BOT_PERMISSIONS.toString() });
+	return `https://discord.com/oauth2/authorize?${params}`;
+}
 
 /** Whether `permissions` include View Channel, and the names of the other `required` permissions it lacks. */
 export function permissionGaps(permissions: bigint, required: readonly (readonly [bigint, string])[]): { viewable: boolean; missing: string[] } {

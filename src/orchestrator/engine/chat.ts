@@ -1,13 +1,16 @@
 import { readFile } from "node:fs/promises";
 import { errorMessage, log } from "../../shared/log";
+import type { RunUsage } from "../../shared/transcript";
 import { askThreadAllowed, memberAllowed } from "../discord/access";
 import { type Progress, startProgress } from "../discord/progress";
-import { acknowledgeSteer, createDiscordUI } from "../discord/questions";
-import { activityText } from "../discord/render";
+import { activityText, chunkText, OOM_WARNING } from "../discord/render";
+import { acknowledgeSteer } from "../discord/replies";
 import type { CommandEvent, InAttachment, MessageEvent, OutMessage } from "../discord/surface";
 import { CHAT_ICONS, setTopIcon } from "../discord/topMessage";
-import { RunDetached, type RunHandle, type RunOwner, RunLost, type RunResult } from "../dispatch/dispatcher";
-import type { AskChatRow } from "../store/db";
+import { type AbortReason, RunDetached, type RunHandle, RunLost, type RunResult } from "../dispatch/dispatcher";
+import type { AgentRunOutcome, AskChatRow } from "../store/db";
+import { listOmpAssets } from "../store/ompAssets";
+import type { AgentLogRun } from "../store/agentlog";
 import { createRunUiStore } from "../store/runUi";
 import {
 	changedFiles,
@@ -22,55 +25,58 @@ import {
 	type SaveOptions,
 	type ScratchPaths,
 	saveAttachments,
-	scratchPaths,
 	snapshotFiles,
 	UPLOAD_LIMIT_BYTES,
 } from "../store/scratch";
 import { chatSessionKey } from "../store/sessions";
-import { loadoutKey } from "../store/stats";
-import { CAPACITY_REACHED } from "./chatSlots";
+import { saveLoadout } from "../store/stats";
 import type { EngineDeps } from "./deps";
-import { askFollowUp, askPrompt, CHAT_SCHEMA, type ChatOutput, runPrompt } from "./prompts";
+import { ASK_MINUTES, askFollowUp, askPrompt, CHAT_SCHEMA, type ChatOutput } from "./prompts";
 
 /**
- * `/ask` chats (CHAT-03 to CHAT-11, DSC-06), ported from the ask-only parts of DevForge `src/engine/chat.ts` onto the
- * surface and the dispatcher: each turn is an `ask` run on a worker; the thread's scratch directory lives in the
- * orchestrator and the dispatcher copies inputs to the worker and outputs back. Runs outlive the engine: stopping it
- * detaches (RUN-09), and starting it re-attaches to unfinished runs, editing the same messages (RUN-14).
+ * `/ask` chats (CHAT-03 to CHAT-11, DSC-06, DSC-39), ported from the ask-only parts of DevForge `src/engine/chat.ts`
+ * onto the surface and the dispatcher: each turn is an `ask` run on a worker; the thread's scratch directory lives in
+ * the orchestrator and the dispatcher copies inputs to the worker and outputs back. Runs outlive the engine: stopping
+ * it detaches (RUN-09), and starting it re-attaches to unfinished runs, editing the same messages (RUN-14).
  */
 
-/** AGT-14: the chat time limit. */
-export const CHAT_MINUTES = 20;
 const SWEEP_INTERVAL_MS = 60_000;
-/** The `repo` of ask chats in `chats`, usage and logs; no `/`, so it never collides with `owner/repo`. */
-export const ASK_LABEL = "ask-only";
+/** The up-front refusal while `maxChatSessions` ask runs are active (CHAT-04). */
+export const CAPACITY_REACHED = "Chat capacity reached; try again shortly.";
+/** DSC-39: `/stop` in an ask thread with no pending or active run. */
+export const NOTHING_RUNNING = "Nothing is running.";
 export const SWEPT_NOTE = "files from earlier in this conversation were deleted after inactivity; ask the user to attach them again if you need them.";
 export const ANSWER_TRUNCATED = "\n\n_[Answer truncated: it exceeded the upload limit.]_";
 /** Most files Discord accepts in one message. */
 const MAX_FILES_PER_MESSAGE = 10;
 const MAX_MESSAGE = 2000;
+const NO_USAGE: RunUsage = { costUsd: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
 export interface AskChatOptions {
 	/** `<state>/scratch`. */
 	scratchRoot: string;
+	/** The admin's skills and agents (`ASKBOT_OMP_DIR`, AGT-24): whether a valid agent is installed decides the prompt (AGT-13). */
+	ompDir: string;
 	/** Downloads attachments; defaults to global `fetch`. */
 	fetch?: SaveOptions["fetch"];
 }
 
 export interface AskChat {
-	/** `/ask`, access already checked (DSC-03 to DSC-05): admits, starts a one-day thread and runs the `ask` profile (CHAT-07). */
+	/** `/ask`, access already checked (DSC-03, DSC-04): admits, starts a one-day thread and runs the `ask` profile (CHAT-07). */
 	command(e: CommandEvent): Promise<void>;
 	/**
 	 * A human message in a thread. False when the thread is not an ask thread; otherwise it was handled: ignored (DSC-06),
-	 * an answer to a waiting question (DSC-18), steering for the live run, or a new run resuming the session (CHAT-03).
+	 * steering for the live run, or a new run resuming the session (CHAT-03).
 	 */
 	message(e: MessageEvent): Promise<boolean>;
-	/** `/work cancel` in an ask thread (requirements §20 item 2): undefined when not an ask thread; else the reply text. */
-	cancel(threadId: string, by: string): Promise<string | undefined>;
+	/** The starter of ask thread `threadId`, or undefined when it is not an ask thread (DSC-39). */
+	ownerOf(threadId: string): string | undefined;
+	/** `/stop` in an ask thread, access already checked (DSC-39): stops the thread's run (CHAT-05); returns the reply text. */
+	stop(threadId: string, by: string): Promise<string>;
 	/** Engine start: re-attaches to the ask chats' unfinished runs (RUN-14) and starts the idle sweep (CHAT-06). */
 	start(): void;
 	/** Engine stop: stops the sweep and detaches from live runs, which keep going (RUN-09). */
-	stop(): Promise<void>;
+	detach(): Promise<void>;
 	/** CHAT-06, CHAT-11: removes the scratch directories of ask chats idle longer than `chatIdleMinutes`. */
 	sweepIdle(): Promise<void>;
 	/** threadId → settle promise of a run this engine is attached to. */
@@ -104,10 +110,10 @@ function uniqueName(name: string, taken: Set<string>): string {
 
 /**
  * CHAT-10: the messages that deliver an ask run's result: the answer (if any) as an attached `answer.md` with a short
- * pointer, then the produced files in messages of at most 10 files and `limit` bytes, then a line naming the files over
- * `limit` (not attached). Files are read when the messages are built.
+ * pointer (and the AGT-19 line when memory ran out), then the produced files in messages of at most 10 files and `limit`
+ * bytes, then a line naming the files over `limit` (not attached). Files are read when the messages are built.
  */
-export async function deliveryMessages(answer: string | undefined, files: ProducedFile[], limit: number): Promise<OutMessage[]> {
+export async function deliveryMessages(answer: string | undefined, files: ProducedFile[], limit: number, oomKills = 0): Promise<OutMessage[]> {
 	const taken = new Set(answer === undefined ? [] : ["answer.md"]);
 	const tooLarge: string[] = [];
 	const batches: ProducedFile[][] = [];
@@ -132,7 +138,7 @@ export async function deliveryMessages(answer: string | undefined, files: Produc
 		const attached = batches.reduce((n, b) => n + b.length, 0);
 		const extra = attached > 0 ? ` and ${attached} generated file${attached === 1 ? "" : "s"} below` : "";
 		messages.push({
-			content: `📄 **Answer attached:** \`answer.md\`${extra}`,
+			content: `📄 **Answer attached:** \`answer.md\`${extra}${oomKills > 0 ? `\n${OOM_WARNING}` : ""}`,
 			files: [{ name: "answer.md", data: truncateUtf8(answer, limit, ANSWER_TRUNCATED) }],
 		});
 	}
@@ -146,6 +152,25 @@ export async function deliveryMessages(answer: string | undefined, files: Produc
 	return messages;
 }
 
+/**
+ * AGT-08, AGT-31: the run will have `task` when at least one installed agent passes AGT-25, the rules the worker checks
+ * again before it exposes `task`. A listing failure counts as none, so the prompt never promises a tool the run lacks.
+ */
+async function hasValidAgents(ompDir: string): Promise<boolean> {
+	try {
+		return (await listOmpAssets(ompDir)).agents.some(agent => !agent.problem);
+	} catch (err) {
+		log("warn", "listing agents failed", { error: errorMessage(err) });
+		return false;
+	}
+}
+
+/** OBS-06: how a turn that returned a result ended. */
+function outcomeOf(aborted: AbortReason | undefined): AgentRunOutcome {
+	if (aborted === "user") return "stopped";
+	return aborted ? "limit" : "finished";
+}
+
 /** A new question or a follow-up; absent when re-attaching to a run after a restart (the prompt is not resent). */
 interface Turn {
 	prompt: string;
@@ -157,29 +182,29 @@ export function createAskChat(deps: EngineDeps, opts: AskChatOptions): AskChat {
 	const agentName = config.agent.name;
 	const runUi = createRunUiStore(db);
 	const fetchFn = opts.fetch ?? ((url: string) => fetch(url));
-	const askChatsOf = db.raw.query<AskChatRow, [string]>("SELECT * FROM ask_chats WHERE owner_id = ?");
-	const allAskChats = db.raw.query<AskChatRow, []>("SELECT * FROM ask_chats");
 	const active = new Map<string, Promise<void>>();
 	/** threadId → handle of the live run (from `register`). */
 	const handles = new Map<string, RunHandle>();
-	/** Aborted by `stop()`; every run's signal also follows the engine's. */
+	/** Threads whose `/stop` came before their run registered: aborted as soon as it does (DSC-39). */
+	const stopRequested = new Set<string>();
+	/** Aborted by `detach()`; every run's signal also follows the engine's. */
 	const detaching = new AbortController();
 	const signal = AbortSignal.any([deps.signal, detaching.signal]);
 	let sweepTimer: ReturnType<typeof setInterval> | undefined;
 
-	const chatOwner = (threadId: string): RunOwner => ({ kind: "chat", threadId });
-
-	/** A plain thread message (mentions are off by default, DSC-07). Never throws. */
+	/** A plain thread message, split to fit (DSC-14). Never throws. */
 	async function notify(threadId: string, content: string): Promise<void> {
-		await discord.send(threadId, { content: content.slice(0, MAX_MESSAGE) }, "high").catch(err => {
+		try {
+			for (const chunk of chunkText(content)) await discord.send(threadId, { content: chunk }, "high");
+		} catch (err) {
 			log("warn", "ask chat message failed", { thread: threadId, error: errorMessage(err) });
-		});
+		}
 	}
 
-	/** Creates the thread's scratch directory (again after a sweep) and records it as the chat's working directory. */
+	/** Creates the thread's scratch directory (again after a sweep) and records it on the chat. */
 	async function ensureScratch(threadId: string): Promise<ScratchPaths> {
 		const paths = await ensureScratchDirs(opts.scratchRoot, threadId);
-		db.updateChat(threadId, { worktree: paths.root });
+		db.updateAskChat(threadId, { scratch_dir: paths.root });
 		return paths;
 	}
 
@@ -196,39 +221,41 @@ export function createAskChat(deps: EngineDeps, opts: AskChatOptions): AskChat {
 		return saved;
 	}
 
+	/** True while the thread has a run starting, pending or active (CHAT-04, RUN-21). */
+	const busy = (threadId: string) => active.has(threadId) || dispatcher.hasUnfinishedRun(threadId);
+
 	/** DSC-06: the thread where `userId` already has a live run, counted from the runs (survives restarts). */
 	function liveRunOf(userId: string): string | undefined {
-		return askChatsOf.all(userId).find(chat => active.has(chat.thread_id) || dispatcher.hasUnfinishedRun(chatOwner(chat.thread_id)))?.thread_id;
+		return db.askChatsOf(userId).find(chat => busy(chat.thread_id))?.thread_id;
 	}
 
 	/** CHAT-04: why a new run may not start now, or undefined. */
-	function refusal(threadId: string | undefined, userId: string | undefined, allowed: boolean): string | undefined {
-		if (threadId && (active.has(threadId) || dispatcher.hasUnfinishedRun(chatOwner(threadId)))) {
-			return "Still starting the previous request; send that again in a moment.";
-		}
-		if (deps.chatSlots.full()) return CAPACITY_REACHED;
-		if (userId && !allowed) {
+	function refusal(threadId: string | undefined, userId: string, allowed: boolean): string | undefined {
+		if (threadId && busy(threadId)) return "Still starting the previous request; send that again in a moment.";
+		if (active.size >= config.limits.maxChatSessions) return CAPACITY_REACHED;
+		if (!allowed) {
 			const other = liveRunOf(userId);
 			if (other) return `You already have a request running in <#${other}>; wait for it to finish.`;
 		}
 		return undefined;
 	}
 
-	/** Runs one turn (or re-attaches to the live one) and tracks it in `active` and the shared chat slots until it settles. */
-	function launch(threadId: string, ownerId: string, turn: Turn | undefined): Promise<void> {
-		const done = run(threadId, ownerId, turn)
+	/** Runs one turn (or re-attaches to the live one) and tracks it in `active` until it settles. */
+	function launch(chat: AskChatRow, turn: Turn | undefined): Promise<void> {
+		const threadId = chat.thread_id;
+		const done = run(chat, turn)
 			.catch(err => log("error", "ask chat run failed", { thread: threadId, error: errorMessage(err) }))
 			.finally(() => {
 				active.delete(threadId);
 				handles.delete(threadId);
+				stopRequested.delete(threadId);
 			});
 		active.set(threadId, done);
-		void deps.chatSlots.track(`chat:${threadId}`, done);
 		return done;
 	}
 
-	async function deliver(threadId: string, answer: string | undefined, files: ProducedFile[]): Promise<void> {
-		for (const message of await deliveryMessages(answer, files, UPLOAD_LIMIT_BYTES)) await discord.send(threadId, message, "high");
+	async function deliver(threadId: string, answer: string | undefined, files: ProducedFile[], oomKills = 0): Promise<void> {
+		for (const message of await deliveryMessages(answer, files, UPLOAD_LIMIT_BYTES, oomKills)) await discord.send(threadId, message, "high");
 	}
 
 	/** The files the run produced (CHAT-10): as the dispatcher reported them, else whatever changed in `outputs/`. */
@@ -241,107 +268,111 @@ export function createAskChat(deps: EngineDeps, opts: AskChatOptions): AskChat {
 		}
 	}
 
-	async function run(threadId: string, ownerId: string, turn: Turn | undefined): Promise<void> {
-		const owner = chatOwner(threadId);
-		// Only a re-attach continues the stored messages; a new turn posts its own (DSC-12) and overwrites the state.
-		const restore = turn ? undefined : runUi.get(owner);
-		const logRun = { run: `chat-${threadId}`, kind: "chat", repo: ASK_LABEL, thread: threadId };
+	async function run(chat: AskChatRow, turn: Turn | undefined): Promise<void> {
+		const threadId = chat.thread_id;
+		// Only a re-attach continues the stored message; a new turn posts its own and overwrites the state.
+		const restore = turn ? undefined : runUi.get(threadId);
+		const logRun: AgentLogRun = { run: `ask-${threadId}`, kind: "ask", thread: threadId, channel: chat.channel_id, user: chat.owner_id };
 		const startedAt = new Date().toISOString();
 		let progress: Progress | undefined;
 		let paths: ScratchPaths | undefined;
 		let before: FileSnapshot = new Map();
 		let result: RunResult | undefined;
+		let usage: RunUsage | undefined;
+		/** OBS-05: every turn's usage, whatever its outcome; a detached turn is recorded by the engine that re-attaches. */
+		const record = (outcome: AgentRunOutcome, oomKills = 0) => {
+			try {
+				db.recordRun({ threadId, channelId: chat.channel_id, userId: chat.owner_id, outcome, oomKills, startedAt, usage: usage ?? result?.usage ?? NO_USAGE });
+			} catch (err) {
+				log("error", "recording usage failed", { thread: threadId, error: errorMessage(err) });
+			}
+		};
 		try {
 			progress = await startProgress(discord, threadId, "Answering", "Preparing the workspace…", {
 				restore,
-				persist: state => runUi.set(owner, state),
+				persist: state => runUi.set(threadId, state),
 			});
 			await setTopIcon(discord, threadId, CHAT_ICONS.working);
 			paths = await ensureScratch(threadId);
 			before = await snapshotFiles(paths.outputs);
 			if (!restore) progress.phase("Starting the agent…");
 			const current = progress;
-			const ui = createDiscordUI(discord, threadId, {
-				jobId: `chat-${threadId}`,
-				askTimeoutMs: config.limits.askTimeoutHours * 3_600_000,
-				isAllowed: actor => askThreadAllowed(config, actor, ownerId),
-				replies: deps.replies,
-				interactions: deps.interactions,
-				mention: { text: "", users: [] },
-				onWaiting: on => current.waiting(on),
-			});
 			result = await dispatcher.runAgent(
 				{
-					owner,
-					kind: "ask",
+					threadId,
 					profile: "ask",
-					prompt: runPrompt(agentName, turn?.prompt ?? ""),
+					prompt: turn?.prompt ?? "",
 					outputSchema: CHAT_SCHEMA,
-					model: config.models.chat,
+					model: config.models.ask,
 					thinking: config.models.thinking,
-					limits: { minutes: CHAT_MINUTES, costUsd: config.limits.maxCostUsdPerJob },
+					limits: { minutes: ASK_MINUTES, costUsd: config.limits.maxCostUsdPerTurn },
 					session: chatSessionKey(threadId),
 					resume: turn?.resume ?? true,
-					threadId,
 					scratchDir: paths.root,
 				},
 				{
-					ui,
-					register: handle => handles.set(threadId, handle),
+					register: handle => {
+						handles.set(threadId, handle);
+						if (stopRequested.has(threadId)) void handle.abort("user");
+					},
 					onWaitingForWorker: () => current.phase("Waiting for a worker…"),
 					onProgress: p => current.activity(activityText(p.tool, p.intent), p.usage.costUsd),
-					onTodos: todos => current.todos(todos),
 					onTranscript: event => deps.agentLog.append(logRun, event),
-					onLoadout: loadout => db.kvSet(loadoutKey(loadout.profile), JSON.stringify(loadout)),
-					onUsage: usage => db.recordRun({ kind: "chat", repo: ASK_LABEL, threadId, startedAt, usage }),
+					onLoadout: loadout => saveLoadout(db, loadout),
+					onUsage: u => {
+						usage = u;
+					},
 				},
 				signal,
 			);
-			db.updateChat(threadId, { last_active_at: new Date().toISOString(), ...(result.hasSession ? { session_file: chatSessionKey(threadId) } : {}) });
+			db.updateAskChat(threadId, { last_active_at: new Date().toISOString(), ...(result.hasSession ? { session_file: chatSessionKey(threadId) } : {}) });
+			record(outcomeOf(result.aborted), result.oomKills);
 			progress.phase("Posting the answer…", result.usage.costUsd);
 			const files = await produced(paths.outputs, before, result);
+			const oom = result.oomKills > 0 ? `\n${OOM_WARNING}` : "";
 			if (result.aborted === "user") {
 				// Files the agent already produced are delivered even when the run did not finish (CHAT-10).
 				await deliver(threadId, undefined, files);
 				await progress.finish("cancelled");
 				await setTopIcon(discord, threadId, CHAT_ICONS.stopped);
-				await notify(threadId, "⏹️ **Stopped.** Send another message to continue.");
+				await notify(threadId, `⏹️ **Stopped.** Send another message to continue.${oom}`);
 			} else if (result.aborted) {
 				await deliver(threadId, undefined, files);
 				await progress.finish("failed");
 				await setTopIcon(discord, threadId, CHAT_ICONS.limit);
-				const limit = result.aborted === "time" ? `${CHAT_MINUTES} minute time limit` : `$${config.limits.maxCostUsdPerJob} cost limit`;
-				await notify(threadId, `⚠️ **Stopped at the ${limit}** before finishing. Send another message to continue where it left off.`);
+				const limit = result.aborted === "time" ? `${ASK_MINUTES} minute time limit` : `$${config.limits.maxCostUsdPerTurn} cost limit`;
+				await notify(threadId, `⚠️ **Stopped at the ${limit}** before finishing. Send another message to continue where it left off.${oom}`);
 			} else {
-				await deliver(threadId, (result.output as ChatOutput).answer, files);
+				await deliver(threadId, (result.output as ChatOutput).answer, files, result.oomKills);
 				await progress.finish("done");
 				await setTopIcon(discord, threadId, CHAT_ICONS.done);
 				await notify(threadId, "✅ **Done.** Reply in this thread to follow up.");
 			}
-			runUi.clear(owner);
+			runUi.clear(threadId);
 		} catch (err) {
 			if (err instanceof RunDetached || signal.aborted) {
-				// The run keeps going; the next engine re-attaches and keeps editing the same messages (RUN-14).
+				// The run keeps going; the next engine re-attaches and keeps editing the same message (RUN-14).
 				progress?.stop();
 				log("info", "ask chat detached", { thread: threadId });
 				return;
 			}
 			log("error", "ask chat failed", { thread: threadId, error: errorMessage(err) });
-			db.updateChat(threadId, { last_active_at: new Date().toISOString() });
+			db.updateAskChat(threadId, { last_active_at: new Date().toISOString() });
+			if (!result) record("failed");
 			if (paths) await deliver(threadId, undefined, await produced(paths.outputs, before, result)).catch(() => {});
 			await progress?.finish("failed");
 			await setTopIcon(discord, threadId, CHAT_ICONS.failed);
 			const reason = err instanceof RunLost ? err.message : errorMessage(err);
 			await notify(threadId, `❌ **Failed:** ${reason.slice(0, 1500)}\nSend another message to try again.`);
-			runUi.clear(owner);
+			runUi.clear(threadId);
 		}
 	}
 
 	/** CHAT-03: steers the live run with a follow-up, or starts a new run resuming the session. */
-	async function followUp(e: MessageEvent, ask: AskChatRow): Promise<void> {
-		const threadId = ask.thread_id;
+	async function followUp(e: MessageEvent, chat: AskChatRow): Promise<void> {
+		const threadId = chat.thread_id;
 		// After an idle sweep the scratch directory is gone (CHAT-11); saving recreates it.
-		const swept = db.getChat(threadId)?.worktree === null;
+		const swept = chat.scratch_dir === null;
 		let saved: string[];
 		try {
 			saved = await saveInputs(threadId, e.attachments, MAX_INPUT_FILES);
@@ -360,26 +391,25 @@ export function createAskChat(deps: EngineDeps, opts: AskChatOptions): AskChat {
 			);
 			return;
 		}
-		const allowed = memberAllowed(config, e.actor);
-		const refused = refusal(threadId, e.actor.userId, allowed);
+		const refused = refusal(threadId, e.actor.userId, memberAllowed(config, e.actor));
 		if (refused) {
 			await notify(threadId, refused);
 			return;
 		}
-		db.updateChat(threadId, { last_active_at: new Date().toISOString() });
-		const resume = db.getChat(threadId)?.session_file != null;
-		void launch(threadId, ask.owner_id, { prompt: askFollowUp(text, saved, swept ? SWEPT_NOTE : undefined), resume });
+		db.updateAskChat(threadId, { last_active_at: new Date().toISOString() });
+		// Always ask to resume: the dispatcher resumes whatever session the worker last uploaded (RUN-18), also after a
+		// first turn whose worker was lost before it returned a result (RUN-04), and starts fresh when there is none.
+		void launch(chat, { prompt: askFollowUp(text, saved, swept ? SWEPT_NOTE : undefined), resume: true });
 	}
 
 	async function sweepIdle(): Promise<void> {
 		const cutoff = new Date(Date.now() - config.limits.chatIdleMinutes * 60_000).toISOString();
-		for (const chat of db.idleChats(cutoff)) {
-			if (!chat.worktree || !db.getAskChat(chat.thread_id)) continue;
-			if (active.has(chat.thread_id) || dispatcher.hasUnfinishedRun(chatOwner(chat.thread_id))) continue;
+		for (const chat of db.idleAskChats(cutoff)) {
+			if (!chat.scratch_dir || busy(chat.thread_id)) continue;
 			try {
 				// The session is kept so the conversation can resume (CHAT-06).
-				if (await removeScratch(opts.scratchRoot, chat.worktree)) {
-					db.updateChat(chat.thread_id, { worktree: null });
+				if (await removeScratch(opts.scratchRoot, chat.scratch_dir)) {
+					db.updateAskChat(chat.thread_id, { scratch_dir: null });
 					log("info", "ask scratch removed", { thread: chat.thread_id });
 				}
 			} catch (err) {
@@ -402,9 +432,8 @@ export function createAskChat(deps: EngineDeps, opts: AskChatOptions): AskChat {
 			await e.defer({ ephemeral: true });
 			const top = await discord.send(e.where.channelId, { content: `💬 **${e.actor.username}** asked:\n${prompt}`.slice(0, MAX_MESSAGE) }, "high");
 			const threadId = await discord.startThread(top, { name: prompt.slice(0, 100) || "Question", autoArchiveMinutes: 1440 });
-			db.insertChat(threadId, ASK_LABEL);
-			db.insertAskChat(threadId, e.where.channelId, e.actor.userId);
-			log("info", "ask chat started", { thread: threadId, user: e.actor.userId });
+			const chat = db.insertAskChat(threadId, e.where.channelId, e.actor.userId);
+			log("info", "ask chat started", { thread: threadId, channel: e.where.channelId, user: e.actor.userId });
 			await e.editReply({ content: `Started <#${threadId}>. Progress and the answer will appear there; reply in the thread to follow up.` });
 			let saved: string[];
 			try {
@@ -420,45 +449,43 @@ export function createAskChat(deps: EngineDeps, opts: AskChatOptions): AskChat {
 				await notify(threadId, late);
 				return;
 			}
-			void launch(threadId, e.actor.userId, { prompt: askPrompt(agentName, prompt, saved), resume: false });
+			void launch(chat, { prompt: askPrompt(agentName, prompt, saved, await hasValidAgents(opts.ompDir)), resume: false });
 		},
 		async message(e) {
-			const ask = db.getAskChat(e.where.channelId);
-			if (!ask) return false;
+			const chat = db.getAskChat(e.where.channelId);
+			if (!chat) return false;
 			// DSC-06: only the thread starter or an allowed member; everyone else is ignored silently.
-			if (!askThreadAllowed(config, e.actor, ask.owner_id)) return true;
+			if (!askThreadAllowed(config, e.actor, chat.owner_id)) return true;
 			try {
-				// A question is waiting: the message is its answer, not steering (DSC-18).
-				if (deps.replies.deliver(ask.thread_id, e.content)) return true;
-				await followUp(e, ask);
+				await followUp(e, chat);
 			} catch (err) {
-				log("error", "ask thread message failed", { thread: ask.thread_id, error: errorMessage(err) });
+				log("error", "ask thread message failed", { thread: chat.thread_id, error: errorMessage(err) });
 			}
 			return true;
 		},
-		async cancel(threadId, by) {
-			if (!db.getAskChat(threadId)) return undefined;
+		ownerOf: threadId => db.getAskChat(threadId)?.owner_id,
+		async stop(threadId, by) {
+			// DSC-39: with no pending or active run, nothing changes.
+			if (!busy(threadId)) return NOTHING_RUNNING;
+			log("info", "ask chat stop requested", { thread: threadId, by });
+			// One-shot (AGT-07, NFR-05): a second /stop finds the same run already stopping.
+			stopRequested.add(threadId);
 			const handle = handles.get(threadId);
-			if (handle) {
-				log("info", "ask chat stopped", { thread: threadId, by });
-				await handle.abort("user");
-				return `Stopping the current run (requested by ${by})…`;
-			}
-			if (active.has(threadId) || dispatcher.hasUnfinishedRun(chatOwner(threadId))) return "The run is still starting; try again in a moment.";
-			return "Nothing is running in this chat.";
+			if (handle) await handle.abort("user");
+			return "Stopping…";
 		},
 		start() {
-			for (const ask of allAskChats.all()) {
+			for (const chat of db.allAskChats()) {
 				// A run that finished while no engine was attached still holds its answer (NFR-03).
-				if (active.has(ask.thread_id) || !dispatcher.hasRun(chatOwner(ask.thread_id))) continue;
-				log("info", "ask chat re-attached after start", { thread: ask.thread_id });
-				void launch(ask.thread_id, ask.owner_id, undefined);
+				if (active.has(chat.thread_id) || !dispatcher.hasRun(chat.thread_id)) continue;
+				log("info", "ask chat re-attached after start", { thread: chat.thread_id });
+				void launch(chat, undefined);
 			}
 			sweepTimer = setInterval(() => {
 				sweepIdle().catch(err => log("error", "ask sweep failed", { error: errorMessage(err) }));
 			}, SWEEP_INTERVAL_MS);
 		},
-		async stop() {
+		async detach() {
 			clearInterval(sweepTimer);
 			detaching.abort();
 			await Promise.allSettled([...active.values()]);

@@ -19,7 +19,7 @@ export interface LogEntryView {
 	/** Run id, for the run filter. */
 	run: string;
 	runLabel: string;
-	/** Run label (linked to the GitHub issue when there is one), then the Discord thread link when known. */
+	/** Run label, then the Discord thread link when the guild is known. */
 	links: Cell[];
 	type: string;
 	head: string;
@@ -28,11 +28,11 @@ export interface LogEntryView {
 }
 
 export function logEntryView(entry: LogEntry, guildId: string | undefined): LogEntryView {
-	// Prompts embed whole issues and tool output can be long: collapse past 1000 chars or 20 lines.
+	// Prompts and tool output can be long: collapse past 1000 chars or 20 lines.
 	const isLong = (text: string) => text.length > 1000 || text.split("\n").length > 20;
-	const runLabel = entry.issue === undefined ? `${entry.kind} ${entry.repo}` : `${entry.kind} ${entry.repo}#${entry.issue}`;
-	const links: Cell[] = [entry.issue === undefined ? runLabel : [runLabel, `https://github.com/${entry.repo}/issues/${entry.issue}`]];
-	if (guildId && entry.thread) {
+	const runLabel = `${entry.kind} ${entry.thread}`;
+	const links: Cell[] = [runLabel];
+	if (guildId) {
 		links.push(["thread", `https://discord.com/channels/${encodeURIComponent(guildId)}/${encodeURIComponent(entry.thread)}`]);
 	}
 	let head = "";

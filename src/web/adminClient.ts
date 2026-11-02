@@ -38,16 +38,10 @@ export class AdminApiError extends Error {
 export interface OrchestratorHealth {
 	reachable: boolean;
 	phase: EnginePhase | null;
-	limits: {
-		maxConcurrentJobs: number;
-		maxChatSessions: number;
-		maxConcurrentRuns: number;
-		workerCapacity: number;
-		effectiveConcurrency: number;
-	} | null;
+	limits: StatusReport["limits"];
 }
 
-/** Every web read and write, over the orchestrator's admin API (`src/shared/adminApi.ts`). `admin` is the acting username (WEB-29). */
+/** Every web read and write, over the orchestrator's admin API (`src/shared/adminApi.ts`). `admin` is the acting username. */
 export interface AdminClient {
 	state(): Promise<AdminState>;
 	setup(req: SetupRequest): Promise<void>;
@@ -69,7 +63,7 @@ export interface AdminClient {
 
 export interface CallInit {
 	body?: unknown;
-	/** The acting admin's username, for the orchestrator's log (WEB-29). */
+	/** The acting admin's username, for the orchestrator's log and update approvals (UPD-03). */
 	admin?: string;
 	timeoutMs?: number;
 }
@@ -102,7 +96,6 @@ const healthSchema = z.object({
 	phase: z.enum(PHASES),
 	limits: z
 		.object({
-			maxConcurrentJobs: z.number(),
 			maxChatSessions: z.number(),
 			maxConcurrentRuns: z.number(),
 			workerCapacity: z.number(),

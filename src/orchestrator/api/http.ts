@@ -32,7 +32,7 @@ export async function jsonBody<T>(req: Request): Promise<Partial<T>> {
 	return body as Partial<T>;
 }
 
-/** The acting admin from `X-Askbot-Admin` (URI-encoded by web), for the log (WEB-29). */
+/** The acting admin from `X-Askbot-Admin` (URI-encoded by web), for the log and the update attempt (UPD-03). */
 export function actingAdmin(req: Request): string | undefined {
 	const raw = req.headers.get("x-askbot-admin");
 	if (!raw) return undefined;
@@ -50,8 +50,8 @@ export interface AdminRoute {
 }
 
 /**
- * A feature's endpoints by path relative to `/internal/admin`: `"/repos"` matches exactly; a key ending in `/`
- * (`"/skills/"`) matches every path under it. The longest matching key wins.
+ * A feature's endpoints by path relative to `/internal/admin`: `"/skills"` matches exactly; a key ending in `/`
+ * (`"/logs/files/"`) matches every path under it. The longest matching key wins.
  */
 export type AdminRoutes = Record<string, AdminRoute>;
 

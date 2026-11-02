@@ -3,7 +3,7 @@ import type { Session } from "./sessions";
 
 /**
  * Responses with the security headers every web response carries (WEB-06), and the contract of the feature pages the
- * web server mounts (repositories, models, omp, skills, logs).
+ * web server mounts (models, omp, skills, logs).
  */
 
 export const SECURITY_HEADERS: Record<string, string> = {
@@ -29,15 +29,11 @@ export function redirect(location: string, headers: Record<string, string> = {})
 	return respond(null, 303, { Location: location, ...headers });
 }
 
-/**
- * What a feature page handler gets: the admin API, the logged-in session (its `flash` survives one redirect), the clock,
- * and whether VS Code is on (the ☰ menu lists it, WEB-10).
- */
+/** What a feature page handler gets: the admin API, the logged-in session (its `flash` survives one redirect) and the clock. */
 export interface PageContext {
 	admin: AdminClient;
 	session: Session;
 	now(): number;
-	vscode: boolean;
 }
 
 /** One logged-in route. `json` routes answer 401 JSON instead of redirecting to the login page (WEB-09). */
@@ -47,7 +43,7 @@ export interface PageRoute {
 }
 
 /**
- * Feature routes by `"<METHOD> <path>"`, e.g. `"GET /admin/repos"`. A key whose path ends in `/` (`"GET /logs/files/"`)
+ * Feature routes by `"<METHOD> <path>"`, e.g. `"GET /admin/skills"`. A key whose path ends in `/` (`"GET /logs/files/"`)
  * matches every path under it. Paths must be under `/admin/` or `/logs`, which need a session.
  */
 export type PageRoutes = Record<string, PageRoute>;

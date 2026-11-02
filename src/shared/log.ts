@@ -1,9 +1,6 @@
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
 export interface LogFields {
-	repo?: string;
-	issue?: number;
-	job?: string;
 	run?: string;
 	[key: string]: unknown;
 }
@@ -16,20 +13,16 @@ let inSink = false;
 /**
  * Known secret values as they appear inside JSON strings (security review F9): masked in every log line, relayed worker
  * line and agent-log entry. Seeded by the components that hold them: internal tokens, live lease tokens, the settings'
- * Discord token, GitHub App key and provider keys, and current OAuth access tokens.
+ * Discord token and provider keys, and current OAuth access tokens.
  */
 const secrets = new Set<string>();
 /** Shorter values are not masked: they would hit ordinary text. */
 const MIN_SECRET_CHARS = 8;
 export const REDACTED = "[redacted]";
 
-/**
- * The forms of `value` to mask: the whole value and, for multi-line values (PEM keys), each long line, JSON-escaped.
- * PEM armor lines (`-----BEGIN …-----`) are public text that error messages quote, so they are not masked.
- */
+/** The form of `value` to mask: as it appears inside a JSON string; none when it is too short. */
 function secretForms(value: string): string[] {
-	const lines = value.includes("\n") ? value.split(/\r?\n/).map(line => line.trim()).filter(line => !line.startsWith("-----")) : [];
-	return [value, ...lines].filter(form => form.length >= MIN_SECRET_CHARS).map(form => JSON.stringify(form).slice(1, -1));
+	return value.length >= MIN_SECRET_CHARS ? [JSON.stringify(value).slice(1, -1)] : [];
 }
 
 /** Masks `value` in every log line and agent-log entry from now on (F9). Empty and short values are ignored. */

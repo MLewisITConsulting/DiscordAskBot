@@ -68,11 +68,11 @@ ${
 const STORAGE_NOTICE = `<p class="warning">Sign-ins are stored and refreshed only by the orchestrator; a new sign-in is used by the next run without a restart.
 Unlike stored API keys, a run's copy of these tokens is readable by that run's agent shell (its refresh token stays with the orchestrator, and signing out refuses that run's later refresh requests).</p>`;
 
-export function modelsPage(view: ModelsView, now: number, vscode: boolean, flash?: Flash): string {
+export function modelsPage(view: ModelsView, now: number, flash?: Flash): string {
 	const models = view.models.map(model => `<tr><td><code>${esc(model.id)}</code></td><td>${esc(model.name)}</td></tr>`);
 	return layout(
 		"Models",
-		`${nav("models", vscode)}
+		`${nav("models")}
 <h1>Models &amp; accounts</h1>
 ${messages(undefined, flash)}
 ${STORAGE_NOTICE}
@@ -112,7 +112,7 @@ setInterval(async () => {
 </script>`;
 }
 
-export function modelLoginPage(state: LoginState, vscode: boolean, error?: string): string {
+export function modelLoginPage(state: LoginState, error?: string): string {
 	const base = `/admin/models/login/${encodeURIComponent(state.id)}`;
 	const finished = FINISHED_LOGIN[state.status];
 	const parts: string[] = [`<p>Status: <strong>${esc(STATUS_LABELS[state.status] ?? state.status)}</strong></p>`, messages(error)];
@@ -143,17 +143,17 @@ export function modelLoginPage(state: LoginState, vscode: boolean, error?: strin
 	parts.push(`<p><a href="/admin/models">Back to models &amp; accounts</a></p>`);
 	return layout(
 		`Sign in to ${state.providerName}`,
-		`${nav("models", vscode)}
+		`${nav("models")}
 <h1>Sign in to ${esc(state.providerName)}</h1>
 ${parts.join("\n")}
 ${finished ? "" : pollScript(state)}`,
 	);
 }
 
-export function loginNotFoundPage(vscode: boolean): string {
+export function loginNotFoundPage(): string {
 	return layout(
 		"Sign-in not found",
-		`${nav("models", vscode)}
+		`${nav("models")}
 <h1>Sign-in not found</h1>
 <p>This sign-in does not exist or has expired.</p>
 <p><a href="/admin/models">Back to models &amp; accounts</a></p>`,
@@ -182,7 +182,7 @@ export const modelsPages: PageRoutes = {
 			const view = await ctx.admin.call<ModelsView>("GET", "/models");
 			const flash = ctx.session.flash;
 			ctx.session.flash = undefined;
-			return html(modelsPage(view, ctx.now(), ctx.vscode, flash));
+			return html(modelsPage(view, ctx.now(), flash));
 		},
 	},
 
@@ -204,26 +204,26 @@ export const modelsPages: PageRoutes = {
 		async handle(_req, url, ctx) {
 			const asJson = url.pathname.endsWith(".json");
 			const { id, rest } = loginPath(url);
-			if (rest) return html(loginNotFoundPage(ctx.vscode), 404);
+			if (rest) return html(loginNotFoundPage(), 404);
 			const state = await loginState(ctx, asJson ? id.slice(0, -".json".length) : id);
 			if (asJson) return state ? json(state) : json({ error: "not found" }, 404);
-			return state ? html(modelLoginPage(state, ctx.vscode)) : html(loginNotFoundPage(ctx.vscode), 404);
+			return state ? html(modelLoginPage(state)) : html(loginNotFoundPage(), 404);
 		},
 	},
 
 	"POST /admin/models/login/": {
 		async handle(req, url, ctx) {
 			const { id, rest } = loginPath(url);
-			if (rest !== "/input" && rest !== "/cancel") return html(loginNotFoundPage(ctx.vscode), 404);
+			if (rest !== "/input" && rest !== "/cancel") return html(loginNotFoundPage(), 404);
 			const body = rest === "/input" ? { text: field(await req.formData(), "text") } : {};
 			try {
 				await ctx.admin.call<LoginState>("POST", `/models/logins/${encodeURIComponent(id)}${rest}`, { body, admin: ctx.session.username });
 			} catch (err) {
 				if (!(err instanceof AdminApiError)) throw err;
-				if (err.status === 404) return html(loginNotFoundPage(ctx.vscode), 404);
+				if (err.status === 404) return html(loginNotFoundPage(), 404);
 				if (err.status !== 400) throw err;
 				const state = await loginState(ctx, id);
-				return state ? html(modelLoginPage(state, ctx.vscode, err.message), 400) : html(loginNotFoundPage(ctx.vscode), 404);
+				return state ? html(modelLoginPage(state, err.message), 400) : html(loginNotFoundPage(), 404);
 			}
 			return redirect(`/admin/models/login/${encodeURIComponent(id)}`);
 		},

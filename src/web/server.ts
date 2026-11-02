@@ -1,5 +1,4 @@
 import { BlockList, isIP } from "node:net";
-import type { ServerWebSocket } from "bun";
 import type { SettingsSaveResponse, SettingsView, UsageWindow } from "../shared/adminApi";
 import { MAX_SKILL_UPLOAD_BYTES } from "../shared/adminSkills";
 import { errorMessage, log } from "../shared/log";
@@ -12,8 +11,7 @@ import { credentialsError, field, formStateFromSubmission, formStateFromView, ty
 import { homePage } from "./homePage";
 import { createSessionStore, type Session } from "./sessions";
 import { DEFAULT_WINDOW, statusPage, USAGE_WINDOWS } from "./statusPage";
-import { adminPage, errorPage, layout, loginPage, nav, notFoundPage, ORCHESTRATOR_UNAVAILABLE, setupPage, unavailablePage } from "./views";
-import { createVsCode, isVsCodePath, VSCODE_PREFIX, type VsCodeConfig, type VsCodeSocketData, VsCodeStartError } from "./vscode";
+import { adminPage, errorPage, loginPage, notFoundPage, ORCHESTRATOR_UNAVAILABLE, setupPage, unavailablePage } from "./views";
 
 export interface WebServerOptions {
 	/** Every read and write goes through the orchestrator's admin API; web holds no database or vault (architecture §2.2). */
@@ -22,10 +20,8 @@ export interface WebServerOptions {
 	port: number;
 	/** Clock for session expiry and the login throttle (tests). */
 	now?: () => number;
-	/** Feature pages (repositories, models, omp, skills, logs); every one needs a session. */
+	/** Feature pages (models, omp, skills, logs); every one needs a session. */
 	pages?: PageRoutes;
-	/** code-server proxied at `/admin/vscode/` (WEB-14); undefined when `ASKBOT_WEB_VSCODE=off`. */
-	vscode?: VsCodeConfig;
 	/**
 	 * `ASKBOT_WEB_TRUSTED_PROXIES`: addresses and CIDRs of reverse proxies in front of web. A request from one of them is
 	 * attributed to the right-most `X-Forwarded-For` entry that is not, for the login throttle (WEB-03); without them
@@ -39,7 +35,7 @@ export interface WebServer {
 	stop(): Promise<void>;
 }
 
-/** Body of web `GET /healthz` (§9.3): never error text, names or ids (RUN-13). */
+/** Body of web `GET /healthz` (requirements §5.3): never error text, names or ids (RUN-13). */
 export interface WebHealth {
 	status: "ok";
 	version: string;
@@ -60,8 +56,6 @@ const MAX_UPLOAD_BODY_BYTES = MAX_SKILL_UPLOAD_BYTES + 64 * 1024;
 const UPLOAD_PATHS: Record<string, true> = { "/admin/skills/upload": true };
 /** Long-lived event streams; Bun's idle timeout (10 s) would cut them between pings. */
 const STREAM_PATHS: Record<string, true> = { "/logs/stream": true };
-/** WebSocket close code when the login behind a VS Code connection ended (private range 4000–4999). */
-const CLOSE_LOGGED_OUT = 4001;
 
 function readCookie(req: Request, name: string): string | undefined {
 	for (const part of (req.headers.get("cookie") ?? "").split(";")) {
@@ -147,9 +141,6 @@ export function startWebServer(opts: WebServerOptions): WebServer {
 	const sessions = createSessionStore(undefined, opts.now);
 	const throttle = createLoginThrottle(WEB_LOGIN_LIMITS, opts.now);
 	const proxies = opts.trustedProxies?.length ? proxyList(opts.trustedProxies) : undefined;
-	const vscode = opts.vscode ? createVsCode(opts.vscode, SESSION_COOKIE) : undefined;
-	const vscodeOn = vscode !== undefined;
-	const sockets = new Set<ServerWebSocket<VsCodeSocketData>>();
 
 	/** The admin state, or undefined when the orchestrator is unavailable (logged; pages say so). */
 	async function tryState() {
@@ -249,12 +240,12 @@ export function startWebServer(opts: WebServerOptions): WebServer {
 			settingsError ??= SETTINGS_LOCKED;
 		}
 		settings ??= view && formStateFromView(view);
-		// WEB-20 to WEB-23: channel dropdowns once the bot token and guild id are stored.
+		// WEB-20 to WEB-23: the ask-only channel dropdown once the bot token and guild id are stored.
 		const channels = view && (await loadChannelListing(admin, view, page.refreshChannels ?? false));
 		const flash = session.flash;
 		session.flash = undefined;
 		return html(
-			adminPage({ state, username: session.username, settings, channels, flash, settingsError, accountError: page.accountError, vscode: vscodeOn }),
+			adminPage({ state, username: session.username, settings, channels, flash, settingsError, accountError: page.accountError }),
 			status,
 		);
 	}
@@ -318,10 +309,10 @@ export function startWebServer(opts: WebServerOptions): WebServer {
 	async function sessionRoute(req: Request, url: URL, session: Session): Promise<Response> {
 		switch (`${req.method} ${url.pathname}`) {
 			case "GET /":
-				return html(homePage({ state: await tryState(), version: await versionInfo(), vscode: vscodeOn }));
+				return html(homePage({ state: await tryState(), version: await versionInfo() }));
 			case "GET /status": {
 				const [report, guild] = await Promise.all([admin.status(usageWindow(url)), guildId()]);
-				return html(statusPage({ report, context: { guildId: guild, now: (opts.now ?? Date.now)() }, vscode: vscodeOn }));
+				return html(statusPage({ report, context: { guildId: guild, now: now() } }));
 			}
 			case "GET /status.json":
 				return json(await admin.status(usageWindow(url)));
@@ -336,48 +327,10 @@ export function startWebServer(opts: WebServerOptions): WebServer {
 			case "POST /admin/account":
 				return changeAccount(req, session);
 			default: {
-				if (isVsCodePath(url.pathname)) return vscodeRoute(req, url);
 				const page = matchPage(pages, req.method, url.pathname);
-				return page ? page.handle(req, url, { admin, session, now, vscode: vscodeOn }) : html(notFoundPage(), 404);
+				return page ? page.handle(req, url, { admin, session, now }) : html(notFoundPage(), 404);
 			}
 		}
-	}
-
-	/** `/admin/vscode/**`: code-server behind the admin login, or a page saying it is off. */
-	async function vscodeRoute(req: Request, url: URL): Promise<Response> {
-		if (!vscode) {
-			if (url.pathname !== VSCODE_PREFIX && url.pathname !== `${VSCODE_PREFIX}/`) return html(notFoundPage(), 404);
-			return html(
-				layout(
-					"VS Code",
-					`${nav("vscode", false)}
-<h1>VS Code</h1>
-<p>The VS Code configuration editor is <strong>off</strong>: this web pod runs with <code>ASKBOT_WEB_VSCODE=off</code>.
-Remove that setting (it defaults to <code>on</code>) and restart the web pod to edit settings, omp settings, skills and agents as files.</p>`,
-				),
-			);
-		}
-		try {
-			return await vscode.proxy(req, url);
-		} catch (err) {
-			if (!(err instanceof VsCodeStartError)) throw err;
-			return html(errorPage(`VS Code could not be started: ${err.message}`), 502);
-		}
-	}
-
-	/** WebSockets under `/admin/vscode/`: browsers apply no CORS to them, so besides the login the origin must be this host. */
-	function upgradeVsCode(req: Request, url: URL, srv: Bun.Server<VsCodeSocketData>, ip: string): Response | undefined {
-		if (!vscode) return html(notFoundPage(), 404);
-		const token = readCookie(req, SESSION_COOKIE);
-		if (!token || !sessions.get(token)) return json({ error: "unauthorized" }, 401);
-		if (!isSameOrigin(req, url)) {
-			log("warn", "cross-origin VS Code connection rejected", { ip, origin: req.headers.get("origin") });
-			return respond("Cross-origin request rejected", 403, { "Content-Type": "text/plain; charset=utf-8" });
-		}
-		const data = vscode.socketData(req, url, token);
-		if (!data) return respond("VS Code is not running; reload the page.", 503, { "Content-Type": "text/plain; charset=utf-8" });
-		if (srv.upgrade(req, { data })) return undefined;
-		return respond("Expected a WebSocket upgrade", 426, { "Content-Type": "text/plain; charset=utf-8" });
 	}
 
 	async function handle(req: Request, ip: string): Promise<Response> {
@@ -395,10 +348,7 @@ Remove that setting (it defaults to <code>on</code>) and restart the web pod to 
 		if (url.pathname === "/login" && (req.method === "GET" || req.method === "POST")) return handleLogin(req, url, ip);
 		const token = readCookie(req, SESSION_COOKIE);
 		if (route === "POST /logout") {
-			if (token) {
-				sessions.delete(token);
-				for (const ws of sockets) if (ws.data.token === token) ws.close(CLOSE_LOGGED_OUT, "Logged out.");
-			}
+			if (token) sessions.delete(token);
 			return redirect("/login", sessionCookie(req, url, "", 0));
 		}
 		if (!PROTECTED_PATH.test(url.pathname)) return html(notFoundPage(), 404);
@@ -415,13 +365,13 @@ Remove that setting (it defaults to <code>on</code>) and restart the web pod to 
 			log("warn", "orchestrator unavailable", { path: url.pathname, reason: err.reason });
 			if (wantsJson(req, url, pages)) return json({ error: ORCHESTRATOR_UNAVAILABLE }, 503);
 			return html(
-				unavailablePage(url.pathname === "/" ? "home" : url.pathname.startsWith("/admin") ? "settings" : "status", vscodeOn, "Unavailable", err.reason),
+				unavailablePage(url.pathname === "/" ? "home" : url.pathname.startsWith("/admin") ? "settings" : "status", "Unavailable", err.reason),
 				503,
 			);
 		}
 	}
 
-	const server = Bun.serve<VsCodeSocketData>({
+	const server = Bun.serve({
 		hostname: opts.host,
 		port: opts.port,
 		maxRequestBodySize: MAX_UPLOAD_BODY_BYTES,
@@ -430,30 +380,11 @@ Remove that setting (it defaults to <code>on</code>) and restart the web pod to 
 			const path = new URL(req.url).pathname;
 			if (STREAM_PATHS[path]) srv.timeout(req, 0);
 			try {
-				if (isVsCodePath(path) && req.headers.get("upgrade")?.toLowerCase() === "websocket") return upgradeVsCode(req, new URL(req.url), srv, ip);
 				return await handle(req, ip);
 			} catch (err) {
 				log("error", "web request failed", { method: req.method, path: new URL(req.url).pathname, error: errorMessage(err) });
 				return html(errorPage("Internal error; see the web log."), 500);
 			}
-		},
-		websocket: {
-			open(ws) {
-				sockets.add(ws);
-				vscode?.websocket.open(ws);
-			},
-			message(ws, message) {
-				// Traffic keeps the login alive, and stops working once it is gone (logout, expiry, credential change).
-				if (!sessions.get(ws.data.token)) {
-					ws.close(CLOSE_LOGGED_OUT, "Your login ended; log in again.");
-					return;
-				}
-				vscode?.websocket.message(ws, message);
-			},
-			close(ws) {
-				sockets.delete(ws);
-				vscode?.websocket.close(ws);
-			},
 		},
 		error(err) {
 			log("error", "web request failed", { error: errorMessage(err) });
@@ -466,8 +397,6 @@ Remove that setting (it defaults to <code>on</code>) and restart the web pod to 
 	return {
 		url: origin,
 		async stop() {
-			for (const ws of sockets) ws.close(1001, "AskBot is stopping.");
-			await vscode?.stop();
 			await server.stop(true);
 		},
 	};

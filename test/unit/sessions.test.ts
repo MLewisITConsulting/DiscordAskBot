@@ -2,14 +2,8 @@ import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createFakeDispatcher } from "../../src/orchestrator/dispatch/fake";
-import type { EngineDeps } from "../../src/orchestrator/engine/deps";
-import { terminalCleanup } from "../../src/orchestrator/engine/jobs";
-import type { IssueState } from "../../src/orchestrator/engine/state";
-import { type Db, openDb } from "../../src/orchestrator/store/db";
-import { isSessionKey, removeSessions, sessionPath, sweepSessions } from "../../src/orchestrator/store/sessions";
+import { chatSessionKey, isSessionKey, removeSessions, sessionDir as sessionsOf, sessionPath } from "../../src/orchestrator/store/sessions";
 import { setLogSink } from "../../src/shared/log";
-import { createFakeDiscord } from "../fakes/discord";
 
 const root = mkdtempSync(join(tmpdir(), "askbot-sessions-"));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
@@ -38,14 +32,10 @@ function makeSession(key: string, dir = sessionDir): string {
 
 const fileOf = (key: string, dir = sessionDir) => join(dir, `${key}.jsonl`);
 
-function seedIssue(db: Db, number: number, state: IssueState, keys: { plan?: string; impl?: string }) {
-	const issue = db.insertIssue("o/r", number, `issue ${number}`);
-	return db.updateIssue(issue.id, { state, plan_session: keys.plan ?? null, impl_session: keys.impl ?? null });
-}
-
 describe("session keys", () => {
 	test("sessionPath puts a key's file in the sessions dir and refuses unsafe keys", () => {
-		expect(sessionPath(sessionDir, "issue-1-plan")).toBe(join(sessionDir, "issue-1-plan.jsonl"));
+		expect(sessionsOf(stateDir)).toBe(sessionDir);
+		expect(sessionPath(sessionDir, chatSessionKey("123"))).toBe(join(sessionDir, "chat-123.jsonl"));
 		for (const bad of ["", "..", "../x", "a/b", "/abs", ".hidden", "a..b", "a\\b"]) {
 			expect(isSessionKey(bad)).toBe(false);
 			expect(() => sessionPath(sessionDir, bad)).toThrow("invalid session key");
@@ -56,11 +46,11 @@ describe("session keys", () => {
 describe("removeSessions", () => {
 	test("removes the file and its artifacts dir and logs the bytes freed", async () => {
 		const key = makeSession("a");
-		const { kept } = await removeSessions(sessionDir, [key], { repo: "o/r" });
+		const { kept } = await removeSessions(sessionDir, [key], { thread: "t1" });
 		expect(kept).toEqual([]);
 		expect(existsSync(fileOf(key))).toBe(false);
 		expect(existsSync(join(sessionDir, "a"))).toBe(false);
-		expect(logs.find(l => l.msg === "sessions removed")).toMatchObject({ sessions: ["a"], bytes: 150, repo: "o/r" });
+		expect(logs.find(l => l.msg === "sessions removed")).toMatchObject({ sessions: ["a"], bytes: 150, thread: "t1" });
 	});
 
 	test("a missing session is not an error and does not stop the others", async () => {
@@ -84,124 +74,5 @@ describe("removeSessions", () => {
 			expect(existsSync(path)).toBe(true);
 		}
 		expect(logs.filter(l => l.msg === "session outside session dir skipped")).toHaveLength(5);
-	});
-});
-
-/** Deps for `terminalCleanup`: the DB, the sessions dir, a fake Discord thread and a dispatcher keeping no refs. */
-async function cleanupDeps(db: Db) {
-	const discord = createFakeDiscord();
-	const channel = discord.addChannel({ name: "work" });
-	const top = await discord.send(channel.id, { content: "📥 top" });
-	const threadId = await discord.startThread(top, { name: "#1", autoArchiveMinutes: 10080 });
-	const deps = { db, sessionDir, discord, dispatcher: createFakeDispatcher() } as unknown as EngineDeps;
-	return { deps, discord, threadId };
-}
-
-describe("terminalCleanup session deletion", () => {
-	test.each(["done", "cancelled"] as const)("deletes both sessions of a %s issue, nulls the columns, posts and archives", async state => {
-		const db = openDb(":memory:");
-		const plan = makeSession("issue-1-plan");
-		const impl = makeSession("issue-1-impl");
-		const issue = seedIssue(db, 1, state, { plan, impl });
-		const { deps, discord, threadId } = await cleanupDeps(db);
-		db.updateIssue(issue.id, { thread_id: threadId });
-
-		await terminalCleanup(deps, db.getIssue(issue.id)!, "bye");
-
-		for (const path of [fileOf(plan), fileOf(impl), join(sessionDir, plan), join(sessionDir, impl)]) expect(existsSync(path)).toBe(false);
-		expect(db.getIssue(issue.id)).toMatchObject({ plan_session: null, impl_session: null });
-		expect(discord.lastMessage(threadId)?.content).toBe("bye");
-		expect(discord.channels().find(c => c.id === threadId)?.archived).toBe(true);
-	});
-
-	test("a stored value that is not a session key is skipped, cleared from the DB, and does not stop archiving", async () => {
-		const db = openDb(":memory:");
-		makeSession("elsewhere", stateDir);
-		const impl = makeSession("issue-1-impl");
-		const issue = seedIssue(db, 1, "done", { plan: "../elsewhere", impl });
-		const { deps, discord, threadId } = await cleanupDeps(db);
-		db.updateIssue(issue.id, { thread_id: threadId });
-
-		await terminalCleanup(deps, db.getIssue(issue.id)!, "bye");
-
-		expect(existsSync(fileOf("elsewhere", stateDir))).toBe(true);
-		expect(existsSync(fileOf(impl))).toBe(false);
-		expect(db.getIssue(issue.id)).toMatchObject({ plan_session: null, impl_session: null });
-		expect(discord.channels().find(c => c.id === threadId)?.archived).toBe(true);
-	});
-
-	test.each(["failed", "queued", "planning", "awaiting_approval", "implementing", "in_review"] as const)(
-		"keeps the sessions of a %s issue",
-		async state => {
-			const db = openDb(":memory:");
-			const plan = makeSession("issue-1-plan");
-			const impl = makeSession("issue-1-impl");
-			const issue = seedIssue(db, 1, state, { plan, impl });
-			const { deps } = await cleanupDeps(db);
-
-			await terminalCleanup(deps, db.getIssue(issue.id)!, "not terminal");
-
-			expect(existsSync(fileOf(plan))).toBe(true);
-			expect(existsSync(join(sessionDir, impl))).toBe(true);
-			expect(db.getIssue(issue.id)).toMatchObject({ plan_session: plan, impl_session: impl });
-		},
-	);
-});
-
-describe("sweepSessions", () => {
-	test("deletes sessions of closed issues and rejected plans only", async () => {
-		const db = openDb(":memory:");
-		const donePlan = makeSession("done-plan");
-		const doneImpl = makeSession("done-impl");
-		const review = makeSession("review");
-		const failed = makeSession("failed");
-		const rejected = makeSession("rejected");
-		const awaiting = makeSession("awaiting");
-		const chat = makeSession("chat-123");
-		const done = seedIssue(db, 1, "done", { plan: donePlan, impl: doneImpl });
-		const cancelled = seedIssue(db, 2, "cancelled", { impl: "missing" });
-		const inReview = seedIssue(db, 3, "in_review", { impl: review });
-		const failedIssue = seedIssue(db, 4, "failed", { impl: failed });
-		db.insertPlan("p1", "o/r", "r", "alice");
-		db.updatePlan("p1", { state: "rejected", session_file: rejected });
-		db.insertPlan("p2", "o/r", "r", "alice");
-		db.updatePlan("p2", { state: "awaiting", session_file: awaiting });
-
-		await sweepSessions({ db, sessionDir });
-
-		for (const path of [fileOf(donePlan), fileOf(doneImpl), fileOf(rejected), join(sessionDir, doneImpl), join(sessionDir, rejected)]) {
-			expect(existsSync(path)).toBe(false);
-		}
-		expect(db.getIssue(done.id)).toMatchObject({ plan_session: null, impl_session: null });
-		expect(db.getIssue(cancelled.id)?.impl_session).toBeNull();
-		expect(db.getPlan("p1")?.session_file).toBeNull();
-		for (const key of [review, failed, awaiting, chat]) expect(existsSync(fileOf(key))).toBe(true);
-		expect(db.getIssue(inReview.id)?.impl_session).toBe(review);
-		expect(db.getIssue(failedIssue.id)?.impl_session).toBe(failed);
-		expect(db.getPlan("p2")?.session_file).toBe(awaiting);
-	});
-
-	test("deletes sessions of ended /work issue drafts and keeps those of live drafts (ENG-05)", async () => {
-		const db = openDb(":memory:");
-		const draft = (id: string, state: "drafting" | "done" | "failed") => {
-			const session = makeSession(`draft-${id}`);
-			db.insertDraft({ id, repo: "o/r", request: "r", author: "alice", authorId: "u1", channelId: "c1" });
-			db.updateDraft(id, { state, session_file: session });
-			return session;
-		};
-		const done = draft("d1", "done");
-		const failed = draft("d2", "failed");
-		const live = draft("d3", "drafting");
-
-		await sweepSessions({ db, sessionDir });
-
-		for (const key of [done, failed]) {
-			expect(existsSync(fileOf(key))).toBe(false);
-			expect(existsSync(join(sessionDir, key))).toBe(false);
-		}
-		expect(db.getDraft("d1")?.session_file).toBeNull();
-		expect(db.getDraft("d2")?.session_file).toBeNull();
-		expect(existsSync(fileOf(live))).toBe(true);
-		expect(db.getDraft("d3")?.session_file).toBe(live);
 	});
 });

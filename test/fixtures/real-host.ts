@@ -99,8 +99,9 @@ export interface HostDirs {
 	tmp: string;
 	sessions: string;
 	omp: string;
-	work: string;
 	scratch: string;
+	/** The session's cwd (AGT-24). */
+	work: string;
 }
 
 export async function makeHostDirs(): Promise<HostDirs> {
@@ -112,8 +113,8 @@ export async function makeHostDirs(): Promise<HostDirs> {
 		tmp: join(root, "tmp"),
 		sessions: join(root, "sessions"),
 		omp: join(root, "omp"),
-		work: join(root, "work"),
 		scratch: join(root, "scratch"),
+		work: join(root, "work"),
 	};
 	for (const dir of Object.values(dirs)) await mkdir(dir, { recursive: true, mode: 0o700 });
 	await mkdir(join(dirs.scratch, "inputs"), { recursive: true });
@@ -164,7 +165,7 @@ export interface HostRun {
 
 export interface HostRunOptions {
 	dirs: HostDirs;
-	opts: Partial<StartOptions> & Pick<StartOptions, "profile" | "prompt">;
+	opts: Partial<StartOptions> & Pick<StartOptions, "prompt">;
 	providerKeys?: Record<string, string>;
 	/** Answers `credential_request` (CRED-03); default: refused. */
 	credential?(req: Extract<ChildMessage, { t: "credential_request" }>): { accessToken: string; expiresAt: number } | { error: string };
@@ -222,20 +223,20 @@ export function runRealHost(o: HostRunOptions): HostRun {
 		},
 		onExit: () => ended.resolve(undefined),
 	});
-	const cwd = o.opts.profile === "ask" ? dirs.scratch : dirs.work;
 	run.send({
 		t: "start",
 		runtime: { agentDir: dirs.auth, ompDir: dirs.omp, providerKeys: o.providerKeys ?? {} },
 		opts: {
 			runId: "real-host-run",
-			cwd,
+			cwd: dirs.work,
 			sessionDir: dirs.sessions,
 			modelPattern: `${FAKE_PROVIDER}/${FAKE_MODEL}`,
 			thinking: "off",
 			limits: { minutes: 10, costUsd: 100 },
 			omp: emptyOmpConfig(),
+			profile: "ask",
 			wantLoadout: false,
-			...(o.opts.profile === "ask" ? { scratchRoot: dirs.scratch } : {}),
+			scratchRoot: dirs.scratch,
 			...o.opts,
 		},
 	});

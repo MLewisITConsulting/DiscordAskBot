@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { OverwriteType, PermissionFlagsBits as P } from "discord-api-types/v10";
 import {
+	BOT_PERMISSIONS,
 	basePermissions,
-	CATEGORY_PERMISSIONS,
+	botInviteLink,
 	CHANNEL_PERMISSIONS,
 	channelPermissions,
 	type GuildData,
@@ -74,9 +75,12 @@ describe("permissionGaps", () => {
 		expect(permissionGaps(P.SendMessages, CHANNEL_PERMISSIONS).viewable).toBe(false);
 	});
 
-	test("the watch category also needs Manage Channels", () => {
+	test("the invite link grants the channel permissions plus Change Nickname, nothing else (WEB-23)", () => {
 		const all = CHANNEL_PERMISSIONS.reduce((bits, [bit]) => bits | bit, 0n);
-		expect(permissionGaps(all, CATEGORY_PERMISSIONS).missing).toEqual(["Manage Channels"]);
-		expect(permissionGaps(all | P.ManageChannels, CATEGORY_PERMISSIONS).missing).toEqual([]);
+		expect(BOT_PERMISSIONS).toBe(all | P.ChangeNickname);
+		const url = new URL(botInviteLink("123"));
+		expect(url.searchParams.get("client_id")).toBe("123");
+		expect(url.searchParams.get("scope")).toBe("bot applications.commands");
+		expect(url.searchParams.get("permissions")).toBe(String(all | P.ChangeNickname));
 	});
 });

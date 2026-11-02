@@ -13,12 +13,11 @@ import { openRollingFiles, type RollingFiles } from "../../src/shared/rollinglog
 import { createAdminClient } from "../../src/web/adminClient";
 import type { PageRoutes } from "../../src/web/http";
 import { startWebServer, type WebServer } from "../../src/web/server";
-import type { VsCodeConfig } from "../../src/web/vscode";
 import { createFakeDiscord } from "../fakes/discord";
 
 /**
  * A real orchestrator admin API (db, vault, controller with a fake Discord, feature routes) and a real web server in
- * front of it, logged in as the admin: feature pages can be driven end to end without Discord, GitHub or providers.
+ * front of it, logged in as the admin: feature pages can be driven end to end without Discord or providers.
  */
 
 const WEB_TOKEN = "web-api-token-for-tests";
@@ -46,7 +45,7 @@ export interface AdminStack extends StackDeps {
 	close(): Promise<void>;
 }
 
-export async function startAdminStack(opts: { routes(deps: StackDeps): AdminRoutes; pages: PageRoutes; vscode?: VsCodeConfig }): Promise<AdminStack> {
+export async function startAdminStack(opts: { routes(deps: StackDeps): AdminRoutes; pages: PageRoutes }): Promise<AdminStack> {
 	const stateDir = mkdtempSync(join(tmpdir(), "askbot-stack-"));
 	mkdirSync(join(stateDir, "logs", "orchestrator"), { recursive: true });
 	const db = openDb(dbPath(stateDir));
@@ -55,7 +54,7 @@ export async function startAdminStack(opts: { routes(deps: StackDeps): AdminRout
 	const processLog = openRollingFiles({ dir: join(stateDir, "logs", "orchestrator"), prefix: "orchestrator", maxBytes: 1024 ** 3 });
 	const deps: StackDeps = { stateDir, agentLog, processLog };
 	const dispatcher = createFakeDispatcher();
-	const controller = createController({ stateDir, db, vault, agentLog, dispatcher, connectDiscord: () => createFakeDiscord() });
+	const controller = createController({ stateDir, ompDir: join(stateDir, "omp"), db, vault, agentLog, dispatcher, connectDiscord: () => createFakeDiscord() });
 	const admin = createAdminApi({
 		db,
 		vault,
@@ -85,7 +84,6 @@ export async function startAdminStack(opts: { routes(deps: StackDeps): AdminRout
 		host: "127.0.0.1",
 		port: 0,
 		pages: opts.pages,
-		vscode: opts.vscode,
 	});
 
 	const setup = await fetch(`${web.url}/setup`, {

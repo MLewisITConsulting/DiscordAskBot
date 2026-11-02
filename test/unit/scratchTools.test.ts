@@ -7,9 +7,11 @@ import { createScratchTools, pageText, resolveInside, WRITE_MAX_BYTES } from "..
 
 let base: string;
 let root: string;
+let skills: string;
 beforeEach(() => {
 	base = mkdtempSync(join(tmpdir(), "askbot-tools-"));
 	root = join(base, "thread");
+	skills = join(base, "omp", "skills");
 	mkdirSync(join(root, "inputs"), { recursive: true });
 	mkdirSync(join(root, "outputs"), { recursive: true });
 });
@@ -17,7 +19,7 @@ afterEach(() => rmSync(base, { recursive: true, force: true }));
 
 /** Calls a tool's execute without a live session (the confined tools use none of the context). */
 async function call(name: string, params: Record<string, unknown>): Promise<string> {
-	const tool = createScratchTools(root).find(t => t.name === name) as CustomTool;
+	const tool = createScratchTools({ scratch: root, skills }).find(t => t.name === name) as CustomTool;
 	const result = await (tool.execute as (...args: unknown[]) => Promise<{ content: { type: string; text?: string }[] }>)("id", params, undefined, {}, undefined);
 	return result.content.map(block => block.text ?? `[${block.type}]`).join("\n");
 }
@@ -96,5 +98,68 @@ describe("pageText", () => {
 
 	test("an offset past the end says so", () => {
 		expect(pageText(text, 50, 5, 1000)).toContain("past the end");
+	});
+});
+
+describe("skill:// (AGT-30)", () => {
+	beforeEach(() => {
+		mkdirSync(join(skills, "glossary", "docs"), { recursive: true });
+		writeFileSync(join(skills, "glossary", "SKILL.md"), "---\nname: glossary\ndescription: Terms\n---\nSee terms.md.\n");
+		writeFileSync(join(skills, "glossary", "terms.md"), "flarn: ZEBRA-42\n");
+		writeFileSync(join(skills, "glossary", "docs", "more.md"), "more\n");
+		mkdirSync(join(skills, "other"));
+		writeFileSync(join(skills, "other", "SKILL.md"), "other skill\n");
+		writeFileSync(join(base, "secret.txt"), "secret");
+		symlinkSync(join(base, "secret.txt"), join(skills, "glossary", "leak.md"));
+		symlinkSync(join(skills, "glossary"), join(skills, "alias"));
+	});
+
+	test("read_file declares that it reads skill URIs, so omp lists the skills", () => {
+		const tools = createScratchTools({ scratch: root, skills });
+		expect(tools.find(t => t.name === "read_file")?.readsSkillUris).toBe(true);
+	});
+
+	test("read_file serves SKILL.md for the folder and files inside it; list_files lists it", async () => {
+		expect(await call("read_file", { path: "skill://glossary" })).toContain("See terms.md.");
+		expect(await call("read_file", { path: "skill://glossary/" })).toContain("See terms.md.");
+		expect(await call("read_file", { path: "skill://glossary/terms.md" })).toBe("flarn: ZEBRA-42\n");
+		expect(await call("read_file", { path: "skill://glossary/docs/more.md" })).toBe("more\n");
+		const listing = await call("list_files", { path: "skill://glossary" });
+		expect(listing).toContain("skill://glossary/terms.md (16 bytes)");
+		expect(listing).toContain("skill://glossary/docs/more.md");
+		expect(listing).not.toContain("leak.md");
+	});
+
+	test("escapes, unknown names, symlinks and absolute paths are refused", async () => {
+		const refused: [string, RegExp][] = [
+			["skill://glossary/../other/SKILL.md", /outside/],
+			["skill://glossary/../../../secret.txt", /outside/],
+			["skill://glossary/leak.md", /outside|Symbolic/],
+			["skill://glossary//etc/hosts", /relative/],
+			["skill:///etc/hosts", /Invalid skill name/],
+			["skill://..", /Invalid skill name/],
+			["skill://../omp", /Invalid skill name/],
+			["skill://Glossary", /Invalid skill name/],
+			["skill://missing", /No such skill/],
+			["skill://alias/terms.md", /No such skill/],
+		];
+		for (const [path, error] of refused) {
+			await expect(call("read_file", { path })).rejects.toThrow(error);
+			await expect(call("list_files", { path })).rejects.toThrow(error);
+		}
+	});
+
+	test("every other scheme stays refused", async () => {
+		for (const path of ["file:///etc/hosts", "local://x.md", "agent://x", "SKILL://glossary", "skills://glossary", "omp://x"]) {
+			await expect(call("read_file", { path })).rejects.toThrow();
+			await expect(call("list_files", { path })).rejects.toThrow();
+		}
+	});
+
+	test("write_file refuses skill:// paths", async () => {
+		for (const path of ["skill://glossary/new.md", "skill://glossary", "skill://missing/x.md"]) {
+			await expect(call("write_file", { path, content: "x" })).rejects.toThrow("skills are read-only");
+		}
+		expect(readFileSync(join(skills, "glossary", "SKILL.md"), "utf8")).toContain("See terms.md.");
 	});
 });

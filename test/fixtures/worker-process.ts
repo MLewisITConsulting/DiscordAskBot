@@ -5,7 +5,7 @@
 //   TEST_WORKER_TOKEN          the worker token
 //   TEST_WORKER_ID             worker id (default `test-worker-<pid>`)
 //   TEST_CLAIM_TIMEOUT_MS      claim timeout (default 10000)
-//   TEST_DISK_LIMIT            the checkout's size limit in bytes (STO-06; default none)
+//   TEST_DISK_LIMIT            the scratch copy's size limit in bytes (STO-06; default none)
 // Prints `{"outcome":…}` on stdout and exits 0, like `askbot worker`.
 import { join } from "node:path";
 import { runWorkerProcess } from "../../src/worker/main";

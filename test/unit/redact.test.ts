@@ -8,33 +8,25 @@ import { addLogSecret, log, REDACTED, removeLogSecret, setLogSink, writeRelayedL
 /** Security review F9: known secrets are masked in log lines and agent-log entries; relayed worker lines can't forge entries. */
 
 const SECRET = "lease-token-0123456789abcdef";
-const PEM = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\n-----END PRIVATE KEY-----";
 const lines: string[] = [];
 const dirs: string[] = [];
 
 afterEach(() => {
 	setLogSink(undefined);
 	removeLogSecret(SECRET);
-	removeLogSecret(PEM);
 	lines.length = 0;
 	for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
 describe("log redaction (F9)", () => {
-	test("known secrets, and each line of a multi-line one, are masked until removed", () => {
+	test("known secrets are masked until removed; short values never", () => {
 		setLogSink(line => lines.push(line));
 		addLogSecret(SECRET);
-		addLogSecret(PEM);
 		addLogSecret("short");
-		log("info", "setup command finished", { tail: `cat token\n${SECRET}\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7`, other: "short" });
+		log("info", "tool finished", { tail: `cat token\n${SECRET}\n`, other: "short" });
 		expect(lines[0]).not.toContain(SECRET);
-		expect(lines[0]).not.toContain("MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7");
 		expect(lines[0]).toContain(REDACTED);
 		expect(lines[0]).toContain('"other":"short"');
-		// The armor lines are public text quoted by the private-key error message; only the key body is secret.
-		log("warn", "key rejected", { error: "paste the whole .pem file, from the -----BEGIN PRIVATE KEY----- line" });
-		expect(lines.at(-1)).toContain("-----BEGIN PRIVATE KEY-----");
-		lines.length = 1;
 		removeLogSecret(SECRET);
 		log("info", "after the run", { token: SECRET });
 		expect(lines[1]).toContain(SECRET);
@@ -57,7 +49,7 @@ describe("log redaction (F9)", () => {
 		dirs.push(dir);
 		addLogSecret(SECRET);
 		const agentLog = await openAgentLog({ dir, maxBytes: 1_000_000 });
-		agentLog.append({ run: "job-1", kind: "implement", repo: "acme/widgets" }, { type: "tool_end", tool: "bash", text: `token=${SECRET}`, isError: false });
+		agentLog.append({ run: "ask-t1", kind: "ask", thread: "t1", channel: "c1", user: "u1" }, { type: "tool_end", tool: "read_file", text: `token=${SECRET}`, isError: false });
 		expect(JSON.stringify(agentLog.recent(10))).not.toContain(SECRET);
 		const file = await Bun.file(join(dir, readdirSync(dir)[0]!)).text();
 		expect(file).not.toContain(SECRET);

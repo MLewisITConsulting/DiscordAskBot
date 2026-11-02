@@ -9,7 +9,7 @@ import { readTokenFile } from "../shared/tokens";
 import { APP_ROOT, type AppIdentity, appIdentity } from "../shared/version";
 import type { OrchestratorControl, WorkerPhase } from "../shared/wire";
 import { WorkerConnection } from "./connection";
-import { type ActiveRun, McpTestRun, type RunTiming, RunSupervisor } from "./runner";
+import { type ActiveRun, type RunTiming, RunSupervisor } from "./runner";
 import { StatusFile, workerRoot, workerRunBaseDir } from "./status";
 
 /**
@@ -23,7 +23,7 @@ export interface WorkerOptions {
 	/** Pod or container name (`HOSTNAME`), else random. */
 	workerId: string;
 	claimTimeoutMs: number;
-	/** Checkout root on container storage: checkout, sessions, skills and scratch copies (architecture §5, "worker checkout"). */
+	/** Worker root on container storage: the scratch, session and skills copies (architecture §5, "worker scratch"). */
 	root: string;
 	/**
 	 * Run-local root (architecture §5, "run-local"; a tmpfs in the image): the status file, the run-private auth store,
@@ -35,21 +35,21 @@ export interface WorkerOptions {
 	/** The agent host entry; tests use a fixture host. */
 	hostEntry?: string;
 	timing?: Partial<RunTiming>;
-	/** The checkout's size limit (STO-06, `ASKBOT_WORKER_DISK`). */
+	/** The scratch copy's size limit (STO-06, `ASKBOT_WORKER_DISK`). */
 	diskLimitBytes?: number;
 	reconnectMinMs?: number;
 	reconnectMaxMs?: number;
 	/** Ping interval of the orchestrator connection (`KEEPALIVE_MS`). */
 	keepaliveMs?: number;
-	/** Aborted on SIGTERM: checkpoint, stop the host, clean up (RUN-18). */
+	/** Aborted on SIGTERM: upload the session, stop the host, clean up (RUN-18). */
 	signal?: AbortSignal;
 }
 
-export type WorkerOutcome = "nothing" | "run" | "mcp-test";
+export type WorkerOutcome = "nothing" | "run";
 
 type Assign = Extract<OrchestratorControl, { t: "assign" }>;
 
-/** Serves at most one assignment and deletes the checkout and run-local roots before returning. */
+/** Serves at most one run and deletes the worker and run-local roots before returning. */
 export async function runWorkerOnce(opts: WorkerOptions): Promise<WorkerOutcome> {
 	await mkdir(opts.root, { recursive: true, mode: 0o700 });
 	await mkdir(opts.runLocal, { recursive: true, mode: 0o700 });
@@ -90,22 +90,24 @@ export async function runWorkerOnce(opts: WorkerOptions): Promise<WorkerOutcome>
 			return "nothing";
 		}
 		const lease = { runId: assign.runId, token: assign.token };
-		log("info", "run claimed", { run: assign.runId, worker: opts.workerId, kind: assign.kind });
+		log("info", "run claimed", { run: assign.runId, worker: opts.workerId });
 		status.update({ runId: assign.runId });
-		const supervisorOptions = {
-			conn,
-			lease,
-			orchestratorUrl: opts.orchestratorUrl,
-			root: opts.root,
-			runLocal: opts.runLocal,
-			ompVersion: opts.ompVersion,
-			identity: opts.identity,
-			hostEntry: opts.hostEntry,
-			timing: opts.timing,
-			diskLimitBytes: opts.diskLimitBytes,
-			onPhase: (phase: WorkerPhase) => status.update({ phase }),
-		};
-		const run = assign.kind === "run" ? new RunSupervisor(supervisorOptions, assign.spec) : new McpTestRun(supervisorOptions, assign.mcp);
+		const run = new RunSupervisor(
+			{
+				conn,
+				lease,
+				orchestratorUrl: opts.orchestratorUrl,
+				root: opts.root,
+				runLocal: opts.runLocal,
+				ompVersion: opts.ompVersion,
+				identity: opts.identity,
+				hostEntry: opts.hostEntry,
+				timing: opts.timing,
+				diskLimitBytes: opts.diskLimitBytes,
+				onPhase: (phase: WorkerPhase) => status.update({ phase }),
+			},
+			assign.spec,
+		);
 		active = run;
 		ready.resolve(run);
 		const onSigterm = () => void run.terminate();
@@ -115,7 +117,7 @@ export async function runWorkerOnce(opts: WorkerOptions): Promise<WorkerOutcome>
 		await running;
 		opts.signal?.removeEventListener("abort", onSigterm);
 		log("info", "run finished on the worker", { run: assign.runId });
-		return assign.kind;
+		return "run";
 	} finally {
 		clearTimeout(claimTimer);
 		ready.resolve(undefined);
@@ -126,11 +128,11 @@ export async function runWorkerOnce(opts: WorkerOptions): Promise<WorkerOutcome>
 }
 
 /**
- * `runWorkerOnce` as this process's one job: the checkout root at `workerRoot()` and the run-local root under
+ * `runWorkerOnce` as this process's one job: the worker root at `workerRoot()` and the run-local root under
  * `ASKBOT_WORKER_RUN_DIR`, with `HOME` and `PI_CODING_AGENT_DIR` pointed into the run-local root before omp loads
- * (spike S2), and SIGTERM wired to the checkpoint-and-stop path (RUN-18). omp's SDK,
+ * (spike S2), and SIGTERM wired to the upload-and-stop path (RUN-18). omp's SDK,
  * loaded for the auth store, handles SIGTERM process-wide by running registered cleanups and then exiting, so the worker
- * registers with it: the SIGTERM checkpoint and the cleanup finish before the process exits (within postmortem's 10 s).
+ * registers with it: the SIGTERM session upload and the cleanup finish before the process exits (within postmortem's 10 s).
  */
 export async function runWorkerProcess(opts: Omit<WorkerOptions, "root" | "runLocal" | "signal">): Promise<WorkerOutcome> {
 	const root = workerRoot();

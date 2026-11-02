@@ -3,8 +3,8 @@ import { join, resolve } from "node:path";
 import { parseLogCapOverride } from "./rollinglog";
 
 /**
- * Typed `ASKBOT_*` environment (requirements §13). Defaults are the source-checkout ones; the image sets its
- * own (`ASKBOT_HOME=/home/askbot`, `ASKBOT_STATE_DIR=/state`, `ASKBOT_WEB_HOST=0.0.0.0`, …) with `ENV`.
+ * Typed `ASKBOT_*` environment (requirements §9). Defaults are the source-checkout ones; the image sets its
+ * own (`ASKBOT_STATE_DIR=/state`, `ASKBOT_WEB_HOST=0.0.0.0`, …) with `ENV`.
  * Each component reads only the fields it uses; an invalid value throws with the variable's name.
  */
 
@@ -14,8 +14,6 @@ export type Role = (typeof ROLES)[number];
 export interface AskbotEnv {
 	/** `ASKBOT_ROLE`; the command argument takes precedence in `cli.ts`. */
 	role?: Role;
-	/** `ASKBOT_HOME`: web home volume root (absolute). */
-	home: string;
 	/** `ASKBOT_STATE_DIR`: state volume root `<state>` (absolute); orchestrator only. */
 	stateDir: string;
 	/** `ASKBOT_OMP_DIR`: skills and agents root; defaults to `<state>/omp`. */
@@ -32,8 +30,6 @@ export interface AskbotEnv {
 	webApiTokenFile?: string;
 	workerTokenFile?: string;
 	scaleTokenFile?: string;
-	/** `ASKBOT_WEB_VSCODE` is not `off`. */
-	webVscode: boolean;
 	/** `ASKBOT_AGENT_LOG_MAX_BYTES`: overrides `logs.maxGiB` (OBS-04). */
 	agentLogMaxBytes?: number;
 	/** `ASKBOT_OMP_RUNTIME_DIR`: set only in the image; enables in-place omp updates. */
@@ -47,9 +43,7 @@ export interface AskbotEnv {
 	/** `ASKBOT_WORKER_RUN_DIR`: parent of the worker's run-local root (the image: `/run/askbot`, a tmpfs or memory `emptyDir`). */
 	workerRunDir?: string;
 	workerCapacity: number;
-	/** `ASKBOT_WORKER_IMAGE`: launcher only; undefined means the AskBot image itself (`image`). */
-	workerImage?: string;
-	/** `ASKBOT_IMAGE`: launcher only; the AskBot image this stack runs (compose sets it to the services' image). */
+	/** `ASKBOT_IMAGE`: launcher only; the AskBot image this stack runs and workers start from (compose sets it to the services' image). */
 	image?: string;
 	/** `ASKBOT_WORKER_NETWORK`: launcher only, required; the stack network workers join. */
 	workerNetwork?: string;
@@ -59,7 +53,7 @@ export interface AskbotEnv {
 	workerMemoryBytes: number;
 	/** `ASKBOT_WORKER_CPUS`: launcher only; CPU quota per worker container, in CPUs (`podman run --cpus`). */
 	workerCpus: number;
-	/** `ASKBOT_WORKER_DISK` in bytes. */
+	/** `ASKBOT_WORKER_DISK` in bytes: the worker's scratch space limit (STO-06). */
 	workerDiskBytes: number;
 	podmanSocket: string;
 	launcherAllowRootful: boolean;
@@ -169,19 +163,16 @@ function addressList(env: Env, name: string): string[] {
 export function loadEnv(env: Env = process.env): Readonly<AskbotEnv> {
 	const role = str(env, "ASKBOT_ROLE");
 	if (role !== undefined && !ROLES.includes(role as Role)) fail("ASKBOT_ROLE", role, ROLES.join(", "));
-	const vscode = str(env, "ASKBOT_WEB_VSCODE") ?? "on";
-	if (vscode !== "on" && vscode !== "off") fail("ASKBOT_WEB_VSCODE", vscode, "on or off");
 	const stateDir = resolve(str(env, "ASKBOT_STATE_DIR") ?? "./state");
 	const claimTimeout = str(env, "ASKBOT_WORKER_CLAIM_TIMEOUT") ?? "15s";
 	const workerMemory = str(env, "ASKBOT_WORKER_MEMORY") ?? "4g";
-	const workerDisk = str(env, "ASKBOT_WORKER_DISK") ?? "20g";
+	const workerDisk = str(env, "ASKBOT_WORKER_DISK") ?? "2g";
 	const optionalPath = (name: string) => {
 		const raw = str(env, name);
 		return raw === undefined ? undefined : resolve(raw);
 	};
 	return Object.freeze({
 		role: role as Role | undefined,
-		home: resolve(str(env, "ASKBOT_HOME") ?? "./web-home"),
 		stateDir,
 		ompDir: resolve(str(env, "ASKBOT_OMP_DIR") ?? join(stateDir, "omp")),
 		webHost: str(env, "ASKBOT_WEB_HOST") ?? "127.0.0.1",
@@ -193,7 +184,6 @@ export function loadEnv(env: Env = process.env): Readonly<AskbotEnv> {
 		webApiTokenFile: optionalPath("ASKBOT_WEB_API_TOKEN_FILE"),
 		workerTokenFile: optionalPath("ASKBOT_WORKER_TOKEN_FILE"),
 		scaleTokenFile: optionalPath("ASKBOT_SCALE_TOKEN_FILE"),
-		webVscode: vscode === "on",
 		agentLogMaxBytes: parseLogCapOverride(str(env, "ASKBOT_AGENT_LOG_MAX_BYTES")),
 		ompRuntimeDir: optionalPath("ASKBOT_OMP_RUNTIME_DIR"),
 		orchestratorUrl: url(env, "ASKBOT_ORCHESTRATOR_URL", "http://orchestrator:8081"),
@@ -201,7 +191,6 @@ export function loadEnv(env: Env = process.env): Readonly<AskbotEnv> {
 		workerAddressBinding: flag(env, "ASKBOT_WORKER_ADDRESS_BINDING", true),
 		workerRunDir: optionalPath("ASKBOT_WORKER_RUN_DIR"),
 		workerCapacity: int(env, "ASKBOT_WORKER_CAPACITY", 4, 1, 1000),
-		workerImage: image(env, "ASKBOT_WORKER_IMAGE"),
 		image: image(env, "ASKBOT_IMAGE"),
 		workerNetwork: podmanName(env, "ASKBOT_WORKER_NETWORK"),
 		workerSecret: podmanName(env, "ASKBOT_WORKER_SECRET") ?? "askbot_worker_token",

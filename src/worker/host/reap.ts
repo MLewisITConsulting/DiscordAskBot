@@ -9,8 +9,8 @@ export const AGENT_RUN_ENV = "ASKBOT_AGENT_RUN";
 
 /**
  * SIGKILLs every process whose environment carries `ASKBOT_AGENT_RUN=<marker>` (Linux `/proc`) and returns
- * their pids. Reaches what a process-group kill cannot: children that called `setsid` (omp's bash commands, its
- * launch broker and services, MCP servers). Unreadable entries (exited meanwhile, other user) are skipped; without
+ * their pids. Reaches what a process-group kill cannot: children that called `setsid` (omp's launch broker and
+ * services). Unreadable entries (exited meanwhile, other user) are skipped; without
  * `/proc` nothing is killed. Sync on purpose: runs once at the end of a run, over small procfs files.
  */
 export function killMarkedProcesses(marker: string, procDir = "/proc"): number[] {

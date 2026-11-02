@@ -36,8 +36,8 @@ export interface OutboxEntry {
 
 /**
  * Unacknowledged relay messages in sequence order. When full (count or bytes), it drops the oldest `progress`,
- * `transcript` and `log` messages first, then every `todos` but the newest; it never drops anything else, so it
- * may stay over its bounds when only such messages are left.
+ * `transcript` and `log` messages first; it never drops anything else, so it may stay over its bounds when only such
+ * messages are left.
  */
 export class RelayOutbox {
 	#entries: OutboxEntry[] = [];
@@ -66,11 +66,7 @@ export class RelayOutbox {
 		this.#bytes += entry.bytes;
 		const dropped: number[] = [];
 		while (this.#entries.length > this.maxMessages || this.#bytes > this.maxBytes) {
-			let index = this.#entries.findIndex(e => DROPPABLE[e.type]);
-			if (index < 0) {
-				const newestTodos = this.#entries.findLastIndex(e => e.type === "todos");
-				index = this.#entries.findIndex((e, i) => e.type === "todos" && i !== newestTodos);
-			}
+			const index = this.#entries.findIndex(e => DROPPABLE[e.type]);
 			if (index < 0) break;
 			const [removed] = this.#entries.splice(index, 1);
 			this.#bytes -= removed!.bytes;

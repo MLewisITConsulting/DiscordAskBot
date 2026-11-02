@@ -4,24 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAdminApi } from "../../src/orchestrator/api/admin";
 import { type InternalApi, startInternalApi } from "../../src/orchestrator/api/server";
-import {
-	type RunHandle,
-	type RunHooks,
-	RunLost,
-	type RunRequest,
-	type RunResult,
-	type RunUi,
-	uiCallContext,
-} from "../../src/orchestrator/dispatch/dispatcher";
+import { type RunHandle, type RunHooks, RunLost, type RunRequest, type RunResult } from "../../src/orchestrator/dispatch/dispatcher";
 import { createWorkerDispatcher, type DispatchLimits, type WorkerDispatcher } from "../../src/orchestrator/dispatch/workers";
 import { createController } from "../../src/orchestrator/engine/controller";
-import { createRepos } from "../../src/orchestrator/git/repos";
 import { openAgentLog } from "../../src/orchestrator/store/agentlog";
 import { type Db, dbPath, openDb } from "../../src/orchestrator/store/db";
 import { openVault } from "../../src/orchestrator/store/vault";
 import type { ChildMessage } from "../../src/shared/protocol";
 import type { RunUsage } from "../../src/shared/transcript";
-import { type DownMessage, GIT_PATH_PREFIX, runArtifactPath, type UpMessage, WORKER_WS_PATH } from "../../src/shared/wire";
+import { type DownMessage, runArtifactPath, type UpMessage, WORKER_WS_PATH } from "../../src/shared/wire";
 
 /**
  * The dispatcher against scripted WebSocket clients acting as workers (no worker process): claims, the relay in both
@@ -63,7 +54,7 @@ interface Setup {
 async function setup(): Promise<Setup> {
 	const stateDir = await mkdtemp(join(tmpdir(), "askbot-dispatch-"));
 	cleanups.push(() => rm(stateDir, { recursive: true, force: true }));
-	const limits: Setup["limits"] = { value: { maxConcurrentJobs: 2, maxChatSessions: 2, maxConcurrentRuns: 4 } };
+	const limits: Setup["limits"] = { value: { maxChatSessions: 2, maxConcurrentRuns: 4 } };
 	return {
 		stateDir,
 		limits,
@@ -76,7 +67,7 @@ async function setup(): Promise<Setup> {
 				reattachGraceMs: opts.graceMs ?? 2000,
 				spec: {
 					stateDir,
-					ompConfig: () => ({ settings: {}, mcpServers: { echo: { command: "echo" } } }),
+					ompConfig: () => ({ settings: { "compaction.enabled": true } }),
 					providerKeys: () => ({ anthropic: "sk-test" }),
 					credentials: async () => [{ id: 1, provider: "p", credential: { refresh: "__remote__" } }],
 					skillsHash: async () => "skills-hash",
@@ -86,13 +77,19 @@ async function setup(): Promise<Setup> {
 				claimWaitMs: 1500,
 				leaseMs: 600,
 				sweepMs: 25,
-				repos: createRepos({ stateDir }),
 				// Every fake worker connects from 127.0.0.1; only the architecture §6 test turns this on.
 				bindWorkerAddresses: opts.bindWorkerAddresses ?? false,
 			});
 			// The real admin API (SEC-14: only the web token gets past it); the controller is never started here.
 			const vault = await openVault(db);
-			const controller = createController({ stateDir, db, vault, agentLog: await openAgentLog({ dir: join(stateDir, "logs", "agent") }), dispatcher });
+			const controller = createController({
+				stateDir,
+				ompDir: join(stateDir, "omp"),
+				db,
+				vault,
+				agentLog: await openAgentLog({ dir: join(stateDir, "logs", "agent") }),
+				dispatcher,
+			});
 			const admin = createAdminApi({ db, vault, controller, dispatcher, version: "0.0.0-test", workerCapacity: 4, webToken: WEB_TOKEN, setupToken: undefined });
 			const api = startInternalApi({
 				host: "127.0.0.1",
@@ -212,15 +209,14 @@ class FakeWorker {
 
 function askRequest(threadId: string, over: Partial<RunRequest> = {}): RunRequest {
 	return {
-		owner: { kind: "chat", threadId },
-		kind: "ask",
+		threadId,
 		profile: "ask",
 		prompt: "What is in a.txt?",
 		thinking: "high",
 		limits: { minutes: 10, costUsd: 1 },
 		session: `chat-${threadId}`,
 		resume: false,
-		threadId,
+		scratchDir: join(tmpdir(), "askbot-dispatch-no-scratch", threadId),
 		...over,
 	};
 }
@@ -231,10 +227,6 @@ interface Recorder {
 	usage: RunUsage[];
 	waiting: number;
 	progress: unknown[];
-	todos: unknown[];
-	questions: { args: unknown[]; dialog: Record<string, unknown> }[];
-	/** How the next question is answered. */
-	answer: { value: Promise<unknown> };
 }
 
 function recorder(): Recorder {
@@ -243,35 +235,19 @@ function recorder(): Recorder {
 		usage: [],
 		waiting: 0,
 		progress: [],
-		todos: [],
-		questions: [],
-		answer: { value: new Promise(() => {}) },
 		hooks: undefined as unknown as RunHooks,
 	};
-	const ask = (...args: unknown[]) => {
-		r.questions.push({ args: args.slice(0, -1), dialog: args.at(-1) as Record<string, unknown> });
-		return r.answer.value;
-	};
-	const ui = {
-		select: (title: string, options: string[], dialog: object) => ask(title, options, dialog),
-		input: (title: string, placeholder: string, dialog: object) => ask(title, placeholder, dialog),
-		editor: (title: string, prefill: string, dialog: object) => ask(title, prefill, dialog),
-		confirm: (title: string, message: string, dialog: object) => ask(title, message, dialog),
-		notify: () => {},
-	} as unknown as RunUi;
 	r.hooks = {
-		ui,
 		register: handle => void r.handles.push(handle),
 		onWaitingForWorker: () => void r.waiting++,
 		onProgress: p => void r.progress.push(p),
-		onTodos: t => void r.todos.push(t),
 		onUsage: u => void r.usage.push(u),
 	};
 	return r;
 }
 
 async function chatThread(db: Db, threadId: string): Promise<void> {
-	db.insertChat(threadId, "ask");
+	db.insertAskChat(threadId, "c1", "u1");
 }
 
 function bearer(token: string): RequestInit {
@@ -279,49 +255,32 @@ function bearer(token: string): RequestInit {
 }
 
 describe("worker dispatcher", () => {
-	test("an ask run: claim, artifacts, relay both ways, done with outputs (RUN-02, RUN-06, RUN-08, AGT-10, CHAT-07)", async () => {
+	test("an ask run: claim, artifacts, relay both ways, done with outputs (RUN-02, RUN-06, RUN-18, RUN-19, CHAT-07)", async () => {
 		const s = await setup();
 		const o = await s.start();
 		await chatThread(o.db, "t1");
 		const scratchDir = join(s.stateDir, "scratch", "t1");
 		await mkdir(join(scratchDir, "inputs"), { recursive: true });
 		await writeFile(join(scratchDir, "inputs", "a.txt"), "hello");
-		const filed: { title: string; body: string }[] = [];
 		const rec = recorder();
-		const resultP = o.dispatcher.runAgent(
-			askRequest("t1", {
-				scratchDir,
-				createIssue: {
-					repo: "o/r",
-					file: async (title, body) => {
-						filed.push({ title, body });
-						return { number: 9, url: "https://github.com/o/r/issues/9" };
-					},
-				},
-			}),
-			rec.hooks,
-		);
+		const resultP = o.dispatcher.runAgent(askRequest("t1", { scratchDir }), rec.hooks);
 		expect(rec.waiting).toBe(1);
 		expect(o.dispatcher.counts()).toMatchObject({ pending: 1, running: 0 });
-		expect(o.dispatcher.hasUnfinishedRun({ kind: "chat", threadId: "t1" })).toBe(true);
+		expect(o.dispatcher.hasUnfinishedRun("t1")).toBe(true);
 		expect(await (await fetch(`${o.api.url}/internal/scale`, bearer(SCALE_TOKEN))).json()).toEqual({ pendingRuns: 1 });
 
 		const w = await FakeWorker.connect(o.api.url, "worker-1");
 		const assign = await w.claim();
-		if (assign.kind !== "run") throw new Error("expected a run");
 		const { runId, token, spec } = assign;
 		expect(spec).toMatchObject({
 			runId,
-			kind: "ask",
 			profile: "ask",
 			resumeSession: false,
+			omp: { settings: { "compaction.enabled": true } },
 			skillsHash: "skills-hash",
 			providerKeys: { anthropic: "sk-test" },
-			createIssueRepo: "o/r",
 			scratch: { inputs: ["a.txt"] },
 		});
-		// MCP servers only for the implement profile (AGT-22).
-		expect(spec.omp.mcpServers).toEqual({});
 		expect(spec.credentials).toHaveLength(1);
 		expect(o.dispatcher.counts()).toMatchObject({ pending: 0, running: 1 });
 		expect(o.dispatcher.workers()).toMatchObject([{ id: "worker-1", runId, ompVersion: "18.12.1" }]);
@@ -344,31 +303,9 @@ describe("worker dispatcher", () => {
 		await until(() => o.db.getRun(runId)?.state === "running", "running");
 		expect(rec.handles).toHaveLength(1);
 		w.relay(runId, { t: "progress", tool: "read", intent: "reading a.txt", usage: USAGE, elapsedMs: 1200 });
-		w.relay(runId, { t: "todos", todos: [{ content: "Read a.txt", status: "in_progress" }] as never });
-		await until(() => rec.progress.length === 1 && rec.todos.length === 1, "progress and todos");
+		w.send({ t: "session-upload", runId });
+		await until(() => rec.progress.length === 1, "progress");
 		expect(rec.progress[0]).toMatchObject({ tool: "read", intent: "reading a.txt", elapsedMs: 1200 });
-
-		// A question: posted with a UiCallContext, its answer relayed, ✅ on the worker's ack (RUN-08, RUN-15).
-		const answer = Promise.withResolvers<unknown>();
-		rec.answer.value = answer.promise;
-		const uiSeq = w.relay(runId, { t: "ui", id: 2, method: "select", args: ["Which?", ["A", "B"]], dialog: {} });
-		await until(() => rec.questions.length === 1, "question");
-		const context = uiCallContext(rec.questions[0]!.dialog)!;
-		expect(context.key).toBe(`${runId}:2`);
-		expect(context.posted).toBeUndefined();
-		context.onPosted({ channelId: "c1", messageIds: ["m1", "m2"] });
-		expect(o.db.getQuestion(runId, "2")).toMatchObject({ channel_id: "c1", message_id: "m1,m2" });
-		answer.resolve("B");
-		expect((await w.down(m => m.t === "reply" && m.id === 2, "answer")).msg).toEqual({ t: "reply", id: 2, ok: true, value: "B" });
-		expect(await context.delivered).toBe(true);
-		expect(o.db.getQuestion(runId, "2")).toBeNull();
-		expect(uiSeq).toBeGreaterThan(0);
-
-		// create_issue runs in the orchestrator (AGT-10).
-		w.relay(runId, { t: "tool_call", id: 3, name: "create_issue", params: { title: "Bug", body: "Details" } });
-		const filedReply = await w.down(m => m.t === "reply" && m.id === 3, "tool reply");
-		expect(filedReply.msg).toMatchObject({ ok: true, value: { number: 9 } });
-		expect(filed).toEqual([{ title: "Bug", body: "Details" }]);
 
 		// Sign-in refresh through the orchestrator (CRED-03).
 		w.send({ t: "credential-request", runId, requestId: 5, provider: "p", credentialId: "1", accessToken: "old" });
@@ -391,10 +328,10 @@ describe("worker dispatcher", () => {
 		expect(queued).toBe(0);
 
 		// Duplicates are dropped but acknowledged.
-		const dup = w.relay(runId, { t: "todos", todos: [] });
-		w.relay(runId, { t: "todos", todos: [] }, dup);
+		const dup = w.relay(runId, { t: "progress", usage: USAGE, elapsedMs: 1300 });
+		w.relay(runId, { t: "progress", usage: USAGE, elapsedMs: 1300 }, dup);
 		await until(() => w.inbox.filter(m => m.t === "ack" && m.seq === dup).length === 2, "two acks");
-		expect(rec.todos).toHaveLength(2);
+		expect(rec.progress).toHaveLength(2);
 
 		w.relay(runId, { t: "usage", usage: USAGE });
 		const doneSeq = w.relay(runId, {
@@ -406,10 +343,20 @@ describe("worker dispatcher", () => {
 		expect(rec.usage).toEqual([USAGE]);
 		await w.next(m => m.t === "ack" && m.seq === doneSeq, "ack of done");
 		expect(o.db.getRun(runId)).toMatchObject({ state: "finished", outcome: "succeeded", result: null, omp_version: "18.12.2" });
-		expect(o.dispatcher.hasUnfinishedRun({ kind: "chat", threadId: "t1" })).toBe(false);
+		expect(o.dispatcher.hasUnfinishedRun("t1")).toBe(false);
 		expect(o.dispatcher.counts()).toEqual({ pending: 0, running: 0, oldestPendingMs: null });
 		// The lease died with the run.
 		expect((await fetch(art("skills"), bearer(token))).status).toBe(401);
+
+		// The thread's next turn resumes the stored session and continues the previous run (CHAT-03, DB-02).
+		const next = o.dispatcher.runAgent(askRequest("t1", { scratchDir, resume: true }), recorder().hooks);
+		const w2 = await FakeWorker.connect(o.api.url, "worker-2");
+		const again = await w2.claim();
+		expect(again.spec.resumeSession).toBe(true);
+		expect(o.db.getRun(again.runId)?.continues_run_id).toBe(runId);
+		expect(await (await fetch(`${o.api.url}${runArtifactPath(again.runId, "session")}`, bearer(again.token))).text()).toBe('{"type":"session"}\n');
+		w2.relay(again.runId, { t: "done", result: { output: { answer: "again" }, sessionFile: "s", usage: USAGE, oomKills: 0 } });
+		expect((await next).output).toEqual({ answer: "again" });
 	});
 
 	test("steering is queued (⏳) until the run registers and while the worker is away, then delivered (👀) (RUN-15)", async () => {
@@ -467,7 +414,7 @@ describe("worker dispatcher", () => {
 		expect(await handle.steer("late", "ann")).toBe("ended");
 	});
 
-	test("an orchestrator restart re-attaches: grace, outbox resent, the open question re-bound (RUN-06 to RUN-09)", async () => {
+	test("an orchestrator restart re-attaches: grace, outbox resent (RUN-06, RUN-07, RUN-09)", async () => {
 		const s = await setup();
 		const first = await s.start();
 		await chatThread(first.db, "t1");
@@ -477,9 +424,6 @@ describe("worker dispatcher", () => {
 		const { runId, token } = await w.claim();
 		w.relay(runId, { t: "registered" });
 		await until(() => rec1.handles.length === 1, "register");
-		w.relay(runId, { t: "ui", id: 7, method: "confirm", args: ["Proceed?", "Really?"], dialog: {} });
-		await until(() => rec1.questions.length === 1, "question");
-		uiCallContext(rec1.questions[0]!.dialog)!.onPosted({ channelId: "c1", messageIds: ["q1"] });
 		// The worker drops; a steer goes to the outbox.
 		w.close();
 		await until(() => first.dispatcher.workers().length === 0, "disconnect");
@@ -490,21 +434,12 @@ describe("worker dispatcher", () => {
 		await Bun.sleep(700);
 		const second = await s.start({ graceMs: 3000 });
 		const rec2 = recorder();
-		const answer = Promise.withResolvers<unknown>();
-		rec2.answer.value = answer.promise;
 		const resultP = second.dispatcher.runAgent(askRequest("t1"), rec2.hooks);
 		expect(rec2.handles).toHaveLength(1);
 		expect(rec2.waiting).toBe(0);
-		await until(() => rec2.questions.length === 1, "question re-invoked");
-		const context = uiCallContext(rec2.questions[0]!.dialog)!;
-		expect(context.key).toBe(`${runId}:7`);
-		expect(context.posted).toEqual({ channelId: "c1", messageIds: ["q1"] });
 
 		const back = await FakeWorker.connect(second.api.url, "worker-1", { runId, token });
 		expect((await back.down(m => m.t === "steer", "outbox resent")).msg).toMatchObject({ text: "[Discord @ann]: while away" });
-		answer.resolve(true);
-		expect((await back.down(m => m.t === "reply" && m.id === 7, "answer")).msg).toEqual({ t: "reply", id: 7, ok: true, value: true });
-		expect(await context.delivered).toBe(true);
 		// The worker continues its own numbering; the orchestrator remembers what it stored.
 		back.relay(runId, { t: "done", result: { output: { answer: "done" }, sessionFile: "s", usage: USAGE, oomKills: 0 } }, 10);
 		expect((await resultP).output).toEqual({ answer: "done" });
@@ -547,15 +482,15 @@ describe("worker dispatcher", () => {
 		await first.catch(() => {});
 		w.close();
 		await until(() => o.db.getRun(runId)?.state === "finished", "lost");
-		expect(o.dispatcher.hasUnfinishedRun({ kind: "chat", threadId: "t1" })).toBe(false);
+		expect(o.dispatcher.hasUnfinishedRun("t1")).toBe(false);
 		expect(o.dispatcher.runAgent(askRequest("t1"), recorder().hooks)).rejects.toBeInstanceOf(RunLost);
 		await Bun.sleep(10);
 		expect(o.db.getRun(runId)?.result).toBeNull();
 	});
 
-	test("caps keep runs in memory, not pending; mcp tests count only toward maxConcurrentRuns (RUN-01, AGT-21)", async () => {
+	test("caps keep runs in memory, not pending: maxChatSessions and maxConcurrentRuns (RUN-01, RUN-21)", async () => {
 		const s = await setup();
-		s.limits.value = { maxConcurrentJobs: 1, maxChatSessions: 1, maxConcurrentRuns: 4 };
+		s.limits.value = { maxChatSessions: 1, maxConcurrentRuns: 4 };
 		const o = await s.start();
 		for (const t of ["t1", "t2", "t3"]) await chatThread(o.db, t);
 		const a = recorder();
@@ -564,7 +499,7 @@ describe("worker dispatcher", () => {
 		const pb = o.dispatcher.runAgent(askRequest("t2"), b.hooks);
 		expect(o.dispatcher.counts().pending).toBe(1);
 		expect(o.dispatcher.pendingRuns()).toBe(1);
-		expect(o.dispatcher.hasUnfinishedRun({ kind: "chat", threadId: "t2" })).toBe(true);
+		expect(o.dispatcher.hasUnfinishedRun("t2")).toBe(true);
 		expect(b.waiting).toBe(1);
 		// Attaching again detaches the first caller and never starts a second run (RUN-21).
 		const attached = o.dispatcher.runAgent(askRequest("t1"), a.hooks);
@@ -582,32 +517,15 @@ describe("worker dispatcher", () => {
 		expect((await attached).output).toEqual({ answer: "a" });
 		expect(o.dispatcher.counts().pending).toBe(0);
 
-		// Caps back: the oldest waiting run becomes pending; the other keeps waiting for the one chat slot.
-		s.limits.value = { maxConcurrentJobs: 1, maxChatSessions: 1, maxConcurrentRuns: 4 };
+		// Caps back: the oldest waiting run becomes pending; the other keeps waiting for the one run slot.
+		s.limits.value = { maxChatSessions: 4, maxConcurrentRuns: 1 };
 		await until(() => o.dispatcher.counts().pending === 1, "t2 pending");
-		expect(o.db.runsInState("pending").map(r => r.chat_thread_id)).toEqual(["t2"]);
+		expect(o.db.runsInState("pending").map(r => r.thread_id)).toEqual(["t2"]);
 		const w2 = await FakeWorker.connect(o.api.url, "worker-2");
 		const assignB = await w2.claim();
-
-		// The chat slot is taken, but an mcp test only needs a run slot.
-		let mcpWaiting = 0;
-		let mcpStarted = 0;
-		const tested = o.dispatcher.mcpTest(
-			{ name: "echo", server: { command: "echo" } },
-			{ onWaitingForWorker: () => void mcpWaiting++, onStarted: () => void mcpStarted++ },
-		);
-		expect(mcpWaiting).toBe(1);
-		expect(o.dispatcher.counts().pending).toBe(1);
-		// AGT-21: the test's timeout starts only when a worker picks it up.
-		expect(mcpStarted).toBe(0);
-		const tester = await FakeWorker.connect(o.api.url, "worker-mcp");
-		const mcpAssign = await tester.claim();
-		expect(mcpStarted).toBe(1);
-		expect(mcpAssign).toMatchObject({ kind: "mcp-test", mcp: { name: "echo", server: { command: "echo" }, timeoutMs: 20_000 } });
-		tester.send({ t: "mcp-test-result", runId: mcpAssign.runId, ok: true, tools: ["echo_say"] });
-		expect(await tested).toEqual({ ok: true, tools: ["echo_say"] });
-		await tester.next(m => m.t === "lease-invalid", "mcp lease released");
-		expect(await o.dispatcher.mcpTest({ name: "__proto__", server: { command: "x" } })).toMatchObject({ ok: false });
+		await Bun.sleep(50);
+		expect(o.dispatcher.counts().pending).toBe(0);
+		expect(c.waiting).toBe(1);
 
 		// Aborting a run still waiting for a slot ends it at once; so does aborting one a worker claimed but never started (RUN-05).
 		await c.handles[0]!.abort("user");
@@ -746,17 +664,9 @@ describe("worker dispatcher", () => {
 		await until(() => second.dispatcher.workers().some(c => c.id === "worker-1"), "worker-1 connected");
 	});
 
-	test("unrunnable kinds fail clearly; oversized messages are dropped (RUN-16); unknown leases are refused", async () => {
+	test("invalid session keys fail clearly; oversized messages are dropped (RUN-16); unknown leases are refused", async () => {
 		const s = await setup();
 		const o = await s.start();
-		const issue = o.db.insertIssue("o/r", 1, "t");
-		const job = o.db.insertJob(issue.id, "plan");
-		expect(
-			o.dispatcher.runAgent(
-				{ ...askRequest("x"), owner: { kind: "job", jobId: job.id }, kind: "plan", profile: "plan", session: "issue-1-plan" },
-				recorder().hooks,
-			),
-		).rejects.toThrow("checkout");
 		expect(o.dispatcher.runAgent(askRequest("x", { session: "../escape" }), recorder().hooks)).rejects.toThrow("invalid session key");
 
 		const w = await FakeWorker.connect(o.api.url, "worker-1");
@@ -789,15 +699,12 @@ describe("worker dispatcher", () => {
 		expect(await openSocket(url, SCALE_TOKEN)).toBeUndefined();
 
 		// The web token only on /internal/admin/*; no other token there.
-		const git = `${GIT_PATH_PREFIX}acme/app.git/info/refs?service=git-upload-pack`;
 		expect(await status("/internal/admin/state", WEB_TOKEN)).toBe(200);
 		for (const token of [WORKER_TOKEN, SCALE_TOKEN, a.token]) expect(await status("/internal/admin/state", token)).toBe(401);
 		expect(await status(WORKER_WS_PATH, WEB_TOKEN)).toBe(401);
 		expect(await openSocket(url, WEB_TOKEN)).toBeUndefined();
 		expect(await status("/internal/scale", WEB_TOKEN)).toBe(401);
 		expect(await status(runArtifactPath(a.runId, "skills"), WEB_TOKEN)).toBe(401);
-		// The git endpoint takes only a lease token of a run on that repository (git.test.ts covers the lease side).
-		for (const token of [WEB_TOKEN, WORKER_TOKEN, SCALE_TOKEN, a.token]) expect(await status(git, token)).toBe(401);
 		expect(await openSocket(url, a.token)).toBeUndefined();
 	});
 });

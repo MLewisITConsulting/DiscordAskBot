@@ -6,11 +6,8 @@ import { join } from "node:path";
 import type { Subprocess } from "bun";
 import { type InternalApi, SCALE_PATH, startInternalApi } from "../../src/orchestrator/api/server";
 import type { MsgRef } from "../../src/orchestrator/discord/surface";
-import type { RunOwner } from "../../src/orchestrator/dispatch/dispatcher";
-import { createWorkerDispatcher, type WorkerDispatcher } from "../../src/orchestrator/dispatch/workers";
+import { createWorkerDispatcher, dispatchLimits, type WorkerDispatcher } from "../../src/orchestrator/dispatch/workers";
 import { type Controller, createController } from "../../src/orchestrator/engine/controller";
-import { createGitHub } from "../../src/orchestrator/github/app";
-import { createRepos } from "../../src/orchestrator/git/repos";
 import { shutdownOrchestrator } from "../../src/orchestrator/main";
 import { openAgentLog } from "../../src/orchestrator/store/agentlog";
 import { type Db, dbPath, openDb } from "../../src/orchestrator/store/db";
@@ -21,18 +18,16 @@ import { parseSettings } from "../../src/shared/config";
 import { setLogSink } from "../../src/shared/log";
 import { workerRoot } from "../../src/worker/status";
 import { createFakeDiscord, type FakeDiscord, type FakeMessage } from "../fakes/discord";
-import { type FakeGitHub, startFakeGitHub } from "../fakes/github";
 
 /**
  * Phase 3 exit (implementation.md §4): `/ask` end to end through the real controller, the real worker dispatcher and
  * internal API, and worker processes (`test/fixtures/worker-process.ts`: `runWorkerOnce` with the fixture agent host)
- * as separate OS processes. Discord and GitHub are the fakes. Covers the happy path with an attached file, an
+ * as separate OS processes. Discord is the fake. Covers the happy path with an attached file, an
  * orchestrator restart mid-run, a killed worker, and `/internal/scale`.
  */
 
 const WORKER_TOKEN = "phase3-worker-token";
 const SCALE_TOKEN = "phase3-scale-token";
-const WORK = "work-channel";
 const ASK = "ask-channel";
 const ALICE = "u-alice";
 /** Short enough to keep the lost-worker test quick; long enough that a worker starting under a loaded CI runner renews it in time. */
@@ -63,8 +58,8 @@ interface Orchestrator {
 	dispatcher: WorkerDispatcher;
 	api: InternalApi;
 	controller: Controller;
-	/** Owners whose run the engine attached to (the dispatcher's `register` hook ran), in order. */
-	attached: RunOwner[];
+	/** Threads whose run the engine attached to (the dispatcher's `register` hook ran), in order. */
+	attached: string[];
 	/** A crash-like stop: sockets closed abruptly, nothing aborted on the worker (RUN-09). */
 	stop(): Promise<void>;
 }
@@ -80,7 +75,6 @@ interface Worker {
 interface Harness {
 	stateDir: string;
 	discord: FakeDiscord;
-	gh: FakeGitHub;
 	orch: Orchestrator;
 	/** Every orchestrator log line of this test (the in-process components). */
 	logs: string[];
@@ -105,9 +99,7 @@ async function boot(): Promise<Harness> {
 	const ompDir = join(stateDir, "omp");
 	await ensureOmpAssetsDir(ompDir);
 
-	const gh = startFakeGitHub();
-	cleanups.push(() => gh.stop());
-	const discord = createFakeDiscord({ guildId: "g1", channels: [{ id: WORK, name: "work" }, { id: ASK, name: "ask" }] });
+	const discord = createFakeDiscord({ guildId: "g1", channels: [{ id: ASK, name: "ask" }] });
 	// Observation only: what each message said after each edit.
 	const edits = new Map<string, string[]>();
 	const edit = discord.edit.bind(discord);
@@ -154,11 +146,8 @@ async function boot(): Promise<Harness> {
 			await vault.initialize("admin", "correct horse battery");
 			vault.writeSettings(
 				parseSettings({
-					config: {
-						discord: { guildId: "g1", allowedUserIds: [ALICE], workChannelId: WORK, askChannelIds: [ASK] },
-						github: { appId: gh.appId, pollIntervalSeconds: 60 },
-					},
-					secrets: { discordToken: "discord-token", githubAppPrivateKey: gh.privateKey, providerKeys: { anthropic: "sk-ant-phase3" } },
+					config: { discord: { guildId: "g1", allowedUserIds: [ALICE], askChannelIds: [ASK] } },
+					secrets: { discordToken: "discord-token", providerKeys: { anthropic: "sk-ant-phase3" } },
 				}),
 			);
 		}
@@ -170,12 +159,7 @@ async function boot(): Promise<Harness> {
 			stateDir,
 			// Every worker here connects from 127.0.0.1 (architecture §6 address binding is tested in dispatch.test.ts).
 			bindWorkerAddresses: false,
-			limits: () => {
-				const config = settings()?.config;
-				if (!config) return undefined;
-				const { maxConcurrentJobs, maxChatSessions } = config.limits;
-				return { maxConcurrentJobs, maxChatSessions, maxConcurrentRuns: config.workers.maxConcurrentRuns ?? 4 };
-			},
+			limits: () => dispatchLimits(settings()?.config, 4),
 			reattachGraceMs: 10_000,
 			spec: {
 				stateDir,
@@ -188,12 +172,11 @@ async function boot(): Promise<Harness> {
 			credentialRequest: req => signins.handleCredentialRequest(req),
 			leaseMs: LEASE_MS,
 			sweepMs: 50,
-			repos: createRepos({ stateDir }),
 		});
-		const attached: RunOwner[] = [];
+		const attached: string[] = [];
 		const runAgent = dispatcher.runAgent.bind(dispatcher);
 		dispatcher.runAgent = (req, hooks, signal) =>
-			runAgent(req, { ...hooks, register: handle => (attached.push(req.owner), hooks.register?.(handle)) }, signal);
+			runAgent(req, { ...hooks, register: handle => (attached.push(req.threadId), hooks.register?.(handle)) }, signal);
 		const api = startInternalApi({
 			host: "127.0.0.1",
 			port,
@@ -212,12 +195,12 @@ async function boot(): Promise<Harness> {
 		port = Number(new URL(api.url).port);
 		const controller = createController({
 			stateDir,
+			ompDir,
 			db,
 			vault,
 			agentLog: await openAgentLog({ dir: join(stateDir, "logs", "agent") }),
 			dispatcher,
 			connectDiscord: () => discord,
-			connectGitHub: ({ appId, privateKey, labels }) => createGitHub({ appId, privateKey, labels, baseUrl: gh.url, throttle: false }),
 		});
 		await controller.apply();
 		expect(controller.status()).toMatchObject({ phase: "running", error: undefined });
@@ -236,7 +219,6 @@ async function boot(): Promise<Harness> {
 	const h: Harness = {
 		stateDir,
 		discord,
-		gh,
 		orch: await start(true),
 		logs,
 		edits,
@@ -287,7 +269,6 @@ async function ask(h: Harness, prompt: string, files: { name: string; content: s
 }
 
 const statusMessages = (h: Harness, threadId: string) => h.discord.messages(threadId).filter(m => m.content.includes("**Answering**"));
-const todoMessage = (h: Harness, threadId: string, item: string) => h.discord.messages(threadId).find(m => m.content.includes(item));
 const withFile = (h: Harness, threadId: string, name: string) => h.discord.messages(threadId).filter(m => m.files.some(f => f.name === name));
 const said = (h: Harness, threadId: string, text: string) => h.discord.messages(threadId).filter(m => m.content.includes(text));
 
@@ -296,12 +277,15 @@ function fileText(m: FakeMessage, name: string): string {
 	return typeof data === "string" ? data : new TextDecoder().decode(data);
 }
 
+/** The thread's run is running on a worker: its host registered. */
+const running = (h: Harness, threadId: string) => runOf(h, threadId)?.state === "running";
+
 function runOf(h: Harness, threadId: string) {
-	return h.orch.db.currentRun("chat_thread_id", threadId);
+	return h.orch.db.currentRun(threadId);
 }
 
 describe("phase 3 exit", () => {
-	test("/ask with a file: progress, to-dos, answer.md and the output file; the worker exits 0 and leaves nothing", async () => {
+	test("/ask with a file: progress, answer.md and the output file; the worker exits 0 and leaves nothing", async () => {
 		const h = await boot();
 		const threadId = await ask(h, "fixture:chatFile summarise the attached notes", [
 			{ name: "notes.txt", content: "Quarterly numbers are up 12%.\nSecond line.\n" },
@@ -321,11 +305,6 @@ describe("phase 3 exit", () => {
 		expect(status!.content).toContain("$0.50");
 		expect(status!.content).not.toContain("↳");
 
-		const todos = todoMessage(h, threadId, "Read the input")!;
-		expect(todos.edits).toBeGreaterThanOrEqual(1);
-		expect(todos.content).toContain("Write the summary");
-		expect(h.edits.get(todos.id)!.some(c => /Read the input/.test(c))).toBe(true);
-
 		const answers = withFile(h, threadId, "answer.md");
 		expect(answers).toHaveLength(1);
 		expect(fileText(answers[0]!, "answer.md")).toContain("Summarised `notes.txt` into `outputs/summary.txt`.");
@@ -336,6 +315,7 @@ describe("phase 3 exit", () => {
 
 		const usage = h.orch.db.raw.query<{ cost_usd: number }, [string]>("SELECT cost_usd FROM agent_runs WHERE thread_id = ?").all(threadId);
 		expect(usage.map(u => u.cost_usd)).toEqual([0.5]);
+		expect(h.orch.db.getAskChat(threadId)?.session_file).toBe(`chat-${threadId}`);
 		expect(runOf(h, threadId)).toBeNull();
 	}, 20_000);
 
@@ -343,7 +323,7 @@ describe("phase 3 exit", () => {
 		const h = await boot();
 		const threadId = await ask(h, "fixture:chatHeld hold until told");
 		const worker = h.spawnWorker();
-		await until(() => !!todoMessage(h, threadId, "Wait to be told to finish"), "the held run's to-do list");
+		await until(() => running(h, threadId), "the held run");
 		await h.discord.settled();
 		const [status] = statusMessages(h, threadId);
 		const editsBefore = status!.edits;
@@ -351,10 +331,9 @@ describe("phase 3 exit", () => {
 		const logsBefore = h.logs.length;
 
 		await h.restart();
-		const owner: RunOwner = { kind: "chat", threadId };
-		await until(() => h.orch.attached.some(o => o.kind === "chat" && o.threadId === threadId), "the chat to re-attach");
+		await until(() => h.orch.attached.includes(threadId), "the chat to re-attach");
 		await until(() => h.logs.slice(logsBefore).some(l => l.includes('"msg":"worker re-attached"') && l.includes(runId)), "the worker to re-announce its lease");
-		expect(h.orch.dispatcher.hasUnfinishedRun(owner)).toBe(true);
+		expect(h.orch.dispatcher.hasUnfinishedRun(threadId)).toBe(true);
 
 		const steer = await h.discord.emitMessage({ channelId: threadId, content: "please finish now", actor: h.discord.actor(ALICE, { username: "alice" }) });
 		await until(() => said(h, threadId, "✅ **Done.**").length === 1, "the chat to finish after the restart");
@@ -364,7 +343,6 @@ describe("phase 3 exit", () => {
 
 		expect(statusMessages(h, threadId).map(m => m.id)).toEqual([status!.id]);
 		expect(status!.edits).toBeGreaterThan(editsBefore);
-		expect(h.discord.messages(threadId).filter(m => m.content.includes("Wait to be told to finish"))).toHaveLength(1);
 		expect(withFile(h, threadId, "answer.md")).toHaveLength(1);
 		expect(fileText(withFile(h, threadId, "answer.md")[0]!, "answer.md")).toContain("Held run finished.");
 		expect(withFile(h, threadId, "held.txt")).toHaveLength(1);
@@ -380,8 +358,8 @@ describe("phase 3 exit", () => {
 
 		await h.restart();
 		h.spawnWorker();
-		// The fixture host only holds (and lists this to-do) when it got the original prompt.
-		await until(() => !!todoMessage(h, threadId, "Wait to be told to finish"), "the re-issued turn to run");
+		// The fixture host only holds when it got the original prompt.
+		await until(() => running(h, threadId), "the re-issued turn to run");
 		await h.discord.emitMessage({ channelId: threadId, content: "please finish now", actor: h.discord.actor(ALICE, { username: "alice" }) });
 		await until(() => said(h, threadId, "✅ **Done.**").length === 1, "the answer after the restart");
 		expect(withFile(h, threadId, "answer.md")).toHaveLength(1);
@@ -393,10 +371,10 @@ describe("phase 3 exit", () => {
 		const threadId = await ask(h, "fixture:chatHeld hold until told", [], stranger);
 		// Pending runs are dropped at a restart (no request to continue); an assigned or running one survives.
 		h.spawnWorker();
-		await until(() => !!todoMessage(h, threadId, "Wait to be told to finish"), "the held run to be running");
+		await until(() => running(h, threadId), "the held run to be running");
 
 		await h.restart();
-		expect(h.orch.dispatcher.hasUnfinishedRun({ kind: "chat", threadId })).toBe(true);
+		expect(h.orch.dispatcher.hasUnfinishedRun(threadId)).toBe(true);
 		const second = await h.discord.emitCommand({ command: "ask", options: { prompt: "another one" }, actor: stranger, channelId: ASK });
 		expect(second.responses.find(r => r.type === "editReply" || r.type === "reply")?.msg?.content).toBe(
 			`You already have a request running in <#${threadId}>; wait for it to finish.`,
@@ -410,7 +388,7 @@ describe("phase 3 exit", () => {
 		const h = await boot();
 		const threadId = await ask(h, "fixture:chatHeld hold until killed");
 		const worker = h.spawnWorker();
-		await until(() => !!todoMessage(h, threadId, "Wait to be told to finish"), "the held run's to-do list");
+		await until(() => running(h, threadId), "the held run");
 		const host = Bun.spawnSync(["pgrep", "-P", String(worker.proc.pid)]).stdout.toString().split("\n").filter(Boolean).map(Number);
 		hostPidsOf.set(worker, host);
 		expect(host.length).toBeGreaterThan(0);
@@ -424,7 +402,7 @@ describe("phase 3 exit", () => {
 		expect(statusMessages(h, threadId)).toHaveLength(1);
 		expect(h.discord.message(threadId)?.content).toStartWith("❌");
 		expect(withFile(h, threadId, "answer.md")).toHaveLength(0);
-		expect(h.orch.dispatcher.hasUnfinishedRun({ kind: "chat", threadId })).toBe(false);
+		expect(h.orch.dispatcher.hasUnfinishedRun(threadId)).toBe(false);
 		// The orphaned agent host winds down on its own once its worker is gone.
 		await until(() => host.every(pid => !alive(pid)), "the orphaned agent host to exit", 7_000);
 	}, 25_000);
@@ -432,13 +410,13 @@ describe("phase 3 exit", () => {
 	test("an omp configuration saved while a run is live reaches the next run without a restart; the live run keeps its own (AGT-23)", async () => {
 		const h = await boot();
 		const dumps = join(h.stateDir, "host-dumps");
-		h.orch.vault.writeOmpConfig({ settings: { "git.enabled": false }, mcpServers: {} });
+		h.orch.vault.writeOmpConfig({ settings: { "compaction.enabled": false } });
 		const held = await ask(h, "fixture:chatHeld hold until told");
 		const first = h.spawnWorker({ env: { TEST_HOST_DUMP_DIR: dumps } });
-		await until(() => !!todoMessage(h, held, "Wait to be told to finish"), "the held run's to-do list");
+		await until(() => running(h, held), "the held run");
 
 		// Saved like the omp page does, with the engine running: no apply, no restart.
-		h.orch.vault.writeOmpConfig({ settings: { "git.enabled": true }, mcpServers: {} });
+		h.orch.vault.writeOmpConfig({ settings: { "compaction.enabled": true } });
 		const next = await ask(h, "fixture:chatFile one more", [{ name: "b.txt", content: "beta\n" }]);
 		const second = h.spawnWorker({ env: { TEST_HOST_DUMP_DIR: dumps } });
 		await until(() => said(h, next, "✅ **Done.**").length === 1, "the second chat to finish");
@@ -447,18 +425,18 @@ describe("phase 3 exit", () => {
 		expect(await first.exited).toBe(0);
 		expect(await second.exited).toBe(0);
 
-		const runIds = h.orch.db.raw.query<{ id: string; chat_thread_id: string }, []>("SELECT id, chat_thread_id FROM runs").all();
+		const runIds = h.orch.db.raw.query<{ id: string; thread_id: string }, []>("SELECT id, thread_id FROM runs").all();
 		const dumpOf = (threadId: string): unknown => {
-			const id = runIds.find(r => r.chat_thread_id === threadId)!.id;
+			const id = runIds.find(r => r.thread_id === threadId)!.id;
 			return JSON.parse(readFileSync(join(dumps, `${id}.json`), "utf8"));
 		};
-		expect(dumpOf(held)).toMatchObject({ opts: { omp: { settings: { "git.enabled": false }, mcpServers: {} } } });
-		expect(dumpOf(next)).toMatchObject({ opts: { omp: { settings: { "git.enabled": true }, mcpServers: {} } } });
+		expect(dumpOf(held)).toMatchObject({ opts: { omp: { settings: { "compaction.enabled": false } } } });
+		expect(dumpOf(next)).toMatchObject({ opts: { omp: { settings: { "compaction.enabled": true } } } });
 		// The live run was not restarted or re-sent anything: one run, one start, one dump per thread.
 		expect(readdirSync(dumps)).toHaveLength(2);
 	}, 30_000);
 
-	test("the agent host gets provider keys but no Discord token, GitHub App key or installation token (SEC-01, AGT-02)", async () => {
+	test("the agent host gets provider keys but no Discord token (SEC-01, AGT-02)", async () => {
 		const h = await boot();
 		const dumps = join(h.stateDir, "host-dumps");
 		const threadId = await ask(h, "fixture:chatFile what does the file say", [{ name: "n.txt", content: "hello\n" }]);
@@ -472,9 +450,6 @@ describe("phase 3 exit", () => {
 		expect(seen).toContain("sk-ant-phase3");
 		expect(seen).toContain("what does the file say");
 		expect(seen).not.toContain("discord-token");
-		for (const line of h.gh.privateKey.split("\n").filter(l => l.length > 20)) expect(seen).not.toContain(line);
-		expect(seen).not.toContain("ghs_");
-		expect(seen).not.toContain("PRIVATE KEY");
 	}, 20_000);
 
 	test("an agent host OOM-killed mid-run fails the run with the signal and says memory most likely ran out (AGT-05, AGT-17)", async () => {

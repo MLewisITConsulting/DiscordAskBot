@@ -43,7 +43,7 @@ interface Host {
  * Spawns `entry` with an IPC channel. Requests are answered by `answers` (by message type) unless it returns
  * `undefined`; `session_file` is accepted by default.
  */
-function spawnHost(entry: string, answers: Partial<Record<"ui" | "tool_call" | "session_file" | "credential_request", (m: never) => Answer | Promise<Answer> | undefined>> = {}, env: Record<string, string> = {}): Host {
+function spawnHost(entry: string, answers: Partial<Record<"session_file" | "credential_request", (m: never) => Answer | Promise<Answer> | undefined>> = {}, env: Record<string, string> = {}): Host {
 	const messages: ChildMessage[] = [];
 	const waiters: { test(m: ChildMessage): boolean; resolve(m: ChildMessage): void }[] = [];
 	const proc = Bun.spawn([process.execPath, entry], {
@@ -59,8 +59,7 @@ function spawnHost(entry: string, answers: Partial<Record<"ui" | "tool_call" | "
 					waiter.resolve(message);
 				}
 			}
-			if (message.t === "ui" || message.t === "tool_call" || message.t === "session_file" || message.t === "credential_request") {
-				if (message.t === "ui" && message.method === "notify") return;
+			if (message.t === "session_file" || message.t === "credential_request") {
 				const handler = answers[message.t] ?? (message.t === "session_file" ? () => ({ ok: true }) : undefined);
 				const answer = handler?.(message as never);
 				if (answer) void Promise.resolve(answer).then(a => proc.send({ t: "reply", id: message.id, ...a } satisfies ParentMessage));
@@ -86,16 +85,18 @@ function spawnHost(entry: string, answers: Partial<Record<"ui" | "tool_call" | "
 const RUNTIME: HostRuntime = { agentDir: "/run/omp-agent", ompDir: "/run/omp", providerKeys: { openai: "sk-test" } };
 
 function startOptions(prompt: string, overrides: Partial<StartOptions> = {}): StartOptions {
+	const scratchRoot = tempDir();
 	return {
 		runId: "run-1",
-		cwd: "/run/work",
+		cwd: scratchRoot,
 		sessionDir: join(tempDir(), "sessions"),
-		profile: "plan",
+		profile: "ask",
 		thinking: "low",
 		prompt,
 		limits: { minutes: 5, costUsd: 1 },
-		omp: { settings: {}, mcpServers: {} },
+		omp: { settings: {} },
 		wantLoadout: false,
+		scratchRoot,
 		...overrides,
 	};
 }
@@ -112,11 +113,10 @@ describe("agent host protocol", () => {
 	test("messages arrive in emission order, the session file waits for its reply, and the result round-trips", async () => {
 		const host = spawnHost(FIXTURE);
 		const opts = start(host, "happy", {
-			omp: { settings: { "task.maxDepth": 2 }, mcpServers: {} },
+			omp: { settings: { "task.maxDepth": 2 } },
 			outputSchema: { type: "object" },
 			resumeFile: "/run/sessions/old.jsonl",
 			wantLoadout: true,
-			createIssueRepo: "acme/widgets",
 		});
 		const end = await host.end();
 		expect(await host.exited).toBe(0);
@@ -127,7 +127,6 @@ describe("agent host protocol", () => {
 			"registered",
 			"progress",
 			"transcript:tool_start",
-			"todos",
 			"progress",
 			"usage",
 			"transcript:run_end",
@@ -137,11 +136,11 @@ describe("agent host protocol", () => {
 		expect(host.messages[0]).toEqual({ t: "session_file", id: 1, path: sessionFile });
 		if (end.t !== "done") throw new Error(end.message);
 		expect(end.result).toMatchObject({ sessionFile, usage: { costUsd: 0.5 }, oomKills: 2 });
-		// What the session saw: the runtime and the serializable options (createIssueRepo/wantLoadout become callbacks).
+		// What the session saw: the runtime and the serializable options (wantLoadout becomes a callback).
 		const output = end.result.output as { runtime: HostRuntime; data: Record<string, unknown>; hasLoadoutCallback: boolean };
 		expect(output.runtime).toEqual(RUNTIME);
 		expect(output.hasLoadoutCallback).toBe(true);
-		const { createIssueRepo: _c, wantLoadout: _w, ...data } = opts;
+		const { wantLoadout: _w, ...data } = opts;
 		expect(output.data).toEqual(data);
 	});
 
@@ -154,69 +153,16 @@ describe("agent host protocol", () => {
 	});
 
 	test("an ask run writes its outputs into the scratch root", async () => {
-		const scratchRoot = tempDir();
 		const host = spawnHost(FIXTURE);
-		start(host, "happy", { profile: "ask", scratchRoot });
+		const opts = start(host, "happy");
 		expect((await host.end()).t).toBe("done");
-		expect(await Bun.file(join(scratchRoot, "outputs", "answer.md")).text()).toBe("fixture answer\n");
+		expect(await Bun.file(join(opts.scratchRoot, "outputs", "answer.md")).text()).toBe("fixture answer\n");
 	});
 
 	test("a refused session_file fails the run before it prompts", async () => {
 		const host = spawnHost(FIXTURE, { session_file: () => ({ ok: false, error: "db is locked" }) });
 		start(host, "sessionFileRejected");
 		expect(await host.end()).toEqual({ t: "failed", message: "db is locked", name: "Error" });
-	});
-
-	test("questions go out with their dialog data, answers come back, and the wait is excluded from run time", async () => {
-		const host = spawnHost(FIXTURE, {
-			ui: async (m: Extract<ChildMessage, { t: "ui" }>) => {
-				if (m.method === "askDialog") {
-					await Bun.sleep(60);
-					return { ok: true, value: { kind: "submit", results: [{ id: "q", question: "Which?", options: ["a", "b"], multi: false, selectedOptions: ["b"] }] } };
-				}
-				return { ok: true, value: m.args[0] === "Sure?" && m.args[1] === "really" };
-			},
-		});
-		start(host, "ask");
-		const end = await host.end();
-		if (end.t !== "done") throw new Error(end.message);
-		const output = end.result.output as { answer: { results: { selectedOptions: string[] }[] }; confirmed: boolean; pausedMs: number };
-		expect(output.answer.results[0]!.selectedOptions).toEqual(["b"]);
-		expect(output.confirmed).toBe(true);
-		expect(output.pausedMs).toBeGreaterThanOrEqual(50);
-		const asks = host.messages.filter(m => m.t === "ui");
-		expect(asks[0]).toMatchObject({ method: "askDialog", dialog: { timeout: 1234, initialIndex: 1 } });
-		expect(asks.at(-1)).toMatchObject({ method: "notify", args: ["heads up", "warning"] });
-	});
-
-	test("a question aborted in the session is cancelled with ui_cancel", async () => {
-		const host = spawnHost(FIXTURE, { ui: () => undefined });
-		start(host, "cancel");
-		const end = await host.end();
-		const asked = await host.next("ui");
-		expect(await host.next("ui_cancel")).toEqual({ t: "ui_cancel", id: asked.id });
-		expect(end.t === "done" && end.result.output).toEqual({ name: "AbortError" });
-	});
-
-	test("a failed answer surfaces as an error in the question call", async () => {
-		const host = spawnHost(FIXTURE, { ui: () => ({ ok: false, error: "discord is down" }) });
-		start(host, "ask");
-		expect(await host.end()).toMatchObject({ t: "failed", message: "discord is down" });
-	});
-
-	test("create_issue is a tool_call; its result and its errors reach the session", async () => {
-		const host = spawnHost(FIXTURE, {
-			tool_call: (m: Extract<ChildMessage, { t: "tool_call" }>) =>
-				m.params.title === "boom" ? { ok: false, error: "GitHub said no" } : { ok: true, value: { number: 7, url: "https://github.com/acme/widgets/issues/7" } },
-		});
-		start(host, "issue", { profile: "chat", createIssueRepo: "acme/widgets" });
-		const end = await host.end();
-		expect(end.t === "done" && end.result.output).toEqual({
-			repo: "acme/widgets",
-			filed: { number: 7, url: "https://github.com/acme/widgets/issues/7" },
-			failure: "GitHub said no",
-		});
-		expect(host.messages.find(m => m.t === "tool_call")).toMatchObject({ name: "create_issue", params: { title: "Title", body: "Body" } });
 	});
 
 	test("credential_request carries the sign-in and resolves with the orchestrator's token", async () => {

@@ -6,7 +6,7 @@ import type { WorkerPhase } from "./wire";
 /**
  * Web ↔ orchestrator admin API (architecture §4.5 `/internal/admin/*`). The web pod holds no database or vault: every
  * read and write goes through these routes. Auth: `Authorization: Bearer <web-api-token>` (SEC-14, constant-time compare).
- * The admin acting is passed as `X-Askbot-Admin: <username>` on writes so the orchestrator can log it (WEB-29).
+ * The admin acting is passed as `X-Askbot-Admin: <username>` on writes so the orchestrator can log it.
  * Errors: non-2xx with `{ error: string }`; 400 = validation (message is shown to the admin), 401 = bad web token,
  * 409 = wrong vault state (e.g. setup after setup), 429 never (the login throttle lives in web, WEB-03).
  *

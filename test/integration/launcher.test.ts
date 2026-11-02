@@ -128,7 +128,7 @@ const WORKER_SETTINGS = {
 	secret: "askbot_worker_token",
 	memoryBytes: 4 * 1024 ** 3,
 	cpus: 2,
-	diskBytes: 20 * 1024 ** 3,
+	diskBytes: 2 * 1024 ** 3,
 	claimTimeoutMs: 15_000,
 	orchestratorUrl: "http://orchestrator:8081",
 };
@@ -269,7 +269,7 @@ describe("scaling (LCH-02)", () => {
 			env: {
 				ASKBOT_ORCHESTRATOR_URL: "http://orchestrator:8081",
 				ASKBOT_WORKER_TOKEN_FILE: "/run/secrets/worker_token",
-				ASKBOT_WORKER_DISK: String(20 * 1024 ** 3),
+				ASKBOT_WORKER_DISK: String(2 * 1024 ** 3),
 				ASKBOT_WORKER_CLAIM_TIMEOUT: "15000ms",
 			},
 			resource_limits: {

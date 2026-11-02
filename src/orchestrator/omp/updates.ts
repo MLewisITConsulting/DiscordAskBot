@@ -1,4 +1,4 @@
-import { type OmpAttempt, type OmpUpdateView, installedByText } from "../../shared/adminOmp";
+import { AUTO_UPDATE_BY, type OmpAttempt, type OmpUpdateView, installedByText } from "../../shared/adminOmp";
 import { errorMessage, log } from "../../shared/log";
 import { OMP_PACKAGE, outputTail, SEMVER } from "../../shared/ompPins";
 import type { AppIdentity } from "../../shared/version";
@@ -7,10 +7,11 @@ import type { Db } from "../store/db";
 import { type CopyInstaller, imageInstaller, type OmpRuntimes, openOmpRuntimes } from "./runtime";
 
 /**
- * In-place omp updates for workers (requirements UPD-02 to UPD-05, architecture UPD-06 to UPD-10; ported from DevForge
- * `ompUpdate.ts`, which updated its own process and restarted). The orchestrator checks npm, and on an approval installs
- * the new omp as a packed runtime copy that new workers download (UPD-07); nothing restarts, and the orchestrator itself
- * keeps the image's omp (UPD-10). Check results, the last attempt and the Discord notice are kept in `kv`.
+ * In-place omp updates for workers (requirements UPD-02 to UPD-05, architecture UPD-06 to UPD-10). The orchestrator
+ * checks npm, and on an approval on `/admin/omp` (WEB-33), or automatically with `omp.autoUpdate`, installs the new omp
+ * as a packed runtime copy that new workers download (UPD-07); nothing restarts, and the orchestrator itself keeps the
+ * image's omp (UPD-10). Check results and the last attempt are kept in `kv` (architecture §8 "State"); nothing goes to
+ * Discord.
  */
 
 export const REGISTRY_URL = `https://registry.npmjs.org/${OMP_PACKAGE}/latest`;
@@ -20,20 +21,13 @@ const KEY_LATEST = "omp.update.latest";
 const KEY_CHECKED_AT = "omp.update.checkedAt";
 const KEY_CHECK_ERROR = "omp.update.checkError";
 const KEY_ATTEMPT = "omp.update.attempt";
-const KEY_NOTICE = "omp.update.notice";
 
 const CHECK_TIMEOUT_MS = 10_000;
 
-/** The Discord notice (message with the Approve button) most recently posted. */
-export interface OmpNotice {
-	version: string;
-	channelId: string;
-	messageId: string;
-	/** False once the message was closed (approved or superseded). */
-	buttons: boolean;
-}
+export type InstallResult = { ok: true; copy: string } | { ok: false; error: string; log?: string };
 
-export type InstallResult = { ok: true; copy: string } | { ok: false; error: string; log?: string; refused?: boolean };
+/** An install request: refused at once (stale, already installing, outside the image), or started with its outcome to come. */
+export type InstallStart = { started: false; error: string } | { started: true; done: Promise<InstallResult> };
 
 /** What the worker dispatcher needs: the copy for a run's spec, its archive, and canary failures (UPD-07, UPD-08). */
 export interface OmpRuntimeSource {
@@ -44,24 +38,19 @@ export interface OmpRuntimeSource {
 
 export interface OmpUpdater extends OmpRuntimeSource {
 	status(): OmpUpdateView;
-	/** npm's latest when it is newer than the omp new workers would use. */
-	updateAvailable(): string | undefined;
-	/** Asks the npm registry (10 s timeout); failures are stored as `checkError`. Never throws. */
+	/**
+	 * Asks the npm registry (10 s timeout); failures are stored as `checkError`. Never throws. With `omp.autoUpdate` on,
+	 * a newer omp is then installed at once (UPD-02).
+	 */
 	check(): Promise<OmpUpdateView>;
-	/** Called after every check, install and canary failure. */
-	subscribe(listener: () => void): () => void;
 	/** UPD-09 cleanup, then a check after `checkDelayMs` and every `checkIntervalMs`. */
 	start(): void;
 	stop(): void;
 	/**
-	 * UPD-06 for `version`, approved by `by`. Claims the install synchronously, so a second call is refused (UPD-03).
-	 * An `unattended` install saves its final attempt as not reported, so the Discord notices post it.
+	 * UPD-06 for `version`, started by `by` (the admin's username, or `AUTO_UPDATE_BY`). Claims the install
+	 * synchronously, so a stale request and a second concurrent one are refused (UPD-03).
 	 */
-	install(version: string, by: string, opts?: { unattended?: boolean }): Promise<InstallResult>;
-	notice(): OmpNotice | undefined;
-	setNotice(notice: OmpNotice | undefined): void;
-	/** Marks the last attempt as posted in Discord. */
-	markReported(): void;
+	install(version: string, by: string): InstallStart;
 }
 
 export interface OmpUpdaterOptions {
@@ -72,6 +61,8 @@ export interface OmpUpdaterOptions {
 	identity: AppIdentity;
 	/** The image's omp version. */
 	imageOmpVersion: string;
+	/** `omp.autoUpdate` from the stored settings (off while they are locked or unsaved). */
+	autoUpdate?: () => boolean;
 	/** Makes the copy's app tree; default `imageInstaller` over `imageAppDir`. */
 	installer?: CopyInstaller;
 	/** The image's app root, copied by the default installer. */
@@ -99,8 +90,8 @@ export function createOmpUpdater(opts: OmpUpdaterOptions): OmpUpdater {
 	const runtimes: OmpRuntimes | undefined = opts.runtimeDir
 		? openOmpRuntimes({ dir: opts.runtimeDir, identity: opts.identity, assignedRuns: () => db.runsInState("assigned").map(row => row.id) })
 		: undefined;
-	const listeners = new Set<() => void>();
 	let installing: OmpUpdateView["installing"];
+	let stopped = false;
 	let firstCheck: ReturnType<typeof setTimeout> | undefined;
 	let interval: ReturnType<typeof setInterval> | undefined;
 
@@ -112,17 +103,7 @@ export function createOmpUpdater(opts: OmpUpdaterOptions): OmpUpdater {
 	// An install the orchestrator did not live to finish.
 	const unfinished = readAttempt();
 	if (unfinished?.outcome === "installing") {
-		saveAttempt({ ...unfinished, outcome: "failed", error: "the orchestrator restarted during the install", at: new Date().toISOString(), reported: false });
-	}
-
-	function notify(): void {
-		for (const listener of listeners) {
-			try {
-				listener();
-			} catch (err) {
-				log("warn", "omp update listener failed", { error: errorMessage(err) });
-			}
-		}
+		saveAttempt({ ...unfinished, outcome: "failed", error: "the orchestrator restarted during the install", at: new Date().toISOString() });
 	}
 
 	function latest(): string | undefined {
@@ -130,6 +111,16 @@ export function createOmpUpdater(opts: OmpUpdaterOptions): OmpUpdater {
 		return value && SEMVER.test(value) ? value : undefined;
 	}
 
+	function autoUpdateOn(): boolean {
+		try {
+			return opts.autoUpdate?.() ?? false;
+		} catch (err) {
+			log("warn", "could not read omp.autoUpdate", { error: errorMessage(err) });
+			return false;
+		}
+	}
+
+	/** npm's latest when it is newer than the omp new workers would use. */
 	function updateAvailable(): string | undefined {
 		const version = latest();
 		const current = workerVersion();
@@ -150,7 +141,8 @@ export function createOmpUpdater(opts: OmpUpdaterOptions): OmpUpdater {
 			supported: runtimes !== undefined,
 			...(runtimes ? {} : { unsupportedReason: UNSUPPORTED }),
 			...(installing ? { installing: { ...installing } } : {}),
-			lastAttempt: readAttempt(),
+			attempt: readAttempt(),
+			autoUpdate: autoUpdateOn(),
 		};
 	}
 
@@ -168,12 +160,37 @@ export function createOmpUpdater(opts: OmpUpdaterOptions): OmpUpdater {
 			db.kvSet(KEY_CHECK_ERROR, errorMessage(err));
 			log("warn", "omp update check failed", { error: errorMessage(err) });
 		}
-		notify();
+		autoInstall();
 		return status();
 	}
 
-	async function install(version: string, by: string, opts?: { unattended?: boolean }): Promise<InstallResult> {
-		const refuse = (error: string): InstallResult => ({ ok: false, error, refused: true });
+	async function runInstall(runtimes: OmpRuntimes, base: OmpAttempt): Promise<InstallResult> {
+		const { version, by } = base;
+		try {
+			const result = await runtimes.create({ version, by, installer });
+			const at = new Date().toISOString();
+			if (result.ok) {
+				saveAttempt({ ...base, outcome: "installed", copy: result.copy.copy, log: outputTail(result.output), at });
+				log("info", "omp update installed for workers", { version, copy: result.copy.copy, sizeBytes: result.copy.size });
+				return { ok: true, copy: result.copy.copy };
+			}
+			const tail = outputTail(result.output);
+			saveAttempt({ ...base, outcome: "failed", error: result.error, log: tail, at });
+			log("error", "omp update failed", { version, error: result.error });
+			return { ok: false, error: result.error, log: tail };
+		} catch (err) {
+			saveAttempt({ ...base, outcome: "failed", error: errorMessage(err), at: new Date().toISOString() });
+			log("error", "omp update failed", { version, error: errorMessage(err) });
+			return { ok: false, error: errorMessage(err) };
+		} finally {
+			installing = undefined;
+			// A newer omp found while this one installed starts now (UPD-02).
+			if (!stopped) autoInstall();
+		}
+	}
+
+	function install(version: string, by: string): InstallStart {
+		const refuse = (error: string): InstallStart => ({ started: false, error });
 		if (!runtimes) return refuse(UNSUPPORTED);
 		if (installing) return refuse(`omp ${installing.version} is already being installed (${installedByText(installing.by)})`);
 		if (version !== updateAvailable()) return refuse(`omp ${version} is no longer the update on offer`);
@@ -182,23 +199,21 @@ export function createOmpUpdater(opts: OmpUpdaterOptions): OmpUpdater {
 		const base: OmpAttempt = { version, from: workerVersion(), by, outcome: "installing", at: startedAt };
 		saveAttempt(base);
 		log("info", "omp update started", { version, from: base.from, by });
-		notify();
-		try {
-			const result = await runtimes.create({ version, by, installer });
-			const at = new Date().toISOString();
-			if (result.ok) {
-				saveAttempt({ ...base, outcome: "installed", copy: result.copy.copy, log: outputTail(result.output), at, reported: !opts?.unattended });
-				log("info", "omp update installed for workers", { version, copy: result.copy.copy, sizeBytes: result.copy.size });
-				return { ok: true, copy: result.copy.copy };
-			}
-			const tail = outputTail(result.output);
-			saveAttempt({ ...base, outcome: "failed", error: result.error, log: tail, at, reported: !opts?.unattended });
-			log("error", "omp update failed", { version, error: result.error });
-			return { ok: false, error: result.error, log: tail };
-		} finally {
-			installing = undefined;
-			notify();
-		}
+		return { started: true, done: runInstall(runtimes, base) };
+	}
+
+	/**
+	 * UPD-02, UPD-03: with `omp.autoUpdate` on, installs the update on offer. Reads the state and claims the install in
+	 * one synchronous step, so a concurrent approval is refused. A version whose last attempt failed (install, canary or
+	 * a restart during the install) is not installed automatically again; a newer version or an approval can try.
+	 */
+	function autoInstall(): void {
+		const version = updateAvailable();
+		if (!version || !runtimes || installing || !autoUpdateOn()) return;
+		const attempt = readAttempt();
+		if (attempt?.version === version && attempt.outcome === "failed") return;
+		const start = install(version, AUTO_UPDATE_BY);
+		if (!start.started) log("warn", "automatic omp install refused", { version, error: start.error });
 	}
 
 	function canaryFailed(report: Omit<Extract<WorkerControl, { t: "omp-runtime-failed" }>, "t">): void {
@@ -209,19 +224,13 @@ export function createOmpUpdater(opts: OmpUpdaterOptions): OmpUpdater {
 		const attempt = readAttempt();
 		const base: OmpAttempt =
 			attempt?.copy === report.copy ? attempt : { version: report.version, from: image, by: "unknown", outcome: "failed", copy: report.copy, at: "" };
-		saveAttempt({ ...base, outcome: "failed", error, log: outputTail(report.output), at: new Date().toISOString(), reported: false });
+		saveAttempt({ ...base, outcome: "failed", error, log: outputTail(report.output), at: new Date().toISOString() });
 		log("error", "omp runtime copy failed its canary run", { copy: report.copy, version: report.version, run: report.runId, exitCode: report.exitCode, signal: report.signal });
-		notify();
 	}
 
 	return {
 		status,
-		updateAvailable,
 		check,
-		subscribe(listener) {
-			listeners.add(listener);
-			return () => void listeners.delete(listener);
-		},
 		start() {
 			if (firstCheck || interval) return;
 			runtimes?.reconcile();
@@ -233,6 +242,7 @@ export function createOmpUpdater(opts: OmpUpdaterOptions): OmpUpdater {
 			firstCheck.unref?.();
 		},
 		stop() {
+			stopped = true;
 			clearTimeout(firstCheck);
 			clearInterval(interval);
 			firstCheck = interval = undefined;
@@ -242,11 +252,5 @@ export function createOmpUpdater(opts: OmpUpdaterOptions): OmpUpdater {
 		forRun: runId => runtimes?.forRun(runId),
 		archive: runId => runtimes?.archive(runId),
 		canaryFailed,
-		notice: () => parseJson<OmpNotice>(db.kvGet(KEY_NOTICE)),
-		setNotice: notice => db.kvSet(KEY_NOTICE, notice ? JSON.stringify(notice) : ""),
-		markReported() {
-			const attempt = readAttempt();
-			if (attempt) saveAttempt({ ...attempt, reported: true });
-		},
 	};
 }

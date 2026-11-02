@@ -4,19 +4,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAdminApi } from "../../src/orchestrator/api/admin";
 import { type InternalApi, startInternalApi } from "../../src/orchestrator/api/server";
-import type { RunRequest, RunUi } from "../../src/orchestrator/dispatch/dispatcher";
+import type { RunRequest } from "../../src/orchestrator/dispatch/dispatcher";
 import { createFakeDispatcher, type FakeDispatcher } from "../../src/orchestrator/dispatch/fake";
 import { type Controller, createController } from "../../src/orchestrator/engine/controller";
-import { createGitHub } from "../../src/orchestrator/github/app";
 import { openAgentLog } from "../../src/orchestrator/store/agentlog";
 import { type Db, dbPath, openDb } from "../../src/orchestrator/store/db";
-import { loadoutKey } from "../../src/orchestrator/store/stats";
+import { saveLoadout } from "../../src/orchestrator/store/stats";
 import { openVault, type Vault } from "../../src/orchestrator/store/vault";
 import type { AdminState, SettingsSaveResponse, SettingsView, StatusReport } from "../../src/shared/adminApi";
 import type { Loadout } from "../../src/shared/agent";
-import { createFakeDiscord } from "../fakes/discord";
-import { type FakeGitHub, startFakeGitHub } from "../fakes/github";
+import { ASK_CHANNEL_MISSING } from "../../src/shared/config";
 import type { ThrottleLimits } from "../../src/shared/loginThrottle";
+import { createFakeDiscord } from "../fakes/discord";
 
 const WEB_TOKEN = "web-api-token-for-tests";
 const SETUP_TOKEN = "setup-token-for-tests";
@@ -44,16 +43,9 @@ function tempStateDir(): string {
 	return dir;
 }
 
-function fakeGitHub(): FakeGitHub {
-	const github = startFakeGitHub();
-	cleanups.push(() => github.stop());
-	return github;
-}
-
-/** One orchestrator process over `stateDir`: what main.ts wires, with the fake Discord and GitHub. */
+/** One orchestrator process over `stateDir`: what main.ts wires, with the fake Discord. */
 async function orchestrator(
 	stateDir: string,
-	github: FakeGitHub,
 	opts: { webToken?: string | null; setupToken?: string; modelAccounts?: () => number; passwordLimits?: ThrottleLimits } = {},
 ): Promise<Orchestrator> {
 	const db = openDb(dbPath(stateDir));
@@ -62,12 +54,12 @@ async function orchestrator(
 	const dispatcher = createFakeDispatcher();
 	const controller = createController({
 		stateDir,
+		ompDir: join(stateDir, "omp"),
 		db,
 		vault,
 		agentLog,
 		dispatcher,
 		connectDiscord: () => createFakeDiscord(),
-		connectGitHub: gh => createGitHub({ ...gh, baseUrl: github.url }),
 	});
 	const admin = createAdminApi({
 		db,
@@ -133,8 +125,8 @@ async function setUp(o: Orchestrator): Promise<void> {
 	expect(res.status).toBe(200);
 }
 
-function config(github: FakeGitHub, extra: Record<string, unknown> = {}) {
-	return { discord: { guildId: "g", allowedUserIds: ["u"], workChannelId: "w" }, github: { appId: github.appId }, ...extra };
+function config(extra: Record<string, unknown> = {}) {
+	return { discord: { guildId: "g", allowedUserIds: ["u"], askChannelIds: ["a"] }, ...extra };
 }
 
 /** The `{ error }` message of a refused request. */
@@ -146,7 +138,7 @@ async function errorOf(res: Response): Promise<string> {
 
 describe("web token (SEC-14)", () => {
 	test("missing or wrong tokens are refused; the right one is accepted", async () => {
-		const o = await orchestrator(tempStateDir(), fakeGitHub());
+		const o = await orchestrator(tempStateDir());
 		expect((await fetch(`${o.api.url}/internal/admin/state`)).status).toBe(401);
 		expect((await o.call("GET", "/state", undefined, { Authorization: "Bearer wrong" })).status).toBe(401);
 		expect((await o.call("GET", "/state", undefined, { Authorization: WEB_TOKEN })).status).toBe(401);
@@ -160,7 +152,7 @@ describe("web token (SEC-14)", () => {
 	});
 
 	test("without a token file the admin API refuses everything", async () => {
-		const o = await orchestrator(tempStateDir(), fakeGitHub(), { webToken: null });
+		const o = await orchestrator(tempStateDir(), { webToken: null });
 		expect((await o.call("GET", "/state")).status).toBe(401);
 		expect((await o.call("POST", "/setup", { token: SETUP_TOKEN, username: "admin", password: PASSWORD })).status).toBe(401);
 		// Health stays unauthenticated.
@@ -170,7 +162,7 @@ describe("web token (SEC-14)", () => {
 
 describe("setup (WEB-02)", () => {
 	test("validates the token and credentials, then refuses a second setup", async () => {
-		const o = await orchestrator(tempStateDir(), fakeGitHub());
+		const o = await orchestrator(tempStateDir());
 		const wrong = await o.call("POST", "/setup", { token: "nope", username: "admin", password: PASSWORD });
 		expect(wrong.status).toBe(400);
 		expect(await wrong.json()).toEqual({ error: "Invalid setup token." });
@@ -192,12 +184,11 @@ describe("setup (WEB-02)", () => {
 describe("login and credentials (WEB-03, WEB-04)", () => {
 	test("login unlocks a locked vault and applies; credentials change needs the current password", async () => {
 		const stateDir = tempStateDir();
-		const github = fakeGitHub();
-		const first = await orchestrator(stateDir, github);
+		const first = await orchestrator(stateDir);
 		await setUp(first);
 		await first.close();
 
-		const o = await orchestrator(stateDir, github);
+		const o = await orchestrator(stateDir);
 		expect(await state(o)).toMatchObject({ phase: "locked", initialized: true, unlocked: false });
 		expect((await o.call("GET", "/settings")).status).toBe(409);
 		expect(await (await o.call("POST", "/login", { username: "admin", password: "wrong password!" })).json()).toEqual({ ok: false });
@@ -218,7 +209,7 @@ describe("login and credentials (WEB-03, WEB-04)", () => {
 	});
 
 	test("password checks are throttled for the whole admin API: one at a time, and a failure budget (architecture §6)", async () => {
-		const o = await orchestrator(tempStateDir(), fakeGitHub(), { passwordLimits: { maxFailures: 3, windowMs: 60_000 } });
+		const o = await orchestrator(tempStateDir(), { passwordLimits: { maxFailures: 3, windowMs: 60_000 } });
 		await setUp(o);
 		const wrong = () => o.call("POST", "/login", { username: "admin", password: "wrong password!" });
 		// Parallel guesses with the web token are not all checked: each scrypt check runs alone.
@@ -238,183 +229,194 @@ describe("login and credentials (WEB-03, WEB-04)", () => {
 
 describe("settings", () => {
 	test("save validates as a whole, applies, masks secrets and keeps blank ones", async () => {
-		const github = fakeGitHub();
-		const o = await orchestrator(tempStateDir(), github);
+		const o = await orchestrator(tempStateDir());
 		await setUp(o);
 
-		const badPem = await o.call("PUT", "/settings", { config: config(github), secrets: { discordToken: "discord-token", githubAppPrivateKey: "not a pem" } });
-		expect(badPem.status).toBe(400);
-		expect(await errorOf(badPem)).toStartWith("GitHub App private key: ");
-		expect(o.vault.readSettings()).toBeUndefined();
-
-		const badConfig = await o.call("PUT", "/settings", {
-			config: { ...config(github), discord: { guildId: "g", workChannelId: "w" } },
-			secrets: { discordToken: "discord-token", githubAppPrivateKey: github.privateKey },
-		});
+		const badConfig = await o.call("PUT", "/settings", { config: { discord: { guildId: "g" } }, secrets: { discordToken: "discord-token" } });
 		expect(badConfig.status).toBe(400);
 		expect(await errorOf(badConfig)).toStartWith("Invalid config: discord");
-		const missingSecret = await o.call("PUT", "/settings", { config: config(github), secrets: { githubAppPrivateKey: github.privateKey } });
+		const missingSecret = await o.call("PUT", "/settings", { config: config(), secrets: {} });
 		expect(missingSecret.status).toBe(400);
 		expect(await errorOf(missingSecret)).toStartWith("Invalid config: secrets.discordToken");
 		expect(o.vault.readSettings()).toBeUndefined();
 
 		const saved = await o.call("PUT", "/settings", {
-			config: config(github, { limits: { maxConcurrentJobs: 1, maxChatSessions: 1 } }),
-			secrets: { discordToken: "discord-token", githubAppPrivateKey: github.privateKey, providerKeys: { anthropic: "sk-1", openai: "sk-2" } },
+			config: config({ limits: { maxChatSessions: 1 } }),
+			secrets: { discordToken: "discord-token", providerKeys: { anthropic: "sk-1", openai: "sk-2" } },
 		});
 		expect(saved.status).toBe(200);
 		const result = (await saved.json()) as SettingsSaveResponse;
 		expect(result.phase).toBe("running");
 		expect(result.error).toBeUndefined();
-		expect(result.warnings).toEqual([expect.stringContaining("is below worker capacity (4)")]);
+		expect(result.warnings).toEqual(["maxChatSessions (1) is below worker capacity (4): at most 1 workers will be used"]);
 
 		const viewRes = await o.call("GET", "/settings");
 		const text = await viewRes.text();
 		expect(text).not.toContain("discord-token");
-		expect(text).not.toContain("PRIVATE KEY");
 		expect(text).not.toContain("sk-1");
 		const view = JSON.parse(text) as SettingsView;
-		expect(view.secrets).toEqual({ discordToken: true, githubAppPrivateKey: true, providerKeys: ["anthropic", "openai"] });
-		expect(view.config?.discord.workChannelId).toBe("w");
+		expect(view.secrets).toEqual({ discordToken: true, providerKeys: ["anthropic", "openai"] });
+		expect(view.config?.discord.askChannelIds).toEqual(["a"]);
 
 		// Blank secrets keep the stored values; an empty provider key deletes that key.
 		const resaved = await o.call("PUT", "/settings", {
-			config: config(github, { agent: { name: "Robo" } }),
+			config: config({ agent: { name: "Robo" }, limits: { maxChatSessions: 4 } }),
 			secrets: { discordToken: "", providerKeys: { openai: "" } },
 		});
 		expect(resaved.status).toBe(200);
-		expect(((await resaved.json()) as SettingsSaveResponse).phase).toBe("running");
+		expect(await resaved.json()).toEqual({ phase: "running", warnings: [] });
 		const stored = o.vault.readSettings()!;
 		expect(stored.config.agent.name).toBe("Robo");
-		expect(stored.secrets).toEqual({ discordToken: "discord-token", githubAppPrivateKey: github.privateKey.trim(), providerKeys: { anthropic: "sk-1" } });
+		expect(stored.secrets).toEqual({ discordToken: "discord-token", providerKeys: { anthropic: "sk-1" } });
+	});
+
+	test("without an ask-only channel the save succeeds and the engine stays unconfigured (ENG-02)", async () => {
+		const o = await orchestrator(tempStateDir());
+		await setUp(o);
+		const saved = await o.call("PUT", "/settings", {
+			config: { discord: { guildId: "g", allowedUserIds: ["u"] }, limits: { maxChatSessions: 4 } },
+			secrets: { discordToken: "discord-token" },
+		});
+		expect(saved.status).toBe(200);
+		expect(await saved.json()).toEqual({ phase: "unconfigured", error: ASK_CHANNEL_MISSING, warnings: [] });
 	});
 
 	test("settings routes answer 409 before setup", async () => {
-		const o = await orchestrator(tempStateDir(), fakeGitHub());
+		const o = await orchestrator(tempStateDir());
 		expect((await o.call("GET", "/settings")).status).toBe(409);
 		expect((await o.call("PUT", "/settings", { config: {}, secrets: {} })).status).toBe(409);
 	});
 });
 
 describe("status", () => {
-	test("reports state, engine snapshot, runs, limits, issues and usage", async () => {
-		const github = fakeGitHub();
-		const o = await orchestrator(tempStateDir(), github);
+	test("reports state, engine snapshot, runs, limits, active threads and usage", async () => {
+		const o = await orchestrator(tempStateDir());
 		await setUp(o);
 		const before = (await (await o.call("GET", "/status")).json()) as StatusReport;
-		expect(before).toMatchObject({ state: { phase: "unconfigured" }, limits: null, warnings: [], runs: { pending: 0, running: 0 } });
+		expect(before).toMatchObject({ state: { phase: "unconfigured" }, limits: null, warnings: [], runs: { pending: 0, running: 0 }, activeThreads: [] });
 		expect(before.engine).toBeUndefined();
+		expect(before.loadout).toBeUndefined();
 		expect(before.usage.window).toBe("7d");
 
-		await o.call("PUT", "/settings", { config: config(github), secrets: { discordToken: "discord-token", githubAppPrivateKey: github.privateKey } });
-		o.db.insertIssue("o/r", 7, "Fix it");
+		await o.call("PUT", "/settings", { config: config(), secrets: { discordToken: "discord-token" } });
+		o.db.insertAskChat("t1", "a", "alice");
+		o.db.insertRun({ threadId: "t1" });
+		o.db.recordRun({
+			threadId: "t0",
+			channelId: "a",
+			userId: "bob",
+			outcome: "stopped",
+			startedAt: new Date(Date.now() - 5_000).toISOString(),
+			usage: { costUsd: 0.25, input: 100, output: 10, cacheRead: 0, cacheWrite: 0 },
+		});
 		const report = (await (await o.call("GET", "/status?window=24h")).json()) as StatusReport;
 		expect(report.state).toMatchObject({ phase: "running", initialized: true, unlocked: true });
-		expect(report.engine).toMatchObject({ githubApp: `${github.slug}[bot]`, discord: { ready: true }, queuedJobs: 0, watches: [] });
-		expect(report.engine!.discordQueue).toMatchObject({ length: 0 });
-		expect(report.limits).toEqual({ maxConcurrentJobs: 2, maxChatSessions: 2, maxConcurrentRuns: 4, workerCapacity: 4, effectiveConcurrency: 4 });
-		expect(report.issues.counts.queued).toBe(1);
-		expect(report.issues.open).toEqual([{ repo: "o/r", number: 7, title: "Fix it", state: "queued", threadId: null }]);
-		expect(report.usage).toMatchObject({ window: "24h", totals: { runs: 0, costUsd: 0 } });
+		expect(report.engine).toMatchObject({ discord: { ready: true }, discordQueue: { length: 0 } });
+		expect(report.limits).toEqual({ maxChatSessions: 2, maxConcurrentRuns: 4, workerCapacity: 4, effectiveConcurrency: 2 });
+		expect(report.warnings).toEqual(["maxChatSessions (2) is below worker capacity (4): at most 2 workers will be used"]);
+		expect(report.activeThreads).toEqual([{ threadId: "t1", channelId: "a", ownerId: "alice" }]);
+		expect(report.usage).toMatchObject({
+			window: "24h",
+			totals: { runs: 1, costUsd: 0.25 },
+			byChannel: [{ id: "a", runs: 1, costUsd: 0.25 }],
+			byUser: [{ id: "bob", runs: 1, costUsd: 0.25 }],
+			outcomes: { finished: 0, failed: 0, stopped: 1, limit: 0 },
+			setup: null,
+		});
+		expect(report.usage.outcomes.avgDurationMs).toBeGreaterThanOrEqual(4_000);
 		expect(report.usage.daily).toHaveLength(14);
 
-		const health = (await (await fetch(`${o.api.url}/readyz`)).json()) as { phase: string; runs: unknown };
-		expect(health).toMatchObject({ phase: "running", runs: { pending: 0, running: 0 } });
+		const health = (await (await fetch(`${o.api.url}/readyz`)).json()) as { phase: string; runs: unknown; limits: unknown };
+		expect(health).toMatchObject({ phase: "running", runs: { pending: 0, running: 0 }, limits: report.limits });
 	});
 
-	test("lists pending runs with their age and runs in progress with setup time, last tool and live usage; the latest loadout per profile", async () => {
-		const o = await orchestrator(tempStateDir(), fakeGitHub());
+	test("lists pending runs with their age and runs in progress with setup time, last tool and live usage; the latest loadout", async () => {
+		const o = await orchestrator(tempStateDir());
 		await setUp(o);
 		const pendingGate = Promise.withResolvers<void>();
 		const setupGate = Promise.withResolvers<void>();
 		const progressed = Promise.withResolvers<void>();
-		o.dispatcher.once({ owner: { kind: "draft", draftId: "waiting" } }, { pending: pendingGate.promise });
+		o.dispatcher.once({ threadId: "waiting" }, { pending: pendingGate.promise });
 		o.dispatcher.once(
-			{ owner: { kind: "draft", draftId: "busy" } },
+			{ threadId: "busy" },
 			{
-				// Setup (worker start, checkout, setupCommand) lasts until the gate opens; then the agent registers and reports.
-				steps: [{ until: setupGate.promise }, { progress: { tool: "grep", usage: { costUsd: 0.5, input: 1200, output: 30, cacheRead: 0, cacheWrite: 0 } } }],
+				// Setup (worker start and downloads) lasts until the gate opens; then the agent registers and reports.
+				steps: [{ until: setupGate.promise }, { progress: { tool: "web_search", usage: { costUsd: 0.5, input: 1200, output: 30, cacheRead: 0, cacheWrite: 0 } } }],
 				registerAt: 1,
 				hold: true,
 			},
 		);
-		const hooks = { ui: {} as RunUi, register: () => {} };
-		const request = (draftId: string, repo: string): RunRequest => ({
-			owner: { kind: "draft", draftId },
-			kind: "draft",
-			profile: "draft",
+		const hooks = { register: () => {} };
+		const request = (threadId: string): RunRequest => ({
+			threadId,
+			profile: "ask",
 			prompt: "p",
 			thinking: "high",
-			limits: { minutes: 1, costUsd: 1 },
-			session: `draft-${draftId}`,
+			limits: { minutes: 20, costUsd: 1 },
+			session: `chat-${threadId}`,
 			resume: false,
-			threadId: `thread-${draftId}`,
-			checkout: { repo, defaultBranch: async () => "main", identity: { name: "a", email: "a@b" }, gitToken: async () => "t" },
+			scratchDir: join(tempStateDir(), threadId),
 		});
-		const waiting = o.dispatcher.runAgent(request("waiting", "o/a"), hooks);
-		const busy = o.dispatcher.runAgent(request("busy", "o/b"), { ...hooks, onProgress: () => progressed.resolve() });
+		const waiting = o.dispatcher.runAgent(request("waiting"), hooks);
+		const busy = o.dispatcher.runAgent(request("busy"), { ...hooks, onProgress: () => progressed.resolve() });
 
 		// Still setting up: claimed, not started, no setup time yet.
 		const settingUp = ((await (await o.call("GET", "/status")).json()) as StatusReport).activeRuns[1]!;
-		expect(settingUp).toMatchObject({ owner: "draft:busy", state: "assigned" });
+		expect(settingUp).toMatchObject({ threadId: "busy", state: "assigned" });
 		expect(settingUp.claimedAt).toBeDefined();
 		expect(settingUp.startedAt).toBeUndefined();
 		expect(settingUp.setupMs).toBeUndefined();
 		setupGate.resolve();
 		await progressed.promise;
-		const loadout: Loadout = { capturedAt: new Date().toISOString(), profile: "implement", tools: ["read"], skills: [], agents: [], mcp: [] };
-		o.db.kvSet(loadoutKey("implement"), JSON.stringify(loadout));
+		const loadout: Loadout = { capturedAt: new Date().toISOString(), profile: "ask", tools: ["read_file", "web_search"], skills: [], agents: [] };
+		saveLoadout(o.db, loadout);
 
 		const report = (await (await o.call("GET", "/status")).json()) as StatusReport;
 		expect(report.runs).toMatchObject({ pending: 1, running: 1 });
 		expect(report.runs.oldestPendingMs).toBeGreaterThanOrEqual(0);
-		expect(report.activeRuns.map(r => [r.owner, r.state, r.repo, r.threadId])).toEqual([
-			["draft:waiting", "pending", "o/a", "thread-waiting"],
-			["draft:busy", "running", "o/b", "thread-busy"],
+		expect(report.activeRuns.map(r => [r.threadId, r.state])).toEqual([
+			["waiting", "pending"],
+			["busy", "running"],
 		]);
 		const [pending, running] = report.activeRuns;
 		expect(pending!.claimedAt).toBeUndefined();
 		expect(pending!.setupMs).toBeUndefined();
 		expect(Date.parse(pending!.createdAt)).toBeLessThanOrEqual(Date.now());
-		expect(running).toMatchObject({ lastTool: "grep", usage: { costUsd: 0.5, input: 1200, output: 30 }, claimedAt: settingUp.claimedAt });
+		expect(running).toMatchObject({ lastTool: "web_search", usage: { costUsd: 0.5, input: 1200, output: 30 }, claimedAt: settingUp.claimedAt });
 		expect(running!.setupMs).toBe(Date.parse(running!.startedAt!) - Date.parse(running!.claimedAt!));
 		expect(running!.setupMs).toBeGreaterThanOrEqual(0);
-		expect(report.loadouts).toEqual([loadout]);
-		expect(report.usage.setup).toEqual([]);
+		expect(report.loadout).toEqual(loadout);
 
 		pendingGate.resolve();
-		o.dispatcher.run({ kind: "draft", draftId: "busy" })!.finish();
+		o.dispatcher.run("busy")!.finish();
 		await Promise.all([waiting, busy]);
 		expect(o.dispatcher.activeRuns()).toEqual([]);
 	});
 });
 
-describe("home facts (§9.3 `/`)", () => {
-	test("counts model accounts and MCP servers and tracks the getting-started checklist", async () => {
-		const github = fakeGitHub();
+describe("home facts (requirements §5.3 `/`)", () => {
+	test("counts model accounts and tracks the getting-started checklist", async () => {
 		let accounts = 0;
-		const o = await orchestrator(tempStateDir(), github, { modelAccounts: () => accounts });
-		const none = { setup: false, credentials: false, workChannel: false, watchedRepo: false, modelAccess: false };
+		const o = await orchestrator(tempStateDir(), { modelAccounts: () => accounts });
+		const none = { setup: false, botToken: false, guild: false, allowedUsers: false, askChannel: false, modelAccess: false };
 		expect((await state(o)).home).toEqual({ modelAccounts: 0, checklist: none });
 
 		await setUp(o);
-		expect((await state(o)).home).toEqual({ modelAccounts: 0, mcpServers: 0, checklist: { ...none, setup: true } });
+		expect((await state(o)).home).toEqual({ modelAccounts: 0, checklist: { ...none, setup: true } });
 
-		await o.call("PUT", "/settings", { config: config(github), secrets: { discordToken: "discord-token", githubAppPrivateKey: github.privateKey } });
-		expect((await state(o)).home.checklist).toEqual({ ...none, setup: true, credentials: true, workChannel: true });
+		await o.call("PUT", "/settings", { config: { discord: { guildId: "g", allowedRoleIds: ["r"] } }, secrets: { discordToken: "discord-token" } });
+		expect((await state(o)).home.checklist).toEqual({ ...none, setup: true, botToken: true, guild: true, allowedUsers: true });
 
 		accounts = 2;
-		o.vault.writeOmpConfig({ settings: {}, mcpServers: { echo: { command: "echo" }, docs: { type: "http", url: "https://mcp.example.com/mcp" } } });
-		o.db.watchRepo({ repoId: 1, repo: "o/r", channelId: "c1", createdBy: "u" });
+		await o.call("PUT", "/settings", { config: config(), secrets: {} });
 		expect((await state(o)).home).toEqual({
 			modelAccounts: 2,
-			mcpServers: 2,
-			checklist: { setup: true, credentials: true, workChannel: true, watchedRepo: true, modelAccess: true },
+			checklist: { setup: true, botToken: true, guild: true, allowedUsers: true, askChannel: true, modelAccess: true },
 		});
 
 		// A provider API key alone also gives model access.
 		accounts = 0;
-		await o.call("PUT", "/settings", { config: config(github), secrets: { providerKeys: { openai: "sk-1" } } });
+		await o.call("PUT", "/settings", { config: config(), secrets: { providerKeys: { openai: "sk-1" } } });
 		expect((await state(o)).home).toMatchObject({ modelAccounts: 0, checklist: { modelAccess: true } });
 	});
 });

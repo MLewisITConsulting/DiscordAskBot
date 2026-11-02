@@ -23,7 +23,6 @@ const MIN_KEY_FILE_CHARS = 32;
 /** F9: the settings' secrets are masked in every log line and agent-log entry once the vault has handled them. */
 function maskSecrets(settings: Settings): Settings {
 	addLogSecret(settings.secrets.discordToken);
-	addLogSecret(settings.secrets.githubAppPrivateKey);
 	for (const key of Object.values(settings.secrets.providerKeys)) addLogSecret(key);
 	return settings;
 }
@@ -40,7 +39,7 @@ interface VaultRecord {
 	password: { salt: string; N: number; r: number; p: number; wrapped: Sealed };
 	keyFile?: { salt: string; wrapped: Sealed };
 	settings?: Sealed;
-	/** omp setting overrides and MCP servers, sealed separately so saving them does not restart the engine. */
+	/** omp setting overrides, sealed separately so saving them does not restart the engine. */
 	omp?: Sealed;
 }
 
