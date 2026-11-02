@@ -7,6 +7,6 @@ version: 0.1.0
 appVersion: "0.1.0"
 # OPS-08: Helm refuses to install on an older cluster. The KEDA ScaledJob CRD is checked in templates/validate.yaml.
 kubeVersion: ">= 1.27.0-0"
-home: https://github.com/factotuminok/AskBot
+home: https://github.com/MLewisITConsulting/DiscordAskBot
 sources:
-  - https://github.com/factotuminok/AskBot
+  - https://github.com/MLewisITConsulting/DiscordAskBot
