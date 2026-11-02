@@ -1,0 +1,217 @@
+import { isIP } from "node:net";
+import { join, resolve } from "node:path";
+import { parseLogCapOverride } from "./rollinglog";
+
+/**
+ * Typed `ASKBOT_*` environment (requirements §13). Defaults are the source-checkout ones; the image sets its
+ * own (`ASKBOT_HOME=/home/askbot`, `ASKBOT_STATE_DIR=/state`, `ASKBOT_WEB_HOST=0.0.0.0`, …) with `ENV`.
+ * Each component reads only the fields it uses; an invalid value throws with the variable's name.
+ */
+
+export const ROLES = ["orchestrator", "web", "worker", "launcher"] as const;
+export type Role = (typeof ROLES)[number];
+
+export interface AskbotEnv {
+	/** `ASKBOT_ROLE`; the command argument takes precedence in `cli.ts`. */
+	role?: Role;
+	/** `ASKBOT_HOME`: web home volume root (absolute). */
+	home: string;
+	/** `ASKBOT_STATE_DIR`: state volume root `<state>` (absolute); orchestrator only. */
+	stateDir: string;
+	/** `ASKBOT_OMP_DIR`: skills and agents root; defaults to `<state>/omp`. */
+	ompDir: string;
+	webHost: string;
+	webPort: number;
+	/** `ASKBOT_WEB_TRUSTED_PROXIES`: addresses and CIDRs of reverse proxies in front of web (WEB-03 client address). */
+	webTrustedProxies: string[];
+	/** `ASKBOT_MASTER_KEY_FILE`: mounted master key file; orchestrator only. */
+	masterKeyFile?: string;
+	internalHost: string;
+	internalPort: number;
+	/** Mounted internal tokens (SEC-14). */
+	webApiTokenFile?: string;
+	workerTokenFile?: string;
+	scaleTokenFile?: string;
+	/** `ASKBOT_WEB_VSCODE` is not `off`. */
+	webVscode: boolean;
+	/** `ASKBOT_AGENT_LOG_MAX_BYTES`: overrides `logs.maxGiB` (OBS-04). */
+	agentLogMaxBytes?: number;
+	/** `ASKBOT_OMP_RUNTIME_DIR`: set only in the image; enables in-place omp updates. */
+	ompRuntimeDir?: string;
+	/** `ASKBOT_ORCHESTRATOR_URL` without a trailing slash. */
+	orchestratorUrl: string;
+	/** `ASKBOT_WORKER_CLAIM_TIMEOUT` in milliseconds. */
+	workerClaimTimeoutMs: number;
+	/** `ASKBOT_WORKER_ADDRESS_BINDING` (default on): one claim per worker address, worker ids bound to their first address (architecture §6). */
+	workerAddressBinding: boolean;
+	/** `ASKBOT_WORKER_RUN_DIR`: parent of the worker's run-local root (the image: `/run/askbot`, a tmpfs or memory `emptyDir`). */
+	workerRunDir?: string;
+	workerCapacity: number;
+	/** `ASKBOT_WORKER_IMAGE`: launcher only; undefined means the AskBot image itself (`image`). */
+	workerImage?: string;
+	/** `ASKBOT_IMAGE`: launcher only; the AskBot image this stack runs (compose sets it to the services' image). */
+	image?: string;
+	/** `ASKBOT_WORKER_NETWORK`: launcher only, required; the stack network workers join. */
+	workerNetwork?: string;
+	/** `ASKBOT_WORKER_SECRET`: launcher only; the Podman secret holding the worker token. */
+	workerSecret: string;
+	/** `ASKBOT_WORKER_MEMORY` in bytes. */
+	workerMemoryBytes: number;
+	/** `ASKBOT_WORKER_CPUS`: launcher only; CPU quota per worker container, in CPUs (`podman run --cpus`). */
+	workerCpus: number;
+	/** `ASKBOT_WORKER_DISK` in bytes. */
+	workerDiskBytes: number;
+	podmanSocket: string;
+	launcherAllowRootful: boolean;
+	version?: string;
+	commit?: string;
+	buildDate?: string;
+}
+
+type Env = Record<string, string | undefined>;
+
+function fail(name: string, raw: string, expected: string): never {
+	throw new Error(`${name} must be ${expected}, got "${raw}"`);
+}
+
+/** The variable's value, or undefined when unset or empty. */
+function str(env: Env, name: string): string | undefined {
+	const raw = env[name]?.trim();
+	return raw ? raw : undefined;
+}
+
+function int(env: Env, name: string, fallback: number, min: number, max: number): number {
+	const raw = str(env, name);
+	if (raw === undefined) return fallback;
+	const value = Number(raw);
+	if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value < min || value > max) fail(name, raw, `an integer from ${min} to ${max}`);
+	return value;
+}
+
+const DURATION_UNITS: Record<string, number> = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 };
+
+/** Parses a duration such as `15s`, `500ms`, `2m` or `1h` into milliseconds. */
+export function parseDuration(name: string, raw: string): number {
+	const match = /^(\d+)(ms|s|m|h)$/.exec(raw);
+	const ms = match ? Number(match[1]) * DURATION_UNITS[match[2]!]! : 0;
+	if (ms <= 0 || !Number.isSafeInteger(ms)) fail(name, raw, "a positive duration such as 15s, 500ms, 2m or 1h");
+	return ms;
+}
+
+const SIZE_UNITS: Record<string, number> = { "": 1, b: 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3, t: 1024 ** 4 };
+
+/** Parses a Podman-style size such as `4g` or `512m` (binary units) into bytes. */
+export function parseSize(name: string, raw: string): number {
+	const match = /^(\d+)([bkmgt]?)$/i.exec(raw);
+	const bytes = match ? Number(match[1]) * SIZE_UNITS[match[2]!.toLowerCase()]! : 0;
+	if (bytes <= 0 || !Number.isSafeInteger(bytes)) fail(name, raw, "a positive size such as 4g or 512m");
+	return bytes;
+}
+
+/** A CPU count such as `2` or `1.5` (`podman run --cpus`): at least 0.01 (a 1 ms quota per 100 ms), at most 1024. */
+function cpus(env: Env, name: string, fallback: number): number {
+	const raw = str(env, name);
+	if (raw === undefined) return fallback;
+	const value = Number(raw);
+	if (!/^\d+(\.\d+)?$/.test(raw) || value < 0.01 || value > 1024) fail(name, raw, "a number of CPUs from 0.01 to 1024, such as 2 or 1.5");
+	return value;
+}
+
+function flag(env: Env, name: string, fallback: boolean): boolean {
+	const raw = str(env, name);
+	if (raw === undefined) return fallback;
+	const value = raw.toLowerCase();
+	if (["1", "true", "on", "yes"].includes(value)) return true;
+	if (["0", "false", "off", "no"].includes(value)) return false;
+	fail(name, raw, "on or off");
+}
+
+function url(env: Env, name: string, fallback: string): string {
+	const raw = str(env, name) ?? fallback;
+	let parsed: URL;
+	try {
+		parsed = new URL(raw);
+	} catch {
+		fail(name, raw, "an http(s) URL");
+	}
+	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") fail(name, raw, "an http(s) URL");
+	return raw.replace(/\/+$/, "");
+}
+
+/** An image reference such as `ghcr.io/owner/askbot:1.2.3`; undefined when unset. */
+function image(env: Env, name: string): string | undefined {
+	const raw = str(env, name);
+	if (raw !== undefined && !/^[a-z0-9][^\s]*$/i.test(raw)) fail(name, raw, "an image reference");
+	return raw;
+}
+
+/** A Podman network or secret name; undefined when unset. */
+function podmanName(env: Env, name: string): string | undefined {
+	const raw = str(env, name);
+	if (raw !== undefined && !/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(raw)) fail(name, raw, "a Podman name (letters, digits, '_', '.', '-')");
+	return raw;
+}
+
+/** Comma-separated IP addresses and CIDRs (`10.0.0.0/8`, `fd00::/8`); empty when unset. */
+function addressList(env: Env, name: string): string[] {
+	const entries = (str(env, name) ?? "").split(",").map(entry => entry.trim()).filter(entry => entry !== "");
+	for (const entry of entries) {
+		const [address = "", prefix, extra] = entry.split("/");
+		const version = isIP(address);
+		const bits = version === 6 ? 128 : 32;
+		const validPrefix = prefix === undefined || (/^\d{1,3}$/.test(prefix) && Number(prefix) <= bits);
+		if (version === 0 || !validPrefix || extra !== undefined) fail(name, entry, "comma-separated IP addresses or CIDRs");
+	}
+	return entries;
+}
+
+/** Reads and validates every `ASKBOT_*` variable; throws on the first invalid one. */
+export function loadEnv(env: Env = process.env): Readonly<AskbotEnv> {
+	const role = str(env, "ASKBOT_ROLE");
+	if (role !== undefined && !ROLES.includes(role as Role)) fail("ASKBOT_ROLE", role, ROLES.join(", "));
+	const vscode = str(env, "ASKBOT_WEB_VSCODE") ?? "on";
+	if (vscode !== "on" && vscode !== "off") fail("ASKBOT_WEB_VSCODE", vscode, "on or off");
+	const stateDir = resolve(str(env, "ASKBOT_STATE_DIR") ?? "./state");
+	const claimTimeout = str(env, "ASKBOT_WORKER_CLAIM_TIMEOUT") ?? "15s";
+	const workerMemory = str(env, "ASKBOT_WORKER_MEMORY") ?? "4g";
+	const workerDisk = str(env, "ASKBOT_WORKER_DISK") ?? "20g";
+	const optionalPath = (name: string) => {
+		const raw = str(env, name);
+		return raw === undefined ? undefined : resolve(raw);
+	};
+	return Object.freeze({
+		role: role as Role | undefined,
+		home: resolve(str(env, "ASKBOT_HOME") ?? "./web-home"),
+		stateDir,
+		ompDir: resolve(str(env, "ASKBOT_OMP_DIR") ?? join(stateDir, "omp")),
+		webHost: str(env, "ASKBOT_WEB_HOST") ?? "127.0.0.1",
+		webPort: int(env, "ASKBOT_WEB_PORT", 8080, 1, 65535),
+		webTrustedProxies: addressList(env, "ASKBOT_WEB_TRUSTED_PROXIES"),
+		masterKeyFile: optionalPath("ASKBOT_MASTER_KEY_FILE"),
+		internalHost: str(env, "ASKBOT_INTERNAL_HOST") ?? "0.0.0.0",
+		internalPort: int(env, "ASKBOT_INTERNAL_PORT", 8081, 1, 65535),
+		webApiTokenFile: optionalPath("ASKBOT_WEB_API_TOKEN_FILE"),
+		workerTokenFile: optionalPath("ASKBOT_WORKER_TOKEN_FILE"),
+		scaleTokenFile: optionalPath("ASKBOT_SCALE_TOKEN_FILE"),
+		webVscode: vscode === "on",
+		agentLogMaxBytes: parseLogCapOverride(str(env, "ASKBOT_AGENT_LOG_MAX_BYTES")),
+		ompRuntimeDir: optionalPath("ASKBOT_OMP_RUNTIME_DIR"),
+		orchestratorUrl: url(env, "ASKBOT_ORCHESTRATOR_URL", "http://orchestrator:8081"),
+		workerClaimTimeoutMs: parseDuration("ASKBOT_WORKER_CLAIM_TIMEOUT", claimTimeout),
+		workerAddressBinding: flag(env, "ASKBOT_WORKER_ADDRESS_BINDING", true),
+		workerRunDir: optionalPath("ASKBOT_WORKER_RUN_DIR"),
+		workerCapacity: int(env, "ASKBOT_WORKER_CAPACITY", 4, 1, 1000),
+		workerImage: image(env, "ASKBOT_WORKER_IMAGE"),
+		image: image(env, "ASKBOT_IMAGE"),
+		workerNetwork: podmanName(env, "ASKBOT_WORKER_NETWORK"),
+		workerSecret: podmanName(env, "ASKBOT_WORKER_SECRET") ?? "askbot_worker_token",
+		workerMemoryBytes: parseSize("ASKBOT_WORKER_MEMORY", workerMemory),
+		workerCpus: cpus(env, "ASKBOT_WORKER_CPUS", 2),
+		workerDiskBytes: parseSize("ASKBOT_WORKER_DISK", workerDisk),
+		podmanSocket: str(env, "ASKBOT_PODMAN_SOCKET") ?? "/run/podman/podman.sock",
+		launcherAllowRootful: flag(env, "ASKBOT_LAUNCHER_ALLOW_ROOTFUL", false),
+		version: str(env, "ASKBOT_VERSION"),
+		commit: str(env, "ASKBOT_COMMIT"),
+		buildDate: str(env, "ASKBOT_BUILD_DATE"),
+	});
+}

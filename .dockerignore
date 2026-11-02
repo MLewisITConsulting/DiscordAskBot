@@ -1,0 +1,11 @@
+# Build context of the image (Dockerfile); podman reads this file too when there is no .containerignore.
+*
+!package.json
+!bun.lock
+!src/
+!scripts/build-vsix.ts
+!scripts/vsix/package.json
+!scripts/vsix/bun.lock
+!scripts/omp-latest.ts
+!vscode/
+**/.DS_Store

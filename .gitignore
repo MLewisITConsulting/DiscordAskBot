@@ -1,0 +1,10 @@
+node_modules/
+state/
+.tools/
+.env
+*.pem
+master.key
+dist/
+.DS_Store
+/secrets/
+.scratch/

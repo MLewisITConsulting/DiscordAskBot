@@ -1,0 +1,141 @@
+# AskBot on rootless Podman (architecture §7.2, requirements OPS-03): `podman compose up -d`.
+#
+# Before the first start: enable the user's Podman socket (`systemctl --user enable --now podman.socket`) and run
+# `scripts/init-secrets.sh` once. Works with both compose providers `podman compose` can run: docker-compose (talking to
+# the Podman socket) and podman-compose. Docker Engine is not supported: the launcher refuses a rootful socket (LCH-01).
+#
+# Variables (shell environment or a `.env` file next to this file):
+#   ASKBOT_IMAGE                 image of all three services and of the workers (default ghcr.io/factotuminok/askbot:latest)
+#   ASKBOT_WORKER_IMAGE          derived worker image with target-repo toolchains, built FROM the same version (optional)
+#   ASKBOT_WORKER_CAPACITY       most worker containers at once, also the orchestrator's run cap (default 4)
+#   ASKBOT_WORKER_MEMORY         memory limit per worker, no swap (default 4g); ASKBOT_WORKER_DISK checkout limit (default 20g)
+#   ASKBOT_WORKER_CPUS           CPU quota per worker, in CPUs like `podman run --cpus` (default 2)
+#   ASKBOT_SECRETS_DIR           directory written by scripts/init-secrets.sh (default ./secrets, next to this file)
+#   ASKBOT_WORKER_SECRET         Podman secret holding the worker token (default askbot_worker_token)
+#   ASKBOT_NETWORK               the stack network's fixed name (default askbot); workers join their own network,
+#                                  `<ASKBOT_NETWORK>-workers`, where only the orchestrator is reachable (architecture §6)
+#   ASKBOT_WEB_HOST_PORT         host port of the web UI on 127.0.0.1 (default 8080)
+#   ASKBOT_WEB_TRUSTED_PROXIES   addresses/CIDRs of your reverse proxy as web sees it: the login throttle then counts the
+#                                  right-most untrusted X-Forwarded-For entry instead of the proxy (default none)
+#   ASKBOT_WORKER_ADDRESS_BINDING  one claim per worker address (architecture §6; default on, off only if workers share one)
+#   ASKBOT_HOST_PODMAN_SOCKET    the user's Podman socket (default $XDG_RUNTIME_DIR/podman/podman.sock); set it where
+#                                  XDG_RUNTIME_DIR is not the Podman host's, e.g. a podman machine (/run/user/<uid>/...)
+#
+# Secrets are files, not `external: true` Podman secrets: docker-compose refuses external secrets outside Swarm
+# ("unsupported external secret"), so only files work with both providers. Each file is mounted only into the services
+# that read it. Its owner and mode 0400 carry into the container because the three services run with
+# `userns_mode: keep-id:uid=10001,gid=10001`, which maps the host user to askbot (10001); compose's secret uid/gid/mode
+# are ignored outside Swarm. The worker token is also a Podman secret with the same value, because the launcher gives
+# it to workers by name and never holds it (LCH-04).
+
+name: askbot
+
+x-askbot: &askbot
+  image: ${ASKBOT_IMAGE:-ghcr.io/factotuminok/askbot:latest}
+  user: "10001:10001"
+  userns_mode: "keep-id:uid=10001,gid=10001"
+  init: true
+  restart: unless-stopped
+  networks: [askbot]
+
+# Docker/Podman probe timings (requirements OBS-01); each service adds its `test`.
+x-health: &health
+  interval: 30s
+  timeout: 5s
+  retries: 3
+  start_period: 30s
+
+services:
+  orchestrator:
+    <<: *askbot
+    command: ["orchestrator"]
+    # Web and the launcher reach it on `askbot`, workers on `workers`.
+    networks: [askbot, workers]
+    environment:
+      ASKBOT_MASTER_KEY_FILE: /run/secrets/askbot_master_key
+      ASKBOT_WEB_API_TOKEN_FILE: /run/secrets/askbot_web_api_token
+      ASKBOT_WORKER_TOKEN_FILE: /run/secrets/askbot_worker_token
+      ASKBOT_SCALE_TOKEN_FILE: /run/secrets/askbot_scale_token
+      ASKBOT_WORKER_CAPACITY: ${ASKBOT_WORKER_CAPACITY:-4}
+      # Checkpoint and result bundles larger than a worker's checkout limit are refused (STO-06).
+      ASKBOT_WORKER_DISK: ${ASKBOT_WORKER_DISK:-20g}
+      ASKBOT_WORKER_ADDRESS_BINDING: ${ASKBOT_WORKER_ADDRESS_BINDING:-on}
+    secrets: [askbot_master_key, askbot_web_api_token, askbot_worker_token, askbot_scale_token]
+    volumes:
+      - askbot-state:/state
+    healthcheck:
+      <<: *health
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:8081/healthz').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+
+  web:
+    <<: *askbot
+    command: ["web"]
+    environment:
+      ASKBOT_WEB_API_TOKEN_FILE: /run/secrets/askbot_web_api_token
+      ASKBOT_ORCHESTRATOR_URL: http://orchestrator:8081
+      ASKBOT_WEB_TRUSTED_PROXIES: ${ASKBOT_WEB_TRUSTED_PROXIES:-}
+    secrets: [askbot_web_api_token]
+    volumes:
+      - askbot-web:/home/askbot
+    ports:
+      - "127.0.0.1:${ASKBOT_WEB_HOST_PORT:-8080}:8080"
+    depends_on:
+      orchestrator:
+        condition: service_started
+    healthcheck:
+      <<: *health
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:8080/healthz').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+
+  launcher:
+    <<: *askbot
+    command: ["launcher"]
+    # SELinux keeps a confined container away from the user's socket; keep-id makes askbot its owner (spike S6).
+    security_opt: ["label=disable"]
+    environment:
+      ASKBOT_ROLE: launcher
+      ASKBOT_IMAGE: ${ASKBOT_IMAGE:-ghcr.io/factotuminok/askbot:latest}
+      ASKBOT_WORKER_IMAGE: ${ASKBOT_WORKER_IMAGE:-}
+      ASKBOT_WORKER_NETWORK: ${ASKBOT_NETWORK:-askbot}-workers
+      ASKBOT_WORKER_SECRET: ${ASKBOT_WORKER_SECRET:-askbot_worker_token}
+      ASKBOT_WORKER_CAPACITY: ${ASKBOT_WORKER_CAPACITY:-4}
+      ASKBOT_WORKER_MEMORY: ${ASKBOT_WORKER_MEMORY:-4g}
+      ASKBOT_WORKER_CPUS: ${ASKBOT_WORKER_CPUS:-2}
+      ASKBOT_WORKER_DISK: ${ASKBOT_WORKER_DISK:-20g}
+      ASKBOT_ORCHESTRATOR_URL: http://orchestrator:8081
+      ASKBOT_PODMAN_SOCKET: /run/podman/podman.sock
+      ASKBOT_SCALE_TOKEN_FILE: /run/secrets/askbot_scale_token
+    secrets: [askbot_scale_token]
+    volumes:
+      - ${ASKBOT_HOST_PODMAN_SOCKET:-${XDG_RUNTIME_DIR}/podman/podman.sock}:/run/podman/podman.sock
+    depends_on:
+      orchestrator:
+        condition: service_started
+    healthcheck:
+      <<: *health
+      test: ["CMD", "askbot", "health"]
+
+networks:
+  askbot:
+    name: ${ASKBOT_NETWORK:-askbot}
+  # Worker containers only (the launcher attaches them): the orchestrator is on it too, web and the launcher are not.
+  # Strict isolation blocks traffic to and from every other bridge network, so a worker cannot reach web even by its
+  # address (security review F6, SEC-15). Podman 6 isolates every network so by default; on older Podman only
+  # podman-compose applies `isolate: strict`, because Podman's Docker API (docker-compose) drops the option.
+  workers:
+    name: ${ASKBOT_NETWORK:-askbot}-workers
+    driver_opts:
+      isolate: strict
+
+volumes:
+  askbot-state: {}
+  askbot-web: {}
+
+secrets:
+  askbot_master_key:
+    file: ${ASKBOT_SECRETS_DIR:-./secrets}/askbot_master_key
+  askbot_web_api_token:
+    file: ${ASKBOT_SECRETS_DIR:-./secrets}/askbot_web_api_token
+  askbot_worker_token:
+    file: ${ASKBOT_SECRETS_DIR:-./secrets}/askbot_worker_token
+  askbot_scale_token:
+    file: ${ASKBOT_SECRETS_DIR:-./secrets}/askbot_scale_token
